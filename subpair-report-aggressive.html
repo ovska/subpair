@@ -3926,7 +3926,7 @@ return Plotly;
   <button class="mode-tab active" id="raw-mode-tab" role="tab" aria-selected="true" onclick="setReportMode('raw')">Raw</button>
   <button class="mode-tab" id="eq-mode-tab" role="tab" aria-selected="false" onclick="setReportMode('eq')">EQ’d</button>
 </div>
-<p class="note">Check table rows to choose comparison pairs. Each mode starts with its top 5; the pair tabs below the table open one full diagnostic at a time.</p>
+<p class="note">Check table rows to choose comparison pairs. Each mode starts with its top 5; the pair tabs below the table open one full diagnostic at a time. Hotkeys 1–9 open the first nine selected tabs.</p>
 <div data-mode-panel="raw">
   <div class="chart-tabs" role="tablist" aria-label="Raw overview chart">
     <button class="chart-tab active" data-overview-mode="raw" data-overview-view="magnitude" role="tab" aria-selected="true" onclick="setOverviewView('raw','magnitude')">Magnitude</button>
@@ -4654,13 +4654,17 @@ function renderPairTabs(mode) {
     strip.appendChild(empty);
     return;
   }
-  keys.forEach(key=>{
+  keys.forEach((key,index)=>{
     const section=sectionForKey(key);
     const button=document.createElement('button');
     button.type='button';
     button.className='pair-tab'+(key===activePairs[mode]?' active':'');
     button.setAttribute('role','tab');
     button.setAttribute('aria-selected',String(key===activePairs[mode]));
+    if(index<9) {
+      button.title='Hotkey '+String(index+1);
+      button.setAttribute('aria-keyshortcuts',String(index+1));
+    }
     button.textContent=section.dataset.pairLabel;
     button.addEventListener('click',()=>activatePair(mode,key));
     strip.appendChild(button);
@@ -4675,6 +4679,19 @@ document.querySelectorAll('.pair-select').forEach(checkbox=>{
     updateOverview(mode);
     if(document.body.dataset.reportMode===mode) renderActiveDetail(mode);
   });
+});
+document.addEventListener('keydown',event=>{
+  if(event.repeat||event.altKey||event.ctrlKey||event.metaKey||event.shiftKey) return;
+  if(!/^[1-9]$/.test(event.key)) return;
+  const target=event.target;
+  if(target instanceof HTMLElement && (
+    target.isContentEditable||['INPUT','TEXTAREA','SELECT'].includes(target.tagName)
+  )) return;
+  const mode=document.body.dataset.reportMode||'raw';
+  const key=orderedSelectedKeys(mode)[Number(event.key)-1];
+  if(!key) return;
+  event.preventDefault();
+  activatePair(mode,key);
 });
 function setReportMode(mode) {
   document.body.dataset.reportMode=mode;

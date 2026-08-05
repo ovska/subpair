@@ -137,6 +137,7 @@ by default); the selected pairs feed the combined overview and appear as pair
 tabs below the table for fast one-at-a-time diagnostics. The overview itself
 switches between magnitude and excess group delay. The Raw/EQ'd tabs maintain
 independent selections and switch the appropriate raw or corrected traces.
+Number keys 1–9 open the corresponding selected pair tab in the active mode.
 Metric cells use a best-to-worst colour scale. `report --top N` changes the
 initial selection count. No network connection or CDN is used when the report
 is viewed.
