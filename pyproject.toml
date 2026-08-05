@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "subpair"
+version = "0.1.0"
+description = "Rank two-subwoofer placements from time-referenced REW measurements"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "subpair contributors" }]
+dependencies = [
+  "numpy>=1.25",
+  "scipy>=1.11",
+  "plotly>=5.18",
+]
+
+[project.scripts]
+subpair = "subpair.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
