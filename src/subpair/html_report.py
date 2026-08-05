@@ -45,39 +45,30 @@ def _magnitude_figure(pair: dict[str, Any], data: dict[str, Any]) -> go.Figure:
     f = data["frequencies"]
     figure = go.Figure()
     figure.add_trace(
-        go.Scatter(x=f, y=data["solo_first_db"], name=pair["first_name"], line={"dash": "dot"})
+        go.Scatter(
+            x=f,
+            y=data["solo_first_db"],
+            name=pair["first_name"],
+            line={"color": "#fb7185", "width": 1.4},
+        )
     )
     figure.add_trace(
-        go.Scatter(x=f, y=data["solo_second_db"], name=pair["second_name"], line={"dash": "dot"})
+        go.Scatter(
+            x=f,
+            y=data["solo_second_db"],
+            name=pair["second_name"],
+            line={"color": "#fbbf24", "width": 1.4},
+        )
     )
     figure.add_trace(
         go.Scatter(x=f, y=data["sum_db"], name="Raw sum", line={"color": "#7dd3fc", "width": 1})
     )
-    if data["eq_target"] == "flat":
-        figure.add_trace(
-            go.Scatter(
-                x=f,
-                y=data["eq_nominal_target_db"],
-                name="Nominal flat target",
-                line={"color": "#e879f9", "width": 1.2, "dash": "dot"},
-                visible="legendonly",
-            )
-        )
     figure.add_trace(
         go.Scatter(
             x=f,
             y=data["eq_target_db"],
             name="EQ target (range/GD aware)",
-            line={"color": "#f0abfc", "width": 1.5, "dash": "longdash"},
-            visible="legendonly",
-        )
-    )
-    figure.add_trace(
-        go.Scatter(
-            x=f,
-            y=data["trend_db"],
-            name="1-oct trend",
-            line={"color": "#fb7185", "width": 2},
+            line={"color": "#e879f9", "width": 1.5},
             visible="legendonly",
         )
     )
@@ -86,15 +77,32 @@ def _magnitude_figure(pair: dict[str, Any], data: dict[str, Any]) -> go.Figure:
             x=f,
             y=data["post_eq_db"],
             name="Post-EQ sum",
-            line={"color": "#86efac", "width": 1.5, "dash": "dash"},
+            line={"color": "#86efac", "width": 1.7},
             visible="legendonly",
+        )
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=f,
+            y=np.asarray(data["post_eq_db"]) - np.asarray(data["sum_db"]),
+            name="Combined PEQ response (all bands)",
+            line={"color": "#c4b5fd", "width": 1.7},
+            visible="legendonly",
+            yaxis="y2",
         )
     )
     figure.update_layout(
         title="Magnitude: solos and optimised sum",
         xaxis={"type": "log", "title": "Frequency (Hz)"},
         yaxis={"title": "Level (dB; cache reference)"},
-        margin={"l": 62, "r": 24, "t": 52, "b": 55},
+        yaxis2={
+            "title": "Combined PEQ gain (dB)",
+            "overlaying": "y",
+            "side": "right",
+            "showgrid": False,
+            "visible": False,
+        },
+        margin={"l": 62, "r": 70, "t": 52, "b": 55},
         legend={"orientation": "h", "y": -0.22},
         template="plotly_dark",
         height=510,
@@ -153,7 +161,7 @@ def _excess_figure(data: dict[str, Any]) -> go.Figure:
         go.Scatter(
             x=data["frequencies"],
             y=100.0 * np.asarray(data["eq_authority"]),
-            line={"color": "#86efac", "width": 1.5, "dash": "dash"},
+            line={"color": "#86efac", "width": 1.5},
             name="EQ authority",
             yaxis="y2",
         )
@@ -318,7 +326,7 @@ def build_report(
             eq_settings.get("correction_slope_db_per_octave", 48.0)
         ),
         max_boost_db=float(eq_settings.get("max_boost_db", 0.0)),
-        max_filters=int(eq_settings.get("max_filters", 4)),
+        max_filters=int(eq_settings.get("max_filters", 7)),
     )
     required_ranking_fields = {
         "rank",
@@ -467,6 +475,15 @@ document.querySelectorAll('.ranking-table th').forEach((th,index)=>{{
       return (av<bv?-1:av>bv?1:0)*(ascending?1:-1);
     }});
     rows.forEach(row=>body.appendChild(row));
+  }});
+}});
+document.querySelectorAll('.pair-detail .plotly-graph-div[id^="magnitude-"]').forEach(plot=>{{
+  plot.on('plotly_legendclick',event=>{{
+    const trace=plot.data[event.curveNumber];
+    if(trace && trace.name==='Combined PEQ response (all bands)') {{
+      const willShow=trace.visible==='legendonly';
+      Plotly.relayout(plot,{{'yaxis2.visible':willShow}});
+    }}
   }});
 }});
 const reportTop={int(top)};

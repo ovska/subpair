@@ -99,7 +99,7 @@ class EqOptions:
     correction_range: tuple[float, float] | None = None
     correction_slope_db_per_octave: float = 48.0
     max_boost_db: float = 0.0
-    max_filters: int = 4
+    max_filters: int = 7
 
     def __post_init__(self) -> None:
         if self.target not in {"trend", "flat"}:

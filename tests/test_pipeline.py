@@ -217,7 +217,7 @@ class PipelineTests(unittest.TestCase):
                 loaded["settings"]["ranking"]["excess_gd_range_hz"],
                 [25.0, 150.0],
             )
-            self.assertEqual(loaded["settings"]["eq"]["max_filters"], 4)
+            self.assertEqual(loaded["settings"]["eq"]["max_filters"], 7)
             self.assertEqual(
                 loaded["settings"]["ranking"]["magnitude_basis"],
                 "raw, unsmoothed",
@@ -237,6 +237,10 @@ class PipelineTests(unittest.TestCase):
             self.assertIn("setReportMode('eq')", page)
             self.assertIn('"visible":"legendonly"', page)
             self.assertNotIn("Variable smoothed", page)
+            self.assertNotIn("Nominal flat target", page)
+            self.assertNotIn("1-oct trend", page)
+            self.assertNotIn('"dash":', page)
+            self.assertIn("Combined PEQ response (all bands)", page)
             self.assertIn('"shape":"spline"', page)
             self.assertIn("EQ authority", page)
             self.assertIn("background:hsla(", page)

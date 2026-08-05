@@ -136,9 +136,9 @@ def _build_parser() -> argparse.ArgumentParser:
     search.add_argument(
         "--eq-bands",
         type=_bounded_int(0, 16),
-        default=4,
+        default=7,
         metavar="COUNT",
-        help="maximum PEQ band count, 0..16 (default: 4)",
+        help="maximum PEQ band count, 0..16 (default: 7)",
     )
     search.add_argument("--top", type=_positive_int, default=10, help="rows to print")
 

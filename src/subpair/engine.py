@@ -23,7 +23,7 @@ class SearchOptions:
     eq_range_hz: tuple[float, float] | None = None
     eq_range_slope_db_per_octave: float = 48.0
     max_boost_db: float = 0.0
-    eq_bands: int = 4
+    eq_bands: int = 7
 
 
 def _best_configurations(

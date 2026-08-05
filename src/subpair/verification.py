@@ -124,7 +124,7 @@ def run_verification(
             y=deviation,
             name="Deviation",
             yaxis="y2",
-            line={"dash": "dot", "color": "#fb7185"},
+            line={"color": "#fb7185", "width": 1.7},
         )
     )
     figure.update_layout(

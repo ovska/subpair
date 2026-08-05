@@ -21,7 +21,7 @@ three solo measurements made with the same loopback timing reference. Then:
 ```sh
 subpair fetch --count 12
 subpair search --band 25 150 \
-  --delay-range -10 10 0.1 --gain-range -3 3 0.5 --eq-bands 4 --top 10
+  --delay-range -10 10 0.1 --gain-range -3 3 0.5 --eq-bands 7 --top 10
 subpair report --top 5 --output subpair-report.html
 ```
 
@@ -93,7 +93,7 @@ the complex sum.
 The PEQ simulator uses constrained greedy target matching with RBJ constant-Q
 bells: it evaluates the largest raw-magnitude target errors and retains the
 candidate that most reduces the weighted global error. `--eq-bands COUNT`
-allows 0–16 bands and defaults to 4; zero cleanly disables EQ. The default
+allows 0–16 bands and defaults to 7; zero cleanly disables EQ. The default
 `--eq-target trend` follows the broad response and `--max-boost 0` preserves
 cuts-only behaviour. `--eq-target flat` or `--aggressive-correction` uses a
 flat in-range target; `--max-boost` permits 0–12 dB of *combined* boost.
