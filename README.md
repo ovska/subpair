@@ -132,10 +132,14 @@ drive). Raw and EQ'd modes each reference their own rank 1.
 
 Produces one HTML file containing Plotly itself, sortable raw and EQ'd tables,
 top-pair response diagnostics, CSD-style pre/post-EQ heatmaps, and copyable
-PEQ text. The tabs at the top switch the ranking table, combined top-five sum
-plot, top-five detail membership/order, and the active raw/post-EQ sum trace.
-Metric cells use a best-to-worst colour scale. No network connection or CDN
-is used when the report is viewed.
+PEQ text. Each ranking table has selection checkboxes (its top five are checked
+by default); the selected pairs feed the combined overview and appear as pair
+tabs below the table for fast one-at-a-time diagnostics. The overview itself
+switches between magnitude and excess group delay. The Raw/EQ'd tabs maintain
+independent selections and switch the appropriate raw or corrected traces.
+Metric cells use a best-to-worst colour scale. `report --top N` changes the
+initial selection count. No network connection or CDN is used when the report
+is viewed.
 
 ### `subpair verify`
 

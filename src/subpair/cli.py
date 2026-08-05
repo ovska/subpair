@@ -146,7 +146,12 @@ def _build_parser() -> argparse.ArgumentParser:
     report.add_argument("--cache", type=Path, default=DEFAULT_CACHE, help="cache directory")
     report.add_argument("--results", type=Path, help="search JSON input path")
     report.add_argument("--output", type=Path, default=Path("subpair-report.html"))
-    report.add_argument("--top", type=_positive_int, default=5, help="pairs with full plots")
+    report.add_argument(
+        "--top",
+        type=_positive_int,
+        default=5,
+        help="pairs selected initially in each ranking mode",
+    )
 
     verify = commands.add_parser("verify", help="compare one physical sum with a prediction")
     verify.add_argument("--url", default=DEFAULT_REW_URL, help="REW API root URL")
