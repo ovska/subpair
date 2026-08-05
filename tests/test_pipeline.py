@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,6 +9,7 @@ from pathlib import Path
 import numpy as np
 
 from subpair.cache import CacheError, write_cache
+from subpair.cli import _build_parser
 from subpair.engine import SearchOptions, run_search
 from subpair.dsp import (
     EqOptions,
@@ -31,6 +33,11 @@ def _synthetic_ir(sample_rate: float, length: int, delay: int, modes: list[tuple
 
 
 class PipelineTests(unittest.TestCase):
+    def test_report_result_limit_argument(self):
+        parser = _build_parser()
+        self.assertEqual(parser.parse_args(["report"]).limit, 15)
+        self.assertEqual(parser.parse_args(["report", "--limit", "24"]).limit, 24)
+
     def test_peq_is_a_local_cut_not_broadband_attenuation(self):
         frequencies = np.asarray([25.0, 80.0, 150.0])
         response_db = db20(peq_response(frequencies, 4000.0, 80.0, 4.0, -6.0))
@@ -223,9 +230,9 @@ class PipelineTests(unittest.TestCase):
                 "raw, unsmoothed",
             )
             report = root / "report.html"
-            build_report(cache, results_path, report, top=2)
+            build_report(cache, results_path, report, top=2, limit=3)
             first_render = report.read_bytes()
-            build_report(cache, results_path, report, top=2)
+            build_report(cache, results_path, report, top=2, limit=3)
             self.assertEqual(first_render, report.read_bytes())
             page = first_render.decode()
             self.assertIn("plotly.js", page.lower())
@@ -244,9 +251,18 @@ class PipelineTests(unittest.TestCase):
             self.assertIn("Hotkeys 1–9", page)
             self.assertIn("aria-keyshortcuts", page)
             self.assertIn("document.addEventListener('keydown'", page)
-            self.assertEqual(page.count('class="pair-select"'), 12)
+            self.assertIn("showing up to 3 pairs per mode", page)
+            self.assertEqual(page.count('class="pair-select"'), 6)
             self.assertEqual(page.count(" checked aria-label"), 4)
-            self.assertEqual(page.count('class="pair-detail"'), 6)
+            table_pair_keys = set(
+                re.findall(
+                    r'class="pair-select"[^>]*data-pair-key="([^"]+)"', page
+                )
+            )
+            detail_pair_keys = set(
+                re.findall(r'class="pair-detail" data-pair-key="([^"]+)"', page)
+            )
+            self.assertEqual(detail_pair_keys, table_pair_keys)
             self.assertIn('"visible":"legendonly"', page)
             self.assertNotIn("Variable smoothed", page)
             self.assertNotIn("Nominal flat target", page)
@@ -257,6 +273,12 @@ class PipelineTests(unittest.TestCase):
             self.assertIn("EQ authority", page)
             self.assertIn("background:hsla(", page)
             self.assertIn("Fitted PEQ filters", page)
+            self.assertIn("Pre-EQ excess GD", page)
+            self.assertIn("Post-EQ excess GD", page)
+            self.assertIn("zero-referenced excess-GD overlay", page)
+            self.assertEqual(page.count('"staticPlot": true'), len(detail_pair_keys))
+            self.assertEqual(page.count('"displayModeBar": false'), len(detail_pair_keys))
+            self.assertNotIn("#f0abfc", page)
             self.assertGreater(report.stat().st_size, 1_000_000)
 
 

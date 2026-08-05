@@ -22,7 +22,7 @@ three solo measurements made with the same loopback timing reference. Then:
 subpair fetch --count 12
 subpair search --band 25 150 \
   --delay-range -10 10 0.1 --gain-range -3 3 0.5 --eq-bands 7 --top 10
-subpair report --top 5 --output subpair-report.html
+subpair report --top 5 --limit 15 --output subpair-report.html
 ```
 
 For an aggressive, range-limited flat target with bounded boost:
@@ -139,8 +139,16 @@ switches between magnitude and excess group delay. The Raw/EQ'd tabs maintain
 independent selections and switch the appropriate raw or corrected traces.
 Number keys 1–9 open the corresponding selected pair tab in the active mode.
 Metric cells use a best-to-worst colour scale. `report --top N` changes the
-initial selection count. No network connection or CDN is used when the report
-is viewed.
+initial selection count. `report --limit N` limits each ranking table and its
+selectable diagnostics to the top N results (default 15). No network connection
+or CDN is used when the report is viewed.
+
+Each CSD heatmap includes the corresponding zero-referenced excess-group-delay
+curve and a solid 0 ms reference. A vertical overlay indicates constant delay;
+frequency-dependent bends expose excess storage without relying on visual
+estimation of the heatmap ridge. Pre- and post-EQ overlays use the same colour
+for direct shape comparison, and CSD figures are static to avoid accidental
+zooming or panning.
 
 ### `subpair verify`
 

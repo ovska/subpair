@@ -32,11 +32,14 @@ def load_results(path: Path) -> dict[str, Any]:
     return value
 
 
-def _plot_html(figure: go.Figure, div_id: str) -> str:
+def _plot_html(figure: go.Figure, div_id: str, *, static: bool = False) -> str:
+    config = {"displaylogo": False, "responsive": True}
+    if static:
+        config.update({"staticPlot": True, "displayModeBar": False})
     return figure.to_html(
         full_html=False,
         include_plotlyjs=False,
-        config={"displaylogo": False, "responsive": True},
+        config=config,
         div_id=div_id,
     )
 
@@ -258,13 +261,50 @@ def _decay_figure(data: dict[str, Any]) -> go.Figure:
     figure.add_trace(
         go.Heatmap(z=data["post_decay_db"], showscale=True, **common), row=1, col=2
     )
+    overlay_common = {
+        "mode": "lines",
+        "line": {
+            "color": "#f8fafc",
+            "width": 2.5,
+            "shape": "spline",
+            "smoothing": 1.0,
+        },
+        "hovertemplate": "%{y:.1f} Hz · %{x:.2f} ms<extra></extra>",
+    }
+    figure.add_trace(
+        go.Scatter(
+            x=data["excess_curve_ms"],
+            y=data["frequencies"],
+            name="Pre-EQ excess GD",
+            line=overlay_common["line"],
+            mode=overlay_common["mode"],
+            hovertemplate=overlay_common["hovertemplate"],
+        ),
+        row=1,
+        col=1,
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=data["post_eq_excess_curve_ms"],
+            y=data["frequencies"],
+            name="Post-EQ excess GD",
+            line=overlay_common["line"],
+            mode=overlay_common["mode"],
+            hovertemplate=overlay_common["hovertemplate"],
+        ),
+        row=1,
+        col=2,
+    )
+    figure.add_vline(x=0.0, line={"color": "#94a3b8", "width": 1}, row=1, col=1)
+    figure.add_vline(x=0.0, line={"color": "#94a3b8", "width": 1}, row=1, col=2)
     figure.update_xaxes(title_text="Time from sum peak (ms)")
     figure.update_yaxes(type="log", title_text="Frequency (Hz)", row=1, col=1)
     figure.update_layout(
-        title="CSD-style constant-percentage-band decay",
+        title="CSD-style decay with zero-referenced excess-GD overlay",
         template="plotly_dark",
-        height=480,
-        margin={"l": 66, "r": 70, "t": 72, "b": 55},
+        height=520,
+        legend={"orientation": "h", "y": -0.18},
+        margin={"l": 66, "r": 70, "t": 72, "b": 82},
     )
     return figure
 
@@ -377,7 +417,10 @@ def build_report(
     results_path: Path,
     output_path: Path,
     top: int = 5,
+    limit: int = 15,
 ) -> Path:
+    if limit < 1:
+        raise ReportError("Report result limit must be at least 1")
     results = load_results(results_path)
     measurements, _ = load_cache(cache_dir)
     if len(measurements) != int(results.get("measurement_count", -1)):
@@ -416,8 +459,8 @@ def build_report(
             "Search results predate dual raw/EQ ranking; run 'subpair search' again"
         )
     context = AnalysisContext(measurements, band, int(settings["ppo"]))
-    raw_pairs = sorted(results["pairs"], key=lambda pair: int(pair["rank"]))
-    eq_pairs = sorted(results["pairs"], key=lambda pair: int(pair["eq_rank"]))
+    raw_pairs = sorted(results["pairs"], key=lambda pair: int(pair["rank"]))[:limit]
+    eq_pairs = sorted(results["pairs"], key=lambda pair: int(pair["eq_rank"]))[:limit]
 
     def pair_key(pair: dict[str, Any]) -> str:
         return f"{int(pair['first'])}-{int(pair['second'])}"
@@ -427,10 +470,16 @@ def build_report(
     eq_default_keys = {pair_key(pair) for pair in eq_pairs[:default_count]}
     detail_sections = []
     diagnostic_by_key: dict[str, dict[str, Any]] = {}
-    # Every table row can be selected interactively, so every pair receives a
-    # pre-rendered offline diagnostic section. This keeps tab switching instant
-    # and preserves the report's no-server, no-CDN contract.
-    for pair in raw_pairs:
+    # Every displayed row can be selected interactively. Pre-render the union
+    # of the limited raw and EQ'd rankings so either table has instant, offline
+    # diagnostics without retaining every pair in the report.
+    displayed_pairs = list(raw_pairs)
+    displayed_keys = {pair_key(pair) for pair in displayed_pairs}
+    for pair in eq_pairs:
+        if pair_key(pair) not in displayed_keys:
+            displayed_pairs.append(pair)
+            displayed_keys.add(pair_key(pair))
+    for pair in displayed_pairs:
         data = pair_diagnostics(
             context,
             int(pair["first"]) - 1,
@@ -461,10 +510,11 @@ def build_report(
                 EQ: {html.escape(eq_options.target)} target, {eq_range[0]:g}–{eq_range[1]:g} Hz,
                 {eq_options.correction_slope_db_per_octave:g} dB/oct curtain,
                 max boost {eq_options.max_boost_db:g} dB, up to
-                {eq_options.max_filters} PEQ bands; excess-GD guarded</p>
+                {eq_options.max_filters} PEQ bands; excess-GD guarded.<br>
+                CSD overlay: excess GD with common delay removed; a vertical line is frequency-independent delay.</p>
               {_plot_html(_magnitude_figure(pair, data), f'magnitude-{key}')}
               {_plot_html(_excess_figure(data), f'excess-{key}')}
-              {_plot_html(_decay_figure(data), f'decay-{key}')}
+              {_plot_html(_decay_figure(data), f'decay-{key}', static=True)}
               <div class="peq"><h3>Fitted PEQ filters</h3><button onclick="copyPeq(this)">Copy</button>
               <pre>{html.escape(peq)}</pre></div>
             </section>
@@ -523,7 +573,7 @@ details {{ margin:22px 0; }} details pre {{ overflow:auto; color:var(--muted); }
 </head>
 <body><main>
 <h1>subpair ranking</h1>
-<p class="lede">{results['measurement_count']} positions · {band[0]:g}–{band[1]:g} Hz · {settings['ppo']} points/octave · dual lexicographic ranking</p>
+<p class="lede">{results['measurement_count']} positions · {band[0]:g}–{band[1]:g} Hz · {settings['ppo']} points/octave · dual lexicographic ranking · showing up to {limit} pairs per mode</p>
 <div class="mode-tabs" role="tablist" aria-label="Ranking response mode">
   <button class="mode-tab active" id="raw-mode-tab" role="tab" aria-selected="true" onclick="setReportMode('raw')">Raw</button>
   <button class="mode-tab" id="eq-mode-tab" role="tab" aria-selected="false" onclick="setReportMode('eq')">EQ’d</button>

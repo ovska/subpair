@@ -152,6 +152,13 @@ def _build_parser() -> argparse.ArgumentParser:
         default=5,
         help="pairs selected initially in each ranking mode",
     )
+    report.add_argument(
+        "--limit",
+        type=_positive_int,
+        default=15,
+        metavar="COUNT",
+        help="maximum ranked pairs shown per mode (default: 15)",
+    )
 
     verify = commands.add_parser("verify", help="compare one physical sum with a prediction")
     verify.add_argument("--url", default=DEFAULT_REW_URL, help="REW API root URL")
@@ -278,7 +285,13 @@ def _search(args: argparse.Namespace) -> int:
 
 def _report(args: argparse.Namespace) -> int:
     results = _results_path(args.cache, args.results)
-    output = build_report(args.cache, results, args.output, args.top)
+    output = build_report(
+        args.cache,
+        results,
+        args.output,
+        top=args.top,
+        limit=args.limit,
+    )
     print(f"Wrote self-contained report to {output.resolve()}")
     return 0
 
