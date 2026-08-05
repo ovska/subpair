@@ -50,21 +50,6 @@ def _interp_complex(source_f: np.ndarray, source_h: np.ndarray, target_f: np.nda
     )
 
 
-def variable_smooth_db(values: np.ndarray, frequencies: np.ndarray, ppo: int) -> np.ndarray:
-    """1/6 octave below 100 Hz, narrowing smoothly toward 1/12 by 200 Hz."""
-    values = np.asarray(values, dtype=np.float64)
-    sigma_sixth = (ppo / 6.0) / 2.354820045
-    sigma_twelfth = (ppo / 12.0) / 2.354820045
-    broad = ndimage.gaussian_filter1d(
-        values, sigma=max(sigma_sixth, 0.01), axis=-1, mode="nearest", truncate=3.0
-    )
-    narrow = ndimage.gaussian_filter1d(
-        values, sigma=max(sigma_twelfth, 0.01), axis=-1, mode="nearest", truncate=3.0
-    )
-    blend = np.clip(np.log2(np.maximum(frequencies, 100.0) / 100.0), 0.0, 1.0)
-    return broad * (1.0 - blend) + narrow * blend
-
-
 def broad_trend_db(values: np.ndarray, ppo: int) -> np.ndarray:
     sigma = ppo / 2.354820045  # one-octave FWHM
     return ndimage.gaussian_filter1d(
@@ -78,9 +63,8 @@ def broad_trend_db(values: np.ndarray, ppo: int) -> np.ndarray:
 
 def null_scores(spectra: np.ndarray, frequencies: np.ndarray, ppo: int) -> np.ndarray:
     magnitude_db = db20(spectra)
-    smoothed = variable_smooth_db(magnitude_db, frequencies, ppo)
-    trend = broad_trend_db(smoothed, ppo)
-    return np.maximum(0.0, np.max(trend - smoothed, axis=-1))
+    trend = broad_trend_db(magnitude_db, ppo)
+    return np.maximum(0.0, np.max(trend - magnitude_db, axis=-1))
 
 
 def peq_response(
@@ -128,8 +112,8 @@ class EqOptions:
             raise ValueError("EQ correction range slope must be between 0 and 48 dB/oct")
         if not 0.0 <= self.max_boost_db <= 12.0:
             raise ValueError("EQ maximum boost must be between 0 and 12 dB")
-        if not 1 <= self.max_filters <= 4:
-            raise ValueError("EQ filter count must be between 1 and 4")
+        if not 0 <= self.max_filters <= 16:
+            raise ValueError("EQ filter count must be between 0 and 16")
 
 
 def _correction_range_authority(
@@ -216,7 +200,7 @@ def fit_eq_filters(
     excess_group_delay_ms: np.ndarray,
     options: EqOptions,
 ) -> tuple[list[dict[str, float]], np.ndarray, dict[str, Any]]:
-    """Fit up to four PEQs toward a range- and excess-GD-aware target."""
+    """Fit a bounded PEQ bank toward a range- and excess-GD-aware target."""
     frequencies = np.asarray(frequencies, dtype=np.float64)
     correction_range = options.correction_range or (
         float(frequencies[0]),
@@ -227,7 +211,7 @@ def fit_eq_filters(
             "EQ correction range must lie within the analysis band "
             f"{frequencies[0]:g}..{frequencies[-1]:g} Hz"
         )
-    base_db = variable_smooth_db(db20(spectrum), frequencies, ppo)
+    base_db = db20(spectrum)
     in_range = (frequencies >= correction_range[0]) & (
         frequencies <= correction_range[1]
     )
@@ -257,62 +241,89 @@ def fit_eq_filters(
     for _ in range(options.max_filters):
         total_db = db20(total)
         residual = desired - total_db
+        current_error = float(np.mean(objective_weights * residual**2))
         candidate_score = np.abs(residual)
         candidate_score[~in_range] = 0.0
         if options.max_boost_db <= 0.0:
             candidate_score[residual > 0.0] = 0.0
-        peak_index = int(np.argmax(candidate_score))
-        correction_db = float(residual[peak_index])
-        if candidate_score[peak_index] < threshold_db:
+        if float(np.max(candidate_score)) < threshold_db:
             break
-        sign = 1.0 if correction_db > 0.0 else -1.0
-        half = abs(correction_db) / 2.0
-        left = peak_index
-        right = peak_index
-        while left > 0 and sign * residual[left] > half:
-            left -= 1
-        while right < residual.size - 1 and sign * residual[right] > half:
-            right += 1
-        fc = float(frequencies[peak_index])
-        bandwidth = max(float(frequencies[right] - frequencies[left]), fc / 20.0)
-        q = float(np.clip(fc / bandwidth, 0.4, 12.0))
-        gain_db = float(np.clip(correction_db, -12.0, options.max_boost_db))
 
-        def trial_response(gain: float) -> tuple[np.ndarray, np.ndarray]:
-            response = total * peq_response(frequencies, sample_rate, fc, q, gain)
-            return response, db20(response)
+        # REW-style greedy assignment starts with the largest target errors,
+        # but several extrema are evaluated so an uncorrectable narrow null
+        # cannot prevent a broader, useful filter from being selected.
+        extrema, _ = signal.find_peaks(
+            candidate_score,
+            distance=max(1, int(round(ppo / 24.0))),
+        )
+        extrema = np.unique(np.append(extrema, int(np.argmax(candidate_score))))
+        ordered = extrema[np.argsort(candidate_score[extrema], kind="stable")][::-1]
+        ordered = ordered[:32]
+        best: tuple[float, np.ndarray, dict[str, float]] | None = None
+        for peak_index in ordered:
+            correction_db = float(residual[peak_index])
+            if abs(correction_db) < threshold_db:
+                continue
+            sign = 1.0 if correction_db > 0.0 else -1.0
+            half = abs(correction_db) / 2.0
+            left = int(peak_index)
+            right = int(peak_index)
+            while left > 0 and sign * residual[left] > half:
+                left -= 1
+            while right < residual.size - 1 and sign * residual[right] > half:
+                right += 1
+            fc = float(frequencies[peak_index])
+            bandwidth = max(float(frequencies[right] - frequencies[left]), fc / 20.0)
+            # Narrow cuts can tame room modes. Boosts are deliberately broad:
+            # miniDSP recommends Q <= 1 and warns against filling narrow nulls.
+            maximum_q = 1.0 if correction_db > 0.0 else 10.0
+            q = float(np.clip(fc / bandwidth, 0.4, maximum_q))
+            gain_db = float(np.clip(correction_db, -12.0, options.max_boost_db))
 
-        # The maximum boost is a ceiling on the combined EQ response, not only
-        # on an individual filter. Reduce a proposed boost until that invariant
-        # holds even when multiple bells overlap.
-        if gain_db > 0.0:
-            low_gain, high_gain = 0.0, gain_db
-            for _ in range(24):
-                mid_gain = 0.5 * (low_gain + high_gain)
-                _, mid_db = trial_response(mid_gain)
-                if float(np.max(mid_db)) <= options.max_boost_db + 1e-9:
-                    low_gain = mid_gain
-                else:
-                    high_gain = mid_gain
-            gain_db = low_gain
-            if gain_db < threshold_db:
-                break
+            def trial_response(gain: float) -> tuple[np.ndarray, np.ndarray]:
+                response = total * peq_response(
+                    frequencies, sample_rate, fc, q, gain
+                )
+                return response, db20(response)
 
-        current_error = float(np.mean(objective_weights * residual**2))
-        gain_db = round(gain_db, 3)
-        q = round(q, 3)
-        fc = round(fc, 3)
-        trial, trial_db = trial_response(gain_db)
-        trial_error = float(np.mean(objective_weights * (desired - trial_db) ** 2))
-        if trial_error >= current_error - 1e-6:
+            # Enforce max boost on the combined filter bank, not just on each
+            # proposed bell. This mirrors the separate overall-boost guard in
+            # established automatic EQ tools.
+            if gain_db > 0.0:
+                _, trial_db_at_limit = trial_response(gain_db)
+                if float(np.max(trial_db_at_limit)) > options.max_boost_db + 1e-9:
+                    low_gain, high_gain = 0.0, gain_db
+                    for _ in range(24):
+                        mid_gain = 0.5 * (low_gain + high_gain)
+                        _, mid_db = trial_response(mid_gain)
+                        if float(np.max(mid_db)) <= options.max_boost_db + 1e-9:
+                            low_gain = mid_gain
+                        else:
+                            high_gain = mid_gain
+                    gain_db = low_gain
+                if gain_db < threshold_db:
+                    continue
+
+            gain_db = (
+                math.floor(gain_db * 1000.0) / 1000.0
+                if gain_db > 0.0
+                else round(gain_db, 3)
+            )
+            q = round(q, 3)
+            fc = round(fc, 3)
+            trial, trial_db = trial_response(gain_db)
+            trial_error = float(
+                np.mean(objective_weights * (desired - trial_db) ** 2)
+            )
+            if trial_error >= current_error - 1e-6:
+                continue
+            current = {"fc_hz": fc, "gain_db": gain_db, "q": q}
+            if best is None or trial_error < best[0]:
+                best = (trial_error, trial, current)
+        if best is None:
             break
-        current = {
-            "fc_hz": fc,
-            "gain_db": gain_db,
-            "q": q,
-        }
+        _, total, current = best
         filters.append(current)
-        total = trial
     metadata: dict[str, Any] = {
         "target": options.target,
         "target_level_db": target_level,
@@ -571,8 +582,7 @@ def pair_diagnostics(
     eq_options = eq_options or EqOptions(correction_range=context.band)
     grid_sum = context.sum_on_grid(first, second, polarity, delay_ms, gain_db)
     magnitude_db = db20(grid_sum)
-    smoothed_db = variable_smooth_db(magnitude_db, context.frequencies, context.ppo)
-    trend_db = broad_trend_db(smoothed_db, context.ppo)
+    trend_db = broad_trend_db(magnitude_db, context.ppo)
     full_sum, full_frequencies = context.sum_full(
         first, second, polarity, delay_ms, gain_db
     )
@@ -603,10 +613,7 @@ def pair_diagnostics(
     )
     post_grid = grid_sum * eq_grid
     post_magnitude_db = db20(post_grid)
-    post_smoothed_db = variable_smooth_db(
-        post_magnitude_db, context.frequencies, context.ppo
-    )
-    post_trend_db = broad_trend_db(post_smoothed_db, context.ppo)
+    post_trend_db = broad_trend_db(post_magnitude_db, context.ppo)
     post_excess_score, post_excess_curve = excess_group_delay(
         post_full,
         full_frequencies,
@@ -614,12 +621,12 @@ def pair_diagnostics(
         integration_range=eq_options.correction_range,
     )
     result: dict[str, Any] = {
-        "null_score_db": float(np.max(np.maximum(0.0, trend_db - smoothed_db))),
+        "null_score_db": float(np.max(np.maximum(0.0, trend_db - magnitude_db))),
         "excess_gd_ms": float(excess_score),
         "raw_tail_ms": float(np.max(raw_tail_by_band)),
         "raw_tail_by_band_ms": [round(float(value), 6) for value in raw_tail_by_band],
         "post_eq_null_score_db": float(
-            np.max(np.maximum(0.0, post_trend_db - post_smoothed_db))
+            np.max(np.maximum(0.0, post_trend_db - post_magnitude_db))
         ),
         "post_eq_excess_gd_ms": float(post_excess_score),
         "post_eq_tail_ms": float(np.max(tail_by_band)),
@@ -644,13 +651,11 @@ def pair_diagnostics(
             {
                 "frequencies": context.frequencies,
                 "sum_db": magnitude_db,
-                "smoothed_db": smoothed_db,
                 "trend_db": trend_db,
                 "solo_first_db": db20(context.spectra[first]),
                 "solo_second_db": db20(context.spectra[second]),
                 "excess_curve_ms": excess_curve,
                 "post_eq_db": post_magnitude_db,
-                "post_eq_smoothed_db": post_smoothed_db,
                 "post_eq_trend_db": post_trend_db,
                 "post_eq_excess_curve_ms": post_excess_curve,
                 "eq_target_db": eq_metadata["effective_target_db"],

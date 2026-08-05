@@ -40,8 +40,7 @@ class PipelineTests(unittest.TestCase):
 
     def test_flat_eq_obeys_range_boost_and_excess_gd_guard(self):
         frequencies = log_frequency_grid(25.0, 150.0, 48)
-        octave_offset = np.log2(frequencies / 60.0)
-        magnitude_db = -8.0 * np.exp(-0.5 * (octave_offset / 0.12) ** 2)
+        magnitude_db = 6.0 * np.log2(frequencies / 55.0)
         spectrum = 10.0 ** (magnitude_db / 20.0)
         options = EqOptions(
             target="flat",
@@ -58,6 +57,9 @@ class PipelineTests(unittest.TestCase):
             options,
         )
         self.assertTrue(any(item["gain_db"] > 0.0 for item in filters))
+        self.assertTrue(
+            all(item["q"] <= 1.0 for item in filters if item["gain_db"] > 0.0)
+        )
         self.assertTrue(all(30.0 <= item["fc_hz"] <= 90.0 for item in filters))
         self.assertLessEqual(float(np.max(db20(response))), 6.001)
         self.assertLess(metadata["eq_authority"][0], 1.0)
@@ -74,6 +76,24 @@ class PipelineTests(unittest.TestCase):
         )
         self.assertEqual(guarded_filters, [])
         self.assertLess(float(np.max(guarded_metadata["eq_authority"])), 0.02)
+
+        disabled_filters, disabled_response, _ = fit_eq_filters(
+            spectrum,
+            frequencies,
+            4000.0,
+            48,
+            np.zeros_like(frequencies),
+            EqOptions(
+                target="flat",
+                correction_range=(30.0, 90.0),
+                max_boost_db=6.0,
+                max_filters=0,
+            ),
+        )
+        self.assertEqual(disabled_filters, [])
+        np.testing.assert_allclose(disabled_response, 1.0)
+        with self.assertRaisesRegex(ValueError, "between 0 and 16"):
+            EqOptions(max_filters=17)
 
     def test_excess_gd_authority_uses_a_broad_smooth_gate(self):
         frequencies = log_frequency_grid(25.0, 150.0, 48)
@@ -197,6 +217,11 @@ class PipelineTests(unittest.TestCase):
                 loaded["settings"]["ranking"]["excess_gd_range_hz"],
                 [25.0, 150.0],
             )
+            self.assertEqual(loaded["settings"]["eq"]["max_filters"], 4)
+            self.assertEqual(
+                loaded["settings"]["ranking"]["magnitude_basis"],
+                "raw, unsmoothed",
+            )
             report = root / "report.html"
             build_report(cache, results_path, report, top=2)
             first_render = report.read_bytes()
@@ -211,6 +236,7 @@ class PipelineTests(unittest.TestCase):
             self.assertIn("setReportMode('raw')", page)
             self.assertIn("setReportMode('eq')", page)
             self.assertIn('"visible":"legendonly"', page)
+            self.assertNotIn("Variable smoothed", page)
             self.assertIn('"shape":"spline"', page)
             self.assertIn("EQ authority", page)
             self.assertIn("background:hsla(", page)

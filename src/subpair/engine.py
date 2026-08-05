@@ -23,6 +23,7 @@ class SearchOptions:
     eq_range_hz: tuple[float, float] | None = None
     eq_range_slope_db_per_octave: float = 48.0
     max_boost_db: float = 0.0
+    eq_bands: int = 4
 
 
 def _best_configurations(
@@ -97,6 +98,7 @@ def run_search(
         correction_range=eq_range,
         correction_slope_db_per_octave=options.eq_range_slope_db_per_octave,
         max_boost_db=options.max_boost_db,
+        max_filters=options.eq_bands,
     )
     combinations = list(itertools.combinations(range(len(measurements)), 2))
     pairs: list[dict] = []
@@ -176,7 +178,7 @@ def run_search(
         )
 
     result = {
-        "format_version": 3,
+        "format_version": 4,
         "measurement_count": len(measurements),
         "sample_rate": measurements[0].sample_rate,
         "response_length": measurements[0].impulse.size,
@@ -211,6 +213,7 @@ def run_search(
                     "post_eq_tail_ms",
                 ],
                 "excess_gd_range_hz": list(eq_range),
+                "magnitude_basis": "raw, unsmoothed",
             },
         },
         "cache_manifest_format": manifest.get("format_version"),

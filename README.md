@@ -21,7 +21,7 @@ three solo measurements made with the same loopback timing reference. Then:
 ```sh
 subpair fetch --count 12
 subpair search --band 25 150 \
-  --delay-range -10 10 0.1 --gain-range -3 3 0.5 --top 10
+  --delay-range -10 10 0.1 --gain-range -3 3 0.5 --eq-bands 4 --top 10
 subpair report --top 5 --output subpair-report.html
 ```
 
@@ -62,9 +62,9 @@ the requested step.
 
 Two rankings are calculated, both strictly lexicographic:
 
-1. **Raw:** maximum dip of a 1/6-octave-smoothed magnitude below a
-   one-octave trend, energy-weighted mean absolute excess group delay, then
-   worst raw time-to-minus-20-dB across one-third-octave bands.
+1. **Raw:** maximum dip of the raw magnitude below a one-octave broad trend,
+   energy-weighted mean absolute excess group delay, then worst raw
+   time-to-minus-20-dB across one-third-octave bands.
 2. **EQ'd:** the same three measurements after applying the fitted PEQs.
 
 The excess-GD scalar used by both rankings is normalized and integrated only
@@ -74,11 +74,12 @@ full cached bandwidth and analysis grid so correction-range boundaries do not
 create Hilbert or numerical derivative artifacts.
 
 There is no weighted blend. Each later metric only breaks an exact tie in the
-earlier metrics. Smoothing is deliberately applied before null depth is
-measured, so thin comb notches do not win or lose the search. Both rankings
-use the same per-pair polarity, delay, and gain tuple selected by the
-exhaustive raw search; the EQ'd ranking answers which of those selected sums
-responds best to the requested correction.
+earlier metrics. Magnitude scoring and PEQ fitting use the raw log-grid samples
+without fractional-octave or variable smoothing. The one-octave trend is only
+the broad reference from which raw dips and the conservative target are
+measured. Both rankings use the same per-pair polarity, delay, and gain tuple
+selected by the exhaustive raw search; the EQ'd ranking answers which of those
+selected sums responds best to the requested correction.
 
 For minimum phase, subpair uses the real-cepstrum form of the Hilbert
 transform on the *full available 0-to-Nyquist magnitude*, not a brick-wall
@@ -89,10 +90,20 @@ energy-weighted constant component of excess delay is removed: it represents
 the arbitrary common timing offset, while relative arrival time remains in
 the complex sum.
 
-The PEQ simulator greedily fits at most four RBJ constant-Q bells. Its default
+The PEQ simulator uses constrained greedy target matching with RBJ constant-Q
+bells: it evaluates the largest raw-magnitude target errors and retains the
+candidate that most reduces the weighted global error. `--eq-bands COUNT`
+allows 0–16 bands and defaults to 4; zero cleanly disables EQ. The default
 `--eq-target trend` follows the broad response and `--max-boost 0` preserves
 cuts-only behaviour. `--eq-target flat` or `--aggressive-correction` uses a
 flat in-range target; `--max-boost` permits 0–12 dB of *combined* boost.
+
+Boost filters are capped at Q 1 so the fitter cannot use a sharp resonant bell
+to fill a narrow cancellation. Cuts may use Q up to 10 for modal peaks. The
+combined response is checked against `--max-boost` after every candidate, and
+areas with large excess group delay receive less fitting authority.
+These safeguards follow the [REW automatic-EQ controls](https://www.roomeqwizard.com/help/help_en-GB/html/eqwindow.html)
+and [miniDSP room-EQ guidance](https://www.minidsp.com/applications/home-theater-tuning/surround-equalization-with-10x10hd).
 
 `--eq-range LOW HIGH` constrains filter centres. The target correction is
 attenuated outside that range by `--eq-range-slope` (0–48 dB/oct); zero means

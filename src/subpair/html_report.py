@@ -53,15 +53,6 @@ def _magnitude_figure(pair: dict[str, Any], data: dict[str, Any]) -> go.Figure:
     figure.add_trace(
         go.Scatter(x=f, y=data["sum_db"], name="Raw sum", line={"color": "#7dd3fc", "width": 1})
     )
-    figure.add_trace(
-        go.Scatter(
-            x=f,
-            y=data["smoothed_db"],
-            name="Variable smoothed",
-            line={"color": "#fbbf24", "width": 2},
-            visible="legendonly",
-        )
-    )
     if data["eq_target"] == "flat":
         figure.add_trace(
             go.Scatter(
@@ -337,9 +328,9 @@ def build_report(
         "post_eq_excess_gd_ms",
         "post_eq_relative_spl_db",
     }
-    if int(results.get("format_version", 0)) < 3:
+    if int(results.get("format_version", 0)) < 4:
         raise ReportError(
-            "Search results predate EQ-range-limited excess-GD scoring; "
+            "Search results predate raw-magnitude scoring and configurable EQ bands; "
             "run 'subpair search' again"
         )
     if any(
@@ -388,7 +379,8 @@ def build_report(
                 excess GD {pair['post_eq_excess_gd_ms']:.3f} ms · tail {pair['post_eq_tail_ms']:.1f} ms</span><br>
                 EQ: {html.escape(eq_options.target)} target, {eq_range[0]:g}–{eq_range[1]:g} Hz,
                 {eq_options.correction_slope_db_per_octave:g} dB/oct curtain,
-                max boost {eq_options.max_boost_db:g} dB; excess-GD guarded</p>
+                max boost {eq_options.max_boost_db:g} dB, up to
+                {eq_options.max_filters} PEQ bands; excess-GD guarded</p>
               {_plot_html(_magnitude_figure(pair, data), f'magnitude-{key}')}
               {_plot_html(_excess_figure(data), f'excess-{key}')}
               {_plot_html(_decay_figure(data), f'decay-{key}')}
@@ -448,12 +440,12 @@ details {{ margin:22px 0; }} details pre {{ overflow:auto; color:var(--muted); }
 </div>
 <div data-mode-panel="raw">
   {_plot_html(_overview_figure(raw_overview, 'raw'), 'top-pairs-overview-raw') if raw_overview else ''}
-  <p class="note">Raw ranking: smoothed null depth, raw excess group delay, then raw tail.</p>
+  <p class="note">Raw ranking: raw-magnitude null depth, raw excess group delay, then raw tail.</p>
   <div class="table-wrap">{_ranking_table(raw_pairs, 'raw', 'ranking-raw')}</div>
 </div>
 <div data-mode-panel="eq" hidden>
   {_plot_html(_overview_figure(eq_overview, 'eq'), 'top-pairs-overview-eq') if eq_overview else ''}
-  <p class="note">EQ’d ranking: post-EQ smoothed null depth, post-EQ excess group delay, then post-EQ tail.</p>
+  <p class="note">EQ’d ranking: post-EQ raw-magnitude null depth, post-EQ excess group delay, then post-EQ tail.</p>
   <div class="table-wrap">{_ranking_table(eq_pairs, 'eq', 'ranking-eq')}</div>
 </div>
 <p class="note">Click a table heading to sort. Metric cells run from green (best) to red (worst); lower is better except relative SPL, where higher is better. Each mode references its own rank 1 for relative SPL.</p>

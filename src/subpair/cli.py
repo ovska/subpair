@@ -42,6 +42,16 @@ def _bounded_float(low: float, high: float):
     return parse
 
 
+def _bounded_int(low: int, high: int):
+    def parse(value: str) -> int:
+        parsed = int(value)
+        if not low <= parsed <= high:
+            raise argparse.ArgumentTypeError(f"must be between {low} and {high}")
+        return parsed
+
+    return parse
+
+
 def _results_path(cache: Path, explicit: Path | None) -> Path:
     return explicit if explicit is not None else cache / "search-results.json"
 
@@ -122,6 +132,13 @@ def _build_parser() -> argparse.ArgumentParser:
         default=0.0,
         metavar="DB",
         help="maximum combined PEQ boost, 0..12 dB (default: 0)",
+    )
+    search.add_argument(
+        "--eq-bands",
+        type=_bounded_int(0, 16),
+        default=4,
+        metavar="COUNT",
+        help="maximum PEQ band count, 0..16 (default: 4)",
     )
     search.add_argument("--top", type=_positive_int, default=10, help="rows to print")
 
@@ -241,6 +258,7 @@ def _search(args: argparse.Namespace) -> int:
         eq_range_hz=tuple(args.eq_range) if args.eq_range else None,
         eq_range_slope_db_per_octave=args.eq_range_slope,
         max_boost_db=args.max_boost,
+        eq_bands=args.eq_bands,
     )
 
     def progress(done: int, total: int, pair: str) -> None:
