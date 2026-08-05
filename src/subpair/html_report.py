@@ -59,10 +59,17 @@ def _magnitude_figure(pair: dict[str, Any], data: dict[str, Any]) -> go.Figure:
             y=data["smoothed_db"],
             name="Variable smoothed",
             line={"color": "#fbbf24", "width": 2},
+            visible="legendonly",
         )
     )
     figure.add_trace(
-        go.Scatter(x=f, y=data["trend_db"], name="1-oct trend", line={"color": "#fb7185", "width": 2})
+        go.Scatter(
+            x=f,
+            y=data["trend_db"],
+            name="1-oct trend",
+            line={"color": "#fb7185", "width": 2},
+            visible="legendonly",
+        )
     )
     figure.add_trace(
         go.Scatter(
@@ -70,6 +77,7 @@ def _magnitude_figure(pair: dict[str, Any], data: dict[str, Any]) -> go.Figure:
             y=data["post_eq_db"],
             name="Post-EQ sum",
             line={"color": "#86efac", "width": 1.5, "dash": "dash"},
+            visible="legendonly",
         )
     )
     figure.update_layout(
@@ -84,18 +92,45 @@ def _magnitude_figure(pair: dict[str, Any], data: dict[str, Any]) -> go.Figure:
     return figure
 
 
+def _overview_figure(rows: list[tuple[dict[str, Any], dict[str, Any]]]) -> go.Figure:
+    colors = ["#7dd3fc", "#fbbf24", "#c4b5fd", "#86efac", "#fb7185", "#f9a8d4"]
+    figure = go.Figure()
+    for index, (pair, data) in enumerate(rows):
+        figure.add_trace(
+            go.Scatter(
+                x=data["frequencies"],
+                y=data["sum_db"],
+                name=(
+                    f"#{pair['rank']} · {pair['first']}+{pair['second']} — "
+                    f"{pair['first_name']} + {pair['second_name']}"
+                ),
+                line={"color": colors[index % len(colors)], "width": 2.2},
+            )
+        )
+    figure.update_layout(
+        title="Top pair raw sums",
+        xaxis={"type": "log", "title": "Frequency (Hz)"},
+        yaxis={"title": "Raw summed level (dB; cache reference)"},
+        margin={"l": 62, "r": 24, "t": 52, "b": 55},
+        legend={"orientation": "h", "y": -0.22},
+        template="plotly_dark",
+        height=540,
+    )
+    return figure
+
+
 def _excess_figure(data: dict[str, Any]) -> go.Figure:
     figure = go.Figure(
         go.Scatter(
             x=data["frequencies"],
             y=data["excess_curve_ms"],
-            line={"color": "#c4b5fd", "width": 2},
+            line={"color": "#c4b5fd", "width": 2, "shape": "spline", "smoothing": 1.0},
             name="Excess GD",
         )
     )
     figure.add_hline(y=0.0, line={"color": "#64748b", "width": 1})
     figure.update_layout(
-        title="Excess group delay (constant delay removed)",
+        title="Excess group delay (display spline; raw data used for score)",
         xaxis={"type": "log", "title": "Frequency (Hz)"},
         yaxis={"title": "Excess GD (ms)"},
         margin={"l": 62, "r": 24, "t": 52, "b": 55},
@@ -163,6 +198,32 @@ def _ranking_table(pairs: list[dict[str, Any]]) -> str:
         f'<th data-key="{key}" data-type="{kind}">{html.escape(label)}</th>'
         for key, label, kind in columns
     )
+    metric_directions = {
+        "null_score_db": "low",
+        "excess_gd_ms": "low",
+        "post_eq_tail_ms": "low",
+        "relative_spl_db": "high",
+    }
+    metric_ranges: dict[str, tuple[float, float]] = {}
+    for key in metric_directions:
+        numeric = [float(pair[key]) for pair in pairs]
+        metric_ranges[key] = (min(numeric), max(numeric))
+
+    def score_style(key: str, value: float) -> str:
+        if key not in metric_directions:
+            return ""
+        low, high = metric_ranges[key]
+        if high == low:
+            worstness = 0.0
+        elif metric_directions[key] == "low":
+            worstness = (value - low) / (high - low)
+        else:
+            worstness = (high - value) / (high - low)
+        hue = 138.0 * (1.0 - float(np.clip(worstness, 0.0, 1.0)))
+        best = worstness <= 1e-12
+        outline = "box-shadow:inset 0 0 0 2px rgba(167,243,208,.85);" if best else ""
+        return f"background:hsla({hue:.1f},72%,38%,.48);{outline}"
+
     rows = []
     for pair in pairs:
         values: dict[str, tuple[str, str]] = {
@@ -179,11 +240,15 @@ def _ranking_table(pairs: list[dict[str, Any]]) -> str:
             "post_eq_tail_ms": (f"{pair['post_eq_tail_ms']:.1f}", str(pair["post_eq_tail_ms"])),
             "relative_spl_db": (f"{pair['relative_spl_db']:+.2f}", str(pair["relative_spl_db"])),
         }
-        cells = "".join(
-            f'<td data-value="{html.escape(values[key][1])}">{html.escape(values[key][0])}</td>'
-            for key, _, _ in columns
-        )
-        rows.append(f"<tr>{cells}</tr>")
+        cells = []
+        for key, _, _ in columns:
+            style = score_style(key, float(pair[key])) if key in metric_directions else ""
+            style_attribute = f' style="{style}"' if style else ""
+            cells.append(
+                f'<td data-value="{html.escape(values[key][1])}"{style_attribute}>'
+                f'{html.escape(values[key][0])}</td>'
+            )
+        rows.append(f"<tr>{''.join(cells)}</tr>")
     return f'<table id="ranking"><thead><tr>{heading}</tr></thead><tbody>{"".join(rows)}</tbody></table>'
 
 
@@ -202,6 +267,7 @@ def build_report(
     context = AnalysisContext(measurements, band, int(settings["ppo"]))
     selected = results["pairs"][: max(0, min(top, len(results["pairs"])))]
     detail_sections = []
+    diagnostic_rows: list[tuple[dict[str, Any], dict[str, Any]]] = []
     for pair in selected:
         data = pair_diagnostics(
             context,
@@ -213,6 +279,7 @@ def build_report(
             include_decay=True,
         )
         rank = int(pair["rank"])
+        diagnostic_rows.append((pair, data))
         peq = _peq_text(data["filters"])
         detail_sections.append(
             f"""
@@ -262,7 +329,8 @@ details {{ margin:22px 0; }} details pre {{ overflow:auto; color:var(--muted); }
 <body><main>
 <h1>subpair ranking</h1>
 <p class="lede">{results['measurement_count']} positions · {band[0]:g}–{band[1]:g} Hz · {settings['ppo']} points/octave · lexicographic ranking</p>
-<p class="note">Click a table heading to sort. Relative SPL is referenced to rank 1 and is not a ranking input.</p>
+{_plot_html(_overview_figure(diagnostic_rows[:5]), 'top-pairs-overview') if diagnostic_rows else ''}
+<p class="note">Click a table heading to sort. Metric cells run from green (best) to red (worst); lower is better except relative SPL, where higher is better. Relative SPL is referenced to rank 1 and is not a ranking input.</p>
 <div class="table-wrap">{_ranking_table(results['pairs'])}</div>
 <details><summary>Analysis settings and minimum-phase convention</summary><pre>{settings_json}</pre></details>
 {''.join(detail_sections)}

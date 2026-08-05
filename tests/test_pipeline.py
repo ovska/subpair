@@ -9,6 +9,7 @@ import numpy as np
 
 from subpair.cache import CacheError, write_cache
 from subpair.engine import SearchOptions, run_search
+from subpair.dsp import db20, peq_response
 from subpair.html_report import build_report
 
 
@@ -22,6 +23,13 @@ def _synthetic_ir(sample_rate: float, length: int, delay: int, modes: list[tuple
 
 
 class PipelineTests(unittest.TestCase):
+    def test_peq_is_a_local_cut_not_broadband_attenuation(self):
+        frequencies = np.asarray([25.0, 80.0, 150.0])
+        response_db = db20(peq_response(frequencies, 4000.0, 80.0, 4.0, -6.0))
+        self.assertAlmostEqual(response_db[1], -6.0, places=6)
+        self.assertGreater(response_db[0], -1.0)
+        self.assertGreater(response_db[2], -1.0)
+
     def test_rejects_mismatched_lengths(self):
         with tempfile.TemporaryDirectory() as temporary:
             rows = []
@@ -91,6 +99,10 @@ class PipelineTests(unittest.TestCase):
             page = first_render.decode()
             self.assertIn("plotly.js", page.lower())
             self.assertIn("id=\"ranking\"", page)
+            self.assertIn("id=\"top-pairs-overview\"", page)
+            self.assertIn('"visible":"legendonly"', page)
+            self.assertIn('"shape":"spline"', page)
+            self.assertIn("background:hsla(", page)
             self.assertIn("Fitted PEQ cuts", page)
             self.assertGreater(report.stat().st_size, 1_000_000)
 

@@ -89,15 +89,16 @@ def peq_response(
     """RBJ Audio EQ Cookbook peaking biquad response."""
     f = np.asarray(frequencies, dtype=np.float64)
     omega = 2.0 * np.pi * f / sample_rate
-    cosine = np.cos(omega)
-    sine = np.sin(omega)
+    omega0 = 2.0 * np.pi * fc / sample_rate
+    cosine0 = np.cos(omega0)
+    sine0 = np.sin(omega0)
     a = 10.0 ** (gain_db / 40.0)
-    alpha = sine / (2.0 * q)
+    alpha = sine0 / (2.0 * q)
     b0 = 1.0 + alpha * a
-    b1 = -2.0 * cosine
+    b1 = -2.0 * cosine0
     b2 = 1.0 - alpha * a
     a0 = 1.0 + alpha / a
-    a1 = -2.0 * cosine
+    a1 = -2.0 * cosine0
     a2 = 1.0 - alpha / a
     z1 = np.exp(-1j * omega)
     z2 = z1 * z1
