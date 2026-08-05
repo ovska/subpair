@@ -13,7 +13,7 @@ from plotly.offline import get_plotlyjs
 from plotly.subplots import make_subplots
 
 from .cache import load_cache
-from .dsp import AnalysisContext, pair_diagnostics
+from .dsp import AnalysisContext, EqOptions, pair_diagnostics
 
 
 class ReportError(RuntimeError):
@@ -62,6 +62,25 @@ def _magnitude_figure(pair: dict[str, Any], data: dict[str, Any]) -> go.Figure:
             visible="legendonly",
         )
     )
+    if data["eq_target"] == "flat":
+        figure.add_trace(
+            go.Scatter(
+                x=f,
+                y=data["eq_nominal_target_db"],
+                name="Nominal flat target",
+                line={"color": "#e879f9", "width": 1.2, "dash": "dot"},
+                visible="legendonly",
+            )
+        )
+    figure.add_trace(
+        go.Scatter(
+            x=f,
+            y=data["eq_target_db"],
+            name="EQ target (range/GD aware)",
+            line={"color": "#f0abfc", "width": 1.5, "dash": "longdash"},
+            visible="legendonly",
+        )
+    )
     figure.add_trace(
         go.Scatter(
             x=f,
@@ -92,25 +111,35 @@ def _magnitude_figure(pair: dict[str, Any], data: dict[str, Any]) -> go.Figure:
     return figure
 
 
-def _overview_figure(rows: list[tuple[dict[str, Any], dict[str, Any]]]) -> go.Figure:
+def _overview_figure(
+    rows: list[tuple[dict[str, Any], dict[str, Any]]], mode: str
+) -> go.Figure:
     colors = ["#7dd3fc", "#fbbf24", "#c4b5fd", "#86efac", "#fb7185", "#f9a8d4"]
     figure = go.Figure()
+    eq = mode == "eq"
     for index, (pair, data) in enumerate(rows):
         figure.add_trace(
             go.Scatter(
                 x=data["frequencies"],
-                y=data["sum_db"],
+                y=data["post_eq_db" if eq else "sum_db"],
                 name=(
-                    f"#{pair['rank']} · {pair['first']}+{pair['second']} — "
+                    f"#{pair['eq_rank' if eq else 'rank']} · "
+                    f"{pair['first']}+{pair['second']} — "
                     f"{pair['first_name']} + {pair['second_name']}"
                 ),
                 line={"color": colors[index % len(colors)], "width": 2.2},
             )
         )
     figure.update_layout(
-        title="Top pair raw sums",
+        title="Top pair EQ’d sums" if eq else "Top pair raw sums",
         xaxis={"type": "log", "title": "Frequency (Hz)"},
-        yaxis={"title": "Raw summed level (dB; cache reference)"},
+        yaxis={
+            "title": (
+                "Post-EQ summed level (dB; cache reference)"
+                if eq
+                else "Raw summed level (dB; cache reference)"
+            )
+        },
         margin={"l": 62, "r": 24, "t": 52, "b": 55},
         legend={"orientation": "h", "y": -0.22},
         template="plotly_dark",
@@ -120,7 +149,8 @@ def _overview_figure(rows: list[tuple[dict[str, Any], dict[str, Any]]]) -> go.Fi
 
 
 def _excess_figure(data: dict[str, Any]) -> go.Figure:
-    figure = go.Figure(
+    figure = go.Figure()
+    figure.add_trace(
         go.Scatter(
             x=data["frequencies"],
             y=data["excess_curve_ms"],
@@ -128,11 +158,26 @@ def _excess_figure(data: dict[str, Any]) -> go.Figure:
             name="Excess GD",
         )
     )
+    figure.add_trace(
+        go.Scatter(
+            x=data["frequencies"],
+            y=100.0 * np.asarray(data["eq_authority"]),
+            line={"color": "#86efac", "width": 1.5, "dash": "dash"},
+            name="EQ authority",
+            yaxis="y2",
+        )
+    )
     figure.add_hline(y=0.0, line={"color": "#64748b", "width": 1})
     figure.update_layout(
         title="Excess group delay (display spline; raw data used for score)",
         xaxis={"type": "log", "title": "Frequency (Hz)"},
         yaxis={"title": "Excess GD (ms)"},
+        yaxis2={
+            "title": "EQ authority (%)",
+            "overlaying": "y",
+            "side": "right",
+            "range": [0, 105],
+        },
         margin={"l": 62, "r": 24, "t": 52, "b": 55},
         template="plotly_dark",
         height=390,
@@ -145,7 +190,7 @@ def _decay_figure(data: dict[str, Any]) -> go.Figure:
         rows=1,
         cols=2,
         shared_yaxes=True,
-        subplot_titles=("Pre-EQ", "Post-EQ (cuts only)"),
+        subplot_titles=("Pre-EQ", "Post-EQ (bounded PEQ)"),
         horizontal_spacing=0.08,
     )
     common = {
@@ -182,27 +227,33 @@ def _peq_text(filters: list[dict[str, float]]) -> str:
     )
 
 
-def _ranking_table(pairs: list[dict[str, Any]]) -> str:
+def _ranking_table(pairs: list[dict[str, Any]], mode: str, table_id: str) -> str:
+    eq = mode == "eq"
+    rank_key = "eq_rank" if eq else "rank"
+    null_key = "post_eq_null_score_db" if eq else "null_score_db"
+    excess_key = "post_eq_excess_gd_ms" if eq else "excess_gd_ms"
+    tail_key = "post_eq_tail_ms" if eq else "raw_tail_ms"
+    spl_key = "post_eq_relative_spl_db" if eq else "relative_spl_db"
     columns = [
-        ("rank", "Rank", "number"),
+        (rank_key, "Rank", "number"),
         ("pair", "Pair", "text"),
         ("polarity", "Pol 2", "number"),
         ("delay_ms", "Delay 2 (ms)", "number"),
         ("gain_db", "Gain 2 (dB)", "number"),
-        ("null_score_db", "Worst null (dB)", "number"),
-        ("excess_gd_ms", "Excess GD (ms)", "number"),
-        ("post_eq_tail_ms", "Post-EQ tail (ms)", "number"),
-        ("relative_spl_db", "Relative SPL (dB)", "number"),
+        (null_key, "Worst null (dB)", "number"),
+        (excess_key, "Excess GD (ms)", "number"),
+        (tail_key, "Tail (ms)", "number"),
+        (spl_key, "Relative SPL (dB)", "number"),
     ]
     heading = "".join(
         f'<th data-key="{key}" data-type="{kind}">{html.escape(label)}</th>'
         for key, label, kind in columns
     )
     metric_directions = {
-        "null_score_db": "low",
-        "excess_gd_ms": "low",
-        "post_eq_tail_ms": "low",
-        "relative_spl_db": "high",
+        null_key: "low",
+        excess_key: "low",
+        tail_key: "low",
+        spl_key: "high",
     }
     metric_ranges: dict[str, tuple[float, float]] = {}
     for key in metric_directions:
@@ -227,7 +278,7 @@ def _ranking_table(pairs: list[dict[str, Any]]) -> str:
     rows = []
     for pair in pairs:
         values: dict[str, tuple[str, str]] = {
-            "rank": (str(pair["rank"]), str(pair["rank"])),
+            rank_key: (str(pair[rank_key]), str(pair[rank_key])),
             "pair": (
                 f"{pair['first']} + {pair['second']}",
                 f"{pair['first']:04d}-{pair['second']:04d}",
@@ -235,10 +286,10 @@ def _ranking_table(pairs: list[dict[str, Any]]) -> str:
             "polarity": ("+" if pair["polarity"] > 0 else "−", str(pair["polarity"])),
             "delay_ms": (f"{pair['delay_ms']:+.3f}", str(pair["delay_ms"])),
             "gain_db": (f"{pair['gain_db']:+.2f}", str(pair["gain_db"])),
-            "null_score_db": (f"{pair['null_score_db']:.3f}", str(pair["null_score_db"])),
-            "excess_gd_ms": (f"{pair['excess_gd_ms']:.3f}", str(pair["excess_gd_ms"])),
-            "post_eq_tail_ms": (f"{pair['post_eq_tail_ms']:.1f}", str(pair["post_eq_tail_ms"])),
-            "relative_spl_db": (f"{pair['relative_spl_db']:+.2f}", str(pair["relative_spl_db"])),
+            null_key: (f"{pair[null_key]:.3f}", str(pair[null_key])),
+            excess_key: (f"{pair[excess_key]:.3f}", str(pair[excess_key])),
+            tail_key: (f"{pair[tail_key]:.1f}", str(pair[tail_key])),
+            spl_key: (f"{pair[spl_key]:+.2f}", str(pair[spl_key])),
         }
         cells = []
         for key, _, _ in columns:
@@ -249,7 +300,10 @@ def _ranking_table(pairs: list[dict[str, Any]]) -> str:
                 f'{html.escape(values[key][0])}</td>'
             )
         rows.append(f"<tr>{''.join(cells)}</tr>")
-    return f'<table id="ranking"><thead><tr>{heading}</tr></thead><tbody>{"".join(rows)}</tbody></table>'
+    return (
+        f'<table id="{table_id}" class="ranking-table"><thead><tr>{heading}</tr></thead>'
+        f'<tbody>{"".join(rows)}</tbody></table>'
+    )
 
 
 def build_report(
@@ -264,10 +318,47 @@ def build_report(
         raise ReportError("Cache measurement count does not match the search results")
     settings = results["settings"]
     band = tuple(float(value) for value in settings["band_hz"])
+    eq_settings = settings.get("eq", {})
+    eq_range = tuple(float(value) for value in eq_settings.get("correction_range_hz", band))
+    eq_options = EqOptions(
+        target=str(eq_settings.get("target", "trend")),
+        correction_range=eq_range,
+        correction_slope_db_per_octave=float(
+            eq_settings.get("correction_slope_db_per_octave", 48.0)
+        ),
+        max_boost_db=float(eq_settings.get("max_boost_db", 0.0)),
+        max_filters=int(eq_settings.get("max_filters", 4)),
+    )
+    required_ranking_fields = {
+        "rank",
+        "eq_rank",
+        "raw_tail_ms",
+        "post_eq_null_score_db",
+        "post_eq_excess_gd_ms",
+        "post_eq_relative_spl_db",
+    }
+    if int(results.get("format_version", 0)) < 3:
+        raise ReportError(
+            "Search results predate EQ-range-limited excess-GD scoring; "
+            "run 'subpair search' again"
+        )
+    if any(
+        not required_ranking_fields.issubset(pair)
+        for pair in results["pairs"]
+    ):
+        raise ReportError(
+            "Search results predate dual raw/EQ ranking; run 'subpair search' again"
+        )
     context = AnalysisContext(measurements, band, int(settings["ppo"]))
-    selected = results["pairs"][: max(0, min(top, len(results["pairs"])))]
+    raw_pairs = sorted(results["pairs"], key=lambda pair: int(pair["rank"]))
+    eq_pairs = sorted(results["pairs"], key=lambda pair: int(pair["eq_rank"]))
+    raw_selected = raw_pairs[: max(0, min(top, len(raw_pairs)))]
+    eq_selected = eq_pairs[: max(0, min(top, len(eq_pairs)))]
+    pair_key = lambda pair: f"{int(pair['first'])}-{int(pair['second'])}"
+    selected_keys = {pair_key(pair) for pair in [*raw_selected, *eq_selected]}
+    selected = [pair for pair in raw_pairs if pair_key(pair) in selected_keys]
     detail_sections = []
-    diagnostic_rows: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    diagnostic_by_key: dict[str, dict[str, Any]] = {}
     for pair in selected:
         data = pair_diagnostics(
             context,
@@ -277,26 +368,42 @@ def build_report(
             float(pair["delay_ms"]),
             float(pair["gain_db"]),
             include_decay=True,
+            eq_options=eq_options,
         )
-        rank = int(pair["rank"])
-        diagnostic_rows.append((pair, data))
+        key = pair_key(pair)
+        diagnostic_by_key[key] = data
         peq = _peq_text(data["filters"])
         detail_sections.append(
             f"""
-            <section class="pair-detail">
-              <h2>#{rank}: {html.escape(pair['first_name'])} + {html.escape(pair['second_name'])}</h2>
+            <section class="pair-detail" data-pair-key="{key}"
+              data-raw-rank="{pair['rank']}" data-eq-rank="{pair['eq_rank']}"
+              style="order:{pair['rank']}">
+              <h2><span data-mode-copy="raw">#{pair['rank']} Raw</span><span data-mode-copy="eq">#{pair['eq_rank']} EQ’d</span>:
+                {html.escape(pair['first_name'])} + {html.escape(pair['second_name'])}</h2>
               <p class="configuration">Sub 2: {'normal' if pair['polarity'] > 0 else 'inverted'},
-                delay {pair['delay_ms']:+.3f} ms, gain {pair['gain_db']:+.2f} dB ·
-                null {pair['null_score_db']:.3f} dB · excess GD {pair['excess_gd_ms']:.3f} ms ·
-                post-EQ tail {pair['post_eq_tail_ms']:.1f} ms</p>
-              {_plot_html(_magnitude_figure(pair, data), f'magnitude-{rank}')}
-              {_plot_html(_excess_figure(data), f'excess-{rank}')}
-              {_plot_html(_decay_figure(data), f'decay-{rank}')}
-              <div class="peq"><h3>Fitted PEQ cuts</h3><button onclick="copyPeq(this)">Copy</button>
+                delay {pair['delay_ms']:+.3f} ms, gain {pair['gain_db']:+.2f} dB<br>
+                <span data-mode-copy="raw">Raw: null {pair['null_score_db']:.3f} dB ·
+                excess GD {pair['excess_gd_ms']:.3f} ms · tail {pair['raw_tail_ms']:.1f} ms</span>
+                <span data-mode-copy="eq">EQ’d: null {pair['post_eq_null_score_db']:.3f} dB ·
+                excess GD {pair['post_eq_excess_gd_ms']:.3f} ms · tail {pair['post_eq_tail_ms']:.1f} ms</span><br>
+                EQ: {html.escape(eq_options.target)} target, {eq_range[0]:g}–{eq_range[1]:g} Hz,
+                {eq_options.correction_slope_db_per_octave:g} dB/oct curtain,
+                max boost {eq_options.max_boost_db:g} dB; excess-GD guarded</p>
+              {_plot_html(_magnitude_figure(pair, data), f'magnitude-{key}')}
+              {_plot_html(_excess_figure(data), f'excess-{key}')}
+              {_plot_html(_decay_figure(data), f'decay-{key}')}
+              <div class="peq"><h3>Fitted PEQ filters</h3><button onclick="copyPeq(this)">Copy</button>
               <pre>{html.escape(peq)}</pre></div>
             </section>
             """
         )
+
+    raw_overview = [
+        (pair, diagnostic_by_key[pair_key(pair)]) for pair in raw_selected[:5]
+    ]
+    eq_overview = [
+        (pair, diagnostic_by_key[pair_key(pair)]) for pair in eq_selected[:5]
+    ]
 
     settings_json = html.escape(json.dumps(settings, sort_keys=True, indent=2))
     document = f"""<!doctype html>
@@ -312,6 +419,11 @@ body {{ margin:0; background:var(--bg); color:var(--text); font:15px/1.5 ui-sans
 main {{ width:min(1500px,96vw); margin:0 auto; padding:36px 0 80px; }}
 h1 {{ font-size:2.2rem; margin:0 0 4px; }} h2 {{ margin-top:0; }}
 .lede,.configuration,.note {{ color:var(--muted); }}
+.mode-tabs {{ display:inline-flex; gap:4px; margin:16px 0 20px; padding:4px; border:1px solid var(--line); border-radius:10px; background:#091322; }}
+.mode-tab {{ border:0; border-radius:7px; padding:9px 18px; color:var(--muted); background:transparent; cursor:pointer; font-weight:700; }}
+.mode-tab.active {{ color:#07111f; background:#7dd3fc; }}
+[hidden] {{ display:none !important; }}
+[data-mode-copy="eq"] {{ display:none; }}
 .table-wrap {{ overflow:auto; border:1px solid var(--line); border-radius:12px; background:var(--card); }}
 table {{ width:100%; border-collapse:collapse; white-space:nowrap; }}
 th,td {{ padding:10px 13px; text-align:right; border-bottom:1px solid var(--line); }}
@@ -319,6 +431,7 @@ th:nth-child(2),td:nth-child(2) {{ text-align:left; }}
 th {{ position:sticky; top:0; cursor:pointer; background:#142238; color:#c9d8eb; }}
 th:hover {{ background:#1b2d48; }} tbody tr:hover {{ background:#132238; }}
 .pair-detail {{ margin-top:32px; padding:24px; border:1px solid var(--line); border-radius:14px; background:var(--card); }}
+#pair-details {{ display:flex; flex-direction:column; }}
 .peq {{ position:relative; padding:16px; background:#091322; border-radius:9px; }}
 .peq h3 {{ margin:0 0 10px; }} .peq pre {{ margin:0; white-space:pre-wrap; color:#a7f3d0; }}
 .peq button {{ position:absolute; right:14px; top:14px; border:1px solid #49607e; border-radius:6px; padding:6px 11px; color:var(--text); background:#1c2d47; cursor:pointer; }}
@@ -328,20 +441,33 @@ details {{ margin:22px 0; }} details pre {{ overflow:auto; color:var(--muted); }
 </head>
 <body><main>
 <h1>subpair ranking</h1>
-<p class="lede">{results['measurement_count']} positions · {band[0]:g}–{band[1]:g} Hz · {settings['ppo']} points/octave · lexicographic ranking</p>
-{_plot_html(_overview_figure(diagnostic_rows[:5]), 'top-pairs-overview') if diagnostic_rows else ''}
-<p class="note">Click a table heading to sort. Metric cells run from green (best) to red (worst); lower is better except relative SPL, where higher is better. Relative SPL is referenced to rank 1 and is not a ranking input.</p>
-<div class="table-wrap">{_ranking_table(results['pairs'])}</div>
+<p class="lede">{results['measurement_count']} positions · {band[0]:g}–{band[1]:g} Hz · {settings['ppo']} points/octave · dual lexicographic ranking</p>
+<div class="mode-tabs" role="tablist" aria-label="Ranking response mode">
+  <button class="mode-tab active" id="raw-mode-tab" role="tab" aria-selected="true" onclick="setReportMode('raw')">Raw</button>
+  <button class="mode-tab" id="eq-mode-tab" role="tab" aria-selected="false" onclick="setReportMode('eq')">EQ’d</button>
+</div>
+<div data-mode-panel="raw">
+  {_plot_html(_overview_figure(raw_overview, 'raw'), 'top-pairs-overview-raw') if raw_overview else ''}
+  <p class="note">Raw ranking: smoothed null depth, raw excess group delay, then raw tail.</p>
+  <div class="table-wrap">{_ranking_table(raw_pairs, 'raw', 'ranking-raw')}</div>
+</div>
+<div data-mode-panel="eq" hidden>
+  {_plot_html(_overview_figure(eq_overview, 'eq'), 'top-pairs-overview-eq') if eq_overview else ''}
+  <p class="note">EQ’d ranking: post-EQ smoothed null depth, post-EQ excess group delay, then post-EQ tail.</p>
+  <div class="table-wrap">{_ranking_table(eq_pairs, 'eq', 'ranking-eq')}</div>
+</div>
+<p class="note">Click a table heading to sort. Metric cells run from green (best) to red (worst); lower is better except relative SPL, where higher is better. Each mode references its own rank 1 for relative SPL.</p>
 <details><summary>Analysis settings and minimum-phase convention</summary><pre>{settings_json}</pre></details>
-{''.join(detail_sections)}
+<div id="pair-details">{''.join(detail_sections)}</div>
 </main>
 <script>
-document.querySelectorAll('#ranking th').forEach((th,index)=>{{
+document.querySelectorAll('.ranking-table th').forEach((th,index)=>{{
   th.addEventListener('click',()=>{{
-    const body=document.querySelector('#ranking tbody');
+    const table=th.closest('table');
+    const body=table.querySelector('tbody');
     const rows=Array.from(body.querySelectorAll('tr'));
     const ascending=th.dataset.order!=='asc';
-    document.querySelectorAll('#ranking th').forEach(x=>delete x.dataset.order);
+    table.querySelectorAll('th').forEach(x=>delete x.dataset.order);
     th.dataset.order=ascending?'asc':'desc';
     rows.sort((a,b)=>{{
       let av=a.children[index].dataset.value, bv=b.children[index].dataset.value;
@@ -351,10 +477,39 @@ document.querySelectorAll('#ranking th').forEach((th,index)=>{{
     rows.forEach(row=>body.appendChild(row));
   }});
 }});
+const reportTop={int(top)};
+function setReportMode(mode) {{
+  document.body.dataset.reportMode=mode;
+  document.querySelectorAll('[data-mode-panel]').forEach(panel=>{{
+    panel.hidden=panel.dataset.modePanel!==mode;
+  }});
+  document.querySelectorAll('.mode-tab').forEach(button=>{{
+    const active=button.id===mode+'-mode-tab';
+    button.classList.toggle('active',active);
+    button.setAttribute('aria-selected',String(active));
+  }});
+  document.querySelectorAll('[data-mode-copy]').forEach(item=>{{
+    item.style.display=item.dataset.modeCopy===mode?'inline':'none';
+  }});
+  document.querySelectorAll('.pair-detail').forEach(section=>{{
+    const rank=Number(mode==='eq'?section.dataset.eqRank:section.dataset.rawRank);
+    section.hidden=rank>reportTop;
+    section.style.order=String(rank);
+    const plot=document.getElementById('magnitude-'+section.dataset.pairKey);
+    if(plot && plot.data) {{
+      const rawIndex=plot.data.findIndex(trace=>trace.name==='Raw sum');
+      const eqIndex=plot.data.findIndex(trace=>trace.name==='Post-EQ sum');
+      if(rawIndex>=0) Plotly.restyle(plot,{{visible:mode==='raw'?true:'legendonly'}},[rawIndex]);
+      if(eqIndex>=0) Plotly.restyle(plot,{{visible:mode==='eq'?true:'legendonly'}},[eqIndex]);
+    }}
+  }});
+  window.dispatchEvent(new Event('resize'));
+}}
 function copyPeq(button) {{
   navigator.clipboard.writeText(button.parentElement.querySelector('pre').innerText);
   const old=button.innerText; button.innerText='Copied'; setTimeout(()=>button.innerText=old,900);
 }}
+setReportMode('raw');
 </script></body></html>"""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(document, encoding="utf-8")

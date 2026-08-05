@@ -32,6 +32,16 @@ def _at_least_three(value: str) -> int:
     return parsed
 
 
+def _bounded_float(low: float, high: float):
+    def parse(value: str) -> float:
+        parsed = float(value)
+        if not low <= parsed <= high:
+            raise argparse.ArgumentTypeError(f"must be between {low:g} and {high:g}")
+        return parsed
+
+    return parse
+
+
 def _results_path(cache: Path, explicit: Path | None) -> Path:
     return explicit if explicit is not None else cache / "search-results.json"
 
@@ -81,6 +91,38 @@ def _build_parser() -> argparse.ArgumentParser:
         default=(-3.0, 3.0, 0.5),
     )
     search.add_argument("--ppo", type=_positive_int, default=48, help=argparse.SUPPRESS)
+    search.add_argument(
+        "--eq-target",
+        choices=("trend", "flat"),
+        default="trend",
+        help="PEQ target: broad trend or aggressive flat response",
+    )
+    search.add_argument(
+        "--aggressive-correction",
+        action="store_true",
+        help="alias for --eq-target flat",
+    )
+    search.add_argument(
+        "--eq-range",
+        nargs=2,
+        type=float,
+        metavar=("LOW_HZ", "HIGH_HZ"),
+        help="frequency range in which PEQ centres may be fitted (default: analysis band)",
+    )
+    search.add_argument(
+        "--eq-range-slope",
+        type=_bounded_float(0.0, 48.0),
+        default=48.0,
+        metavar="DB_PER_OCT",
+        help="correction curtain outside --eq-range, 0 is hard (default: 48)",
+    )
+    search.add_argument(
+        "--max-boost",
+        type=_bounded_float(0.0, 12.0),
+        default=0.0,
+        metavar="DB",
+        help="maximum combined PEQ boost, 0..12 dB (default: 0)",
+    )
     search.add_argument("--top", type=_positive_int, default=10, help="rows to print")
 
     report = commands.add_parser("report", help="write the self-contained HTML report")
@@ -168,16 +210,24 @@ def _fetch(args: argparse.Namespace) -> int:
 
 
 def _print_ranking(result: dict, top: int) -> None:
-    print("\nRank  Pair     Pol   Delay ms  Gain dB  Null dB  Excess ms  Tail ms  Rel SPL")
-    for row in result["pairs"][:top]:
-        pair = f"{row['first']}+{row['second']}"
-        polarity = "+" if row["polarity"] > 0 else "-"
-        print(
-            f"{row['rank']:>4}  {pair:<7}  {polarity:>3}  {row['delay_ms']:>+9.3f}  "
-            f"{row['gain_db']:>+7.2f}  {row['null_score_db']:>7.3f}  "
-            f"{row['excess_gd_ms']:>9.3f}  {row['post_eq_tail_ms']:>7.1f}  "
-            f"{row['relative_spl_db']:>+7.2f}"
-        )
+    def print_mode(rows: list[dict], eq: bool) -> None:
+        label = "EQ'd" if eq else "Raw"
+        print(f"\n{label} ranking")
+        print("Rank  Pair     Pol   Delay ms  Gain dB  Null dB  Excess ms  Tail ms  Rel SPL")
+        for row in rows[:top]:
+            pair = f"{row['first']}+{row['second']}"
+            polarity = "+" if row["polarity"] > 0 else "-"
+            print(
+                f"{row['eq_rank' if eq else 'rank']:>4}  {pair:<7}  {polarity:>3}  "
+                f"{row['delay_ms']:>+9.3f}  {row['gain_db']:>+7.2f}  "
+                f"{row['post_eq_null_score_db' if eq else 'null_score_db']:>7.3f}  "
+                f"{row['post_eq_excess_gd_ms' if eq else 'excess_gd_ms']:>9.3f}  "
+                f"{row['post_eq_tail_ms' if eq else 'raw_tail_ms']:>7.1f}  "
+                f"{row['post_eq_relative_spl_db' if eq else 'relative_spl_db']:>+7.2f}"
+            )
+
+    print_mode(result["pairs"], eq=False)
+    print_mode(sorted(result["pairs"], key=lambda row: row["eq_rank"]), eq=True)
 
 
 def _search(args: argparse.Namespace) -> int:
@@ -187,6 +237,10 @@ def _search(args: argparse.Namespace) -> int:
         delay_range_ms=tuple(args.delay_range),
         gain_range_db=tuple(args.gain_range),
         ppo=args.ppo,
+        eq_target="flat" if args.aggressive_correction else args.eq_target,
+        eq_range_hz=tuple(args.eq_range) if args.eq_range else None,
+        eq_range_slope_db_per_octave=args.eq_range_slope,
+        max_boost_db=args.max_boost,
     )
 
     def progress(done: int, total: int, pair: str) -> None:

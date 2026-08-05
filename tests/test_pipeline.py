@@ -9,7 +9,15 @@ import numpy as np
 
 from subpair.cache import CacheError, write_cache
 from subpair.engine import SearchOptions, run_search
-from subpair.dsp import db20, peq_response
+from subpair.dsp import (
+    EqOptions,
+    _excess_gd_authority,
+    db20,
+    fit_eq_filters,
+    excess_group_delay,
+    log_frequency_grid,
+    peq_response,
+)
 from subpair.html_report import build_report
 
 
@@ -29,6 +37,82 @@ class PipelineTests(unittest.TestCase):
         self.assertAlmostEqual(response_db[1], -6.0, places=6)
         self.assertGreater(response_db[0], -1.0)
         self.assertGreater(response_db[2], -1.0)
+
+    def test_flat_eq_obeys_range_boost_and_excess_gd_guard(self):
+        frequencies = log_frequency_grid(25.0, 150.0, 48)
+        octave_offset = np.log2(frequencies / 60.0)
+        magnitude_db = -8.0 * np.exp(-0.5 * (octave_offset / 0.12) ** 2)
+        spectrum = 10.0 ** (magnitude_db / 20.0)
+        options = EqOptions(
+            target="flat",
+            correction_range=(30.0, 90.0),
+            correction_slope_db_per_octave=48.0,
+            max_boost_db=6.0,
+        )
+        filters, response, metadata = fit_eq_filters(
+            spectrum,
+            frequencies,
+            4000.0,
+            48,
+            np.zeros_like(frequencies),
+            options,
+        )
+        self.assertTrue(any(item["gain_db"] > 0.0 for item in filters))
+        self.assertTrue(all(30.0 <= item["fc_hz"] <= 90.0 for item in filters))
+        self.assertLessEqual(float(np.max(db20(response))), 6.001)
+        self.assertLess(metadata["eq_authority"][0], 1.0)
+        self.assertLess(metadata["eq_authority"][-1], 0.1)
+
+        one_cycle_excess_ms = 1000.0 / frequencies
+        guarded_filters, _, guarded_metadata = fit_eq_filters(
+            spectrum,
+            frequencies,
+            4000.0,
+            48,
+            one_cycle_excess_ms,
+            options,
+        )
+        self.assertEqual(guarded_filters, [])
+        self.assertLess(float(np.max(guarded_metadata["eq_authority"])), 0.02)
+
+    def test_excess_gd_authority_uses_a_broad_smooth_gate(self):
+        frequencies = log_frequency_grid(25.0, 150.0, 48)
+        excess_ms = np.zeros_like(frequencies)
+        centre = int(np.argmin(np.abs(frequencies - 65.0)))
+        # A deliberately narrow, one-cycle delay spike must be expanded into a
+        # stable correction region rather than copied into the EQ target.
+        excess_ms[centre - 1 : centre + 2] = 1000.0 / frequencies[
+            centre - 1 : centre + 2
+        ]
+        authority = _excess_gd_authority(frequencies, excess_ms)
+        self.assertLess(float(authority[centre]), 0.5)
+        self.assertLess(float(np.max(np.abs(np.diff(authority)))), 0.12)
+        half_octave = int(round(48 / 4))
+        self.assertLess(float(authority[centre - half_octave]), 0.95)
+        self.assertLess(float(authority[centre + half_octave]), 0.95)
+
+    def test_excess_gd_score_is_limited_to_integration_range(self):
+        sample_rate = 4000.0
+        n_fft = 8192
+        fft_frequencies = np.fft.rfftfreq(n_fft, 1.0 / sample_rate)
+        evaluation_frequencies = log_frequency_grid(25.0, 150.0, 48)
+        # Flat magnitude makes the minimum-phase counterpart zero phase. Put
+        # phase storage well above the requested 30--90 Hz correction range.
+        phase = 2.5 * np.exp(
+            -0.5 * (np.log2(np.maximum(fft_frequencies, 1e-6) / 125.0) / 0.08) ** 2
+        )
+        spectrum = np.exp(1j * phase)
+        full_score, _ = excess_group_delay(
+            spectrum, fft_frequencies, evaluation_frequencies
+        )
+        limited_score, _ = excess_group_delay(
+            spectrum,
+            fft_frequencies,
+            evaluation_frequencies,
+            integration_range=(30.0, 90.0),
+        )
+        self.assertGreater(full_score, 0.5)
+        self.assertLess(limited_score, full_score * 0.01)
 
     def test_rejects_mismatched_lengths(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -84,13 +168,35 @@ class PipelineTests(unittest.TestCase):
             )
             self.assertEqual(len(result["pairs"]), 6)
             self.assertEqual([row["rank"] for row in result["pairs"]], list(range(1, 7)))
-            keys = [
-                (row["null_score_db"], row["excess_gd_ms"], row["post_eq_tail_ms"])
+            self.assertEqual(
+                sorted(row["eq_rank"] for row in result["pairs"]), list(range(1, 7))
+            )
+            raw_keys = [
+                (row["null_score_db"], row["excess_gd_ms"], row["raw_tail_ms"])
                 for row in result["pairs"]
             ]
-            self.assertEqual(keys, sorted(keys))
+            self.assertEqual(raw_keys, sorted(raw_keys))
+            eq_keys = [
+                (
+                    row["post_eq_null_score_db"],
+                    row["post_eq_excess_gd_ms"],
+                    row["post_eq_tail_ms"],
+                )
+                for row in sorted(result["pairs"], key=lambda row: row["eq_rank"])
+            ]
+            self.assertEqual(eq_keys, sorted(eq_keys))
             loaded = json.loads(results_path.read_text())
-            self.assertEqual(loaded["settings"]["ranking"][0], "null_score_db")
+            self.assertEqual(
+                loaded["settings"]["ranking"]["raw"][0], "null_score_db"
+            )
+            self.assertEqual(
+                loaded["settings"]["ranking"]["eq"][0],
+                "post_eq_null_score_db",
+            )
+            self.assertEqual(
+                loaded["settings"]["ranking"]["excess_gd_range_hz"],
+                [25.0, 150.0],
+            )
             report = root / "report.html"
             build_report(cache, results_path, report, top=2)
             first_render = report.read_bytes()
@@ -98,12 +204,17 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(first_render, report.read_bytes())
             page = first_render.decode()
             self.assertIn("plotly.js", page.lower())
-            self.assertIn("id=\"ranking\"", page)
-            self.assertIn("id=\"top-pairs-overview\"", page)
+            self.assertIn("id=\"ranking-raw\"", page)
+            self.assertIn("id=\"ranking-eq\"", page)
+            self.assertIn("id=\"top-pairs-overview-raw\"", page)
+            self.assertIn("id=\"top-pairs-overview-eq\"", page)
+            self.assertIn("setReportMode('raw')", page)
+            self.assertIn("setReportMode('eq')", page)
             self.assertIn('"visible":"legendonly"', page)
             self.assertIn('"shape":"spline"', page)
+            self.assertIn("EQ authority", page)
             self.assertIn("background:hsla(", page)
-            self.assertIn("Fitted PEQ cuts", page)
+            self.assertIn("Fitted PEQ filters", page)
             self.assertGreater(report.stat().st_size, 1_000_000)
 
 
