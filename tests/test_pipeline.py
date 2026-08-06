@@ -200,6 +200,30 @@ class PipelineTests(unittest.TestCase):
             with self.assertRaisesRegex(CacheError, "refusing to zero-pad"):
                 write_cache(Path(temporary), rows, {})
 
+    def test_analysis_context_rejects_large_relative_start_time_offsets(self):
+        from subpair.cache import CachedMeasurement
+        from subpair.dsp import AnalysisContext
+
+        sample_rate = 4000.0
+        length = 4096
+        rows = []
+        for index, start in enumerate([0.0, 0.0, 2.5], start=1):
+            rows.append(
+                CachedMeasurement(
+                    position=index,
+                    source_index=index,
+                    title=f"Position {index}",
+                    uuid=f"uuid-{index}",
+                    sample_rate=sample_rate,
+                    start_time_seconds=start,
+                    impulse=_synthetic_ir(sample_rate, length, 100, [(50, 0.2)]),
+                    metadata={},
+                    path=Path("unused"),
+                )
+            )
+        with self.assertRaisesRegex(ValueError, "exceeds the safe zero-padded"):
+            AnalysisContext(rows, (25.0, 150.0), 24)
+
     def test_synthetic_search_and_report(self):
         sample_rate = 4000.0
         length = 4096

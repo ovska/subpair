@@ -7,16 +7,7 @@ closed it).
 
 ## Now implementing
 
-1. **No sanity check on inter-measurement absolute time offsets.**
-   `AnalysisContext.padded_spectra` applies a spectral delay derived from
-   `start_time_seconds` before an FFT zero-padded 4x. If measurements don't
-   actually share a loopback-derived time base (user error / REW
-   misconfiguration), a large relative offset can silently alias/wrap
-   instead of raising a clear error. Add a guard that raises `CacheError`
-   when the spread of `start_time_seconds` exceeds a safe fraction of the
-   padded analysis window.
-
-2. **Dead code / documentation.**
+1. **Dead code / documentation.**
    - `engine._best_configuration` (singular) is unused everywhere; delete it.
    - Document `--max-cut` in the README next to the existing `--max-boost`
      documentation.
@@ -28,19 +19,19 @@ intentional ("no weighted blend", dip-only null scoring). Implementing them
 as opt-in flags (default = current behavior) rather than changing defaults
 outright, once the items above are done:
 
-3. **Ranking is strictly lexicographic across pairs**, so `excess_gd_ms` and
+2. **Ranking is strictly lexicographic across pairs**, so `excess_gd_ms` and
    `raw_tail_ms` essentially never affect which *pair* ranks #1 (only which
    delay/gain/polarity setting of the *same* pair). Proposal: optional
    `--tie-tolerance-db` that groups near-equal primary scores before
    applying the secondary/tertiary sort keys. Default 0.0 (no behavior
    change) to preserve existing tests/semantics.
 
-4. **No robustness/plateau preference in delay/gain optimum search.**
+3. **No robustness/plateau preference in delay/gain optimum search.**
    The exact grid minimum of `null_scores` can be a razor's-edge optimum
    that's very sensitive to small real-world delay drift. Proposal: report a
    sensitivity/plateau-width diagnostic alongside the chosen configuration.
 
-5. **`null_scores` is self-referential and dip-only.** Because the "trend"
+4. **`null_scores` is self-referential and dip-only.** Because the "trend"
    is a ~1-octave smoothing of the same measured curve, dips wider than
    roughly an octave are partly absorbed into the trend and under-scored,
    and peaks above trend are never penalized. This is documented/intentional
