@@ -246,45 +246,34 @@ def _excess_gd_authority(
 ) -> np.ndarray:
     """Gate broad excess-delay regions without following narrow pointwise wiggles.
 
-    Large peaks are detected on a smoothed cycles-of-delay curve, expanded to
-    at least a one-third-octave Gaussian gate, and averaged once more after the
-    nonlinear authority mapping.
+    Risk is a *maximum* filter over at least a one-third-octave window, not
+    an averaging one: a moving average (Gaussian or boxcar) inherently
+    dilutes any feature narrower than its own window in proportion to how
+    much narrower it is, which used to mean a genuinely severe but narrow
+    (a few bins) excess-GD spike was almost entirely ignored while a wider,
+    shallower bump of the *same peak height* was heavily gated. A maximum
+    filter instead reproduces a feature's true peak height everywhere within
+    reach of it regardless of that feature's own width, so a narrow spike
+    and a wide bump of equal height are gated the same. Only a light
+    denoise (well under one bin FWHM) runs first, just enough to keep a
+    single noisy sample from single-handedly setting the gate; the final
+    Gaussian pass only softens the gate's edges; the maximum filter already
+    fixed the true height by then.
     """
     frequencies = np.asarray(frequencies, dtype=np.float64)
     excess_cycles = np.abs(excess_group_delay_ms) * frequencies / 1000.0
     if frequencies.size < 3:
         return 1.0 / (1.0 + (excess_cycles / 0.35) ** 4)
     ppo = _grid_ppo(frequencies)
-    analysis_sigma = max(0.5, (ppo / 12.0) / 2.354820045)
-    smoothed_cycles = ndimage.gaussian_filter1d(
-        excess_cycles, sigma=analysis_sigma, mode="nearest", truncate=3.0
+    denoised_cycles = ndimage.gaussian_filter1d(
+        excess_cycles, sigma=0.35, mode="nearest", truncate=3.0
     )
-    risk = ndimage.gaussian_filter1d(
-        excess_cycles,
-        sigma=max(0.5, (ppo / 6.0) / 2.354820045),
-        mode="nearest",
-        truncate=3.0,
-    )
-    peaks, properties = signal.find_peaks(
-        smoothed_cycles,
-        height=0.08,
-        prominence=0.03,
-        distance=max(1, int(round(ppo / 12.0))),
-    )
-    if peaks.size:
-        widths = signal.peak_widths(smoothed_cycles, peaks, rel_height=0.5)[0]
-        indices = np.arange(frequencies.size, dtype=np.float64)
-        for peak, height, width in zip(peaks, properties["peak_heights"], widths):
-            gate_fwhm = max(float(width), ppo / 3.0)
-            gate_sigma = gate_fwhm / 2.354820045
-            gate = float(height) * np.exp(
-                -0.5 * ((indices - float(peak)) / gate_sigma) ** 2
-            )
-            risk = np.maximum(risk, gate)
+    gate_size = max(1, int(round(ppo / 3.0)))
+    risk = ndimage.maximum_filter1d(denoised_cycles, size=gate_size, mode="nearest")
     authority = 1.0 / (1.0 + (risk / 0.35) ** 4)
     return ndimage.gaussian_filter1d(
         authority,
-        sigma=max(0.5, (ppo / 6.0) / 2.354820045),
+        sigma=max(0.5, (ppo / 4.0) / 2.354820045),
         mode="nearest",
         truncate=3.0,
     )
@@ -642,26 +631,39 @@ def excess_group_delay(
     return float(1000.0 * numerator / denominator), 1000.0 * group_delay
 
 
-EXCESS_GD_TAIL_PERCENTILE = 95.0
+EXCESS_GD_TAIL_POWER = 1.0
 
 
 def excess_gd_tail_ms(
     excess_group_delay_ms: np.ndarray,
     frequencies: np.ndarray,
     integration_range: tuple[float, float] | None = None,
-    percentile: float = EXCESS_GD_TAIL_PERCENTILE,
+    power: float = EXCESS_GD_TAIL_POWER,
 ) -> float:
-    """Robust near-worst-case |excess GD|: the level only the worst tail exceeds.
+    """|excess GD| integrated over log-frequency, unweighted by level.
 
     ``excess_group_delay``'s scalar is an *energy-weighted* mean, so a badly
     smeared region that happens to sit in a magnitude dip or near a band
     edge (where SPL is naturally low) barely moves it - two sums can look
     equally clean on that metric while one is audibly ringing somewhere the
-    ear doesn't need much level to notice it. This statistic ignores level
-    entirely: every frequency in range counts equally, so a sum that is flat
-    on magnitude but smeary in phase is still caught. ``percentile=95``
-    (the default) is the value only the worst 5% of the (optionally
-    range-restricted) band exceeds.
+    ear doesn't need much level to notice it. This integrates |excess
+    GD|^power over log-frequency instead (matching how
+    ``excess_group_delay``'s own mean already integrates via
+    ``np.trapezoid``, rather than a plain index-based average), with every
+    frequency in range weighted equally regardless of level, so a sum that
+    is flat on magnitude but smeary in phase is still caught.
+
+    The default ``power=1`` is a plain area-weighted average: a narrow,
+    severe spike and a wider, shallower bump of the same area (peak height
+    times width) score the same, which is what makes this shape-neutral
+    rather than favouring one over the other. It replaces an earlier
+    percentile-based version of this function, which was an order statistic
+    blind to any anomaly narrower than ``100 - percentile`` percent of the
+    band, however severe - the opposite failure from a naive peak detector,
+    which instead only sees the narrow one. A power greater than 1 would
+    weight a large *local* deviation more than proportionally, but at the
+    cost of that shape-neutrality: concentrating the same area into a
+    narrower, taller feature then scores higher than spreading it out.
     """
     frequencies = np.asarray(frequencies, dtype=np.float64)
     values = np.abs(np.asarray(excess_group_delay_ms, dtype=np.float64))
@@ -669,8 +671,14 @@ def excess_gd_tail_ms(
         low, high = integration_range
         mask = (frequencies >= low) & (frequencies <= high)
         if np.any(mask):
+            frequencies = frequencies[mask]
             values = values[mask]
-    return float(np.percentile(values, percentile))
+    if values.size < 2:
+        return float(values[0]) if values.size else 0.0
+    log_frequency = np.log(frequencies)
+    span = max(float(log_frequency[-1] - log_frequency[0]), EPS)
+    numerator = np.trapezoid(values**power, x=log_frequency)
+    return float((numerator / span) ** (1.0 / power))
 
 
 def _band_centres(low: float, high: float, ppo: int) -> np.ndarray:

@@ -191,6 +191,30 @@ class PipelineTests(unittest.TestCase):
         self.assertLess(float(authority[centre - half_octave]), 0.95)
         self.assertLess(float(authority[centre + half_octave]), 0.95)
 
+    def test_excess_gd_authority_gates_narrow_and_wide_peaks_of_equal_height_alike(self):
+        # A moving-average-based risk measure dilutes a peak in proportion
+        # to how much narrower it is than the averaging window, so a
+        # genuinely severe but narrow excess-GD spike could end up almost
+        # entirely ignored while a wider bump of the very same peak height
+        # was heavily gated. Authority should instead track true peak
+        # height, not width.
+        frequencies = log_frequency_grid(25.0, 150.0, 48)
+        centre = int(np.argmin(np.abs(frequencies - 65.0)))
+        cycles_height = 0.6
+
+        def make(width_bins: int) -> np.ndarray:
+            excess_ms = np.zeros_like(frequencies)
+            half = max(0, width_bins // 2)
+            lo, hi = centre - half, centre + half + 1
+            excess_ms[lo:hi] = cycles_height * 1000.0 / frequencies[lo:hi]
+            return excess_ms
+
+        narrow_authority = float(np.min(_excess_gd_authority(frequencies, make(1))))
+        wide_authority = float(np.min(_excess_gd_authority(frequencies, make(16))))
+        self.assertLess(narrow_authority, 0.5)
+        self.assertLess(wide_authority, 0.5)
+        self.assertLess(abs(narrow_authority - wide_authority), 0.2)
+
     def test_null_scores_detects_a_wide_shelf_dip(self):
         # A dip much wider than the ~1-octave trend window is largely
         # absorbed into that trend (the trend just follows it down), so the
@@ -293,19 +317,32 @@ class PipelineTests(unittest.TestCase):
         self.assertGreater(full_score, 0.5)
         self.assertLess(limited_score, full_score * 0.01)
 
-    def test_excess_gd_tail_ms_catches_a_localised_spike_the_mean_misses(self):
+    def test_excess_gd_tail_ms_is_shape_neutral_for_equal_area(self):
+        # A narrow, tall spike and a wider, shallower bump of the same area
+        # (peak height x width) should score similarly: neither a naive
+        # peak detector (which only sees the narrow one) nor a percentile
+        # (which is blind to anything narrower than its own width cutoff,
+        # however severe) achieves that.
         frequencies = log_frequency_grid(25.0, 150.0, 48)
-        excess_ms = np.zeros_like(frequencies)
-        # A narrow but severe smeary region, comfortably past the worst-5%
-        # cutoff (95th percentile) so it's unambiguously inside the tail.
-        spike_width = max(1, int(round(frequencies.size * 0.12)))
-        excess_ms[:spike_width] = 5.0
-        mean_ms = float(np.mean(np.abs(excess_ms)))
-        tail_ms = excess_gd_tail_ms(excess_ms, frequencies)
-        # The plain mean is diluted by the mostly-clean rest of the band.
-        self.assertLess(mean_ms, 1.0)
-        # The tail statistic still reports close to the true worst region.
-        self.assertGreater(tail_ms, 4.0)
+        area = 40.0  # height_ms * width_bins, held constant
+
+        def make(width_bins: int) -> np.ndarray:
+            excess_ms = np.zeros_like(frequencies)
+            excess_ms[:width_bins] = area / width_bins
+            return excess_ms
+
+        narrow_tail = excess_gd_tail_ms(make(2), frequencies)
+        wide_tail = excess_gd_tail_ms(make(32), frequencies)
+        self.assertGreater(narrow_tail, 0.0)
+        self.assertGreater(wide_tail, 0.0)
+        self.assertLess(abs(narrow_tail - wide_tail) / max(narrow_tail, wide_tail), 0.5)
+
+    def test_excess_gd_tail_ms_matches_a_uniform_band(self):
+        frequencies = log_frequency_grid(25.0, 150.0, 48)
+        excess_ms = np.full_like(frequencies, 2.0)
+        self.assertAlmostEqual(
+            excess_gd_tail_ms(excess_ms, frequencies), 2.0, places=2
+        )
 
     def test_excess_gd_tail_ms_respects_integration_range(self):
         frequencies = log_frequency_grid(25.0, 150.0, 48)
@@ -317,7 +354,7 @@ class PipelineTests(unittest.TestCase):
         limited_tail = excess_gd_tail_ms(
             excess_ms, frequencies, integration_range=(30.0, 90.0)
         )
-        self.assertGreater(full_tail, 1.0)
+        self.assertGreater(full_tail, 0.0)
         self.assertEqual(limited_tail, 0.0)
 
     def test_rejects_mismatched_lengths(self):
