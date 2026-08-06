@@ -18,6 +18,7 @@ from subpair.dsp import (
     db20,
     fit_eq_filters,
     excess_group_delay,
+    gd_weighted_null_score,
     log_frequency_grid,
     peq_response,
 )
@@ -38,6 +39,33 @@ class PipelineTests(unittest.TestCase):
         parser = _build_parser()
         self.assertEqual(parser.parse_args(["report"]).limit, 15)
         self.assertEqual(parser.parse_args(["report", "--limit", "24"]).limit, 24)
+
+    def test_search_max_cut_and_tie_tolerance_arguments(self):
+        parser = _build_parser()
+        defaults = parser.parse_args(["search"])
+        self.assertEqual(defaults.max_cut, 18.0)
+        self.assertEqual(defaults.tie_tolerance_db, 0.0)
+        overridden = parser.parse_args(
+            ["search", "--max-cut", "24", "--tie-tolerance-db", "0.5"]
+        )
+        self.assertEqual(overridden.max_cut, 24.0)
+        self.assertEqual(overridden.tie_tolerance_db, 0.5)
+
+    def test_banded_sort_key_is_identity_when_tolerance_is_zero(self):
+        from subpair.engine import _banded_sort_key
+
+        rows = [{"score": 1.234}, {"score": 1.235}, {"score": 5.0}]
+        self.assertEqual(
+            _banded_sort_key(rows, "score", 0.0), [1.234, 1.235, 5.0]
+        )
+
+    def test_banded_sort_key_groups_near_equal_scores(self):
+        from subpair.engine import _banded_sort_key
+
+        rows = [{"score": 1.0}, {"score": 1.05}, {"score": 1.3}]
+        bands = _banded_sort_key(rows, "score", 0.2)
+        self.assertEqual(bands[0], bands[1])
+        self.assertNotEqual(bands[1], bands[2])
 
     def test_peq_is_a_local_cut_not_broadband_attenuation(self):
         frequencies = np.asarray([25.0, 80.0, 150.0])
@@ -160,6 +188,35 @@ class PipelineTests(unittest.TestCase):
         half_octave = int(round(48 / 4))
         self.assertLess(float(authority[centre - half_octave]), 0.95)
         self.assertLess(float(authority[centre + half_octave]), 0.95)
+
+    def test_gd_weighted_null_score_inflates_dips_with_real_excess_gd(self):
+        frequencies = log_frequency_grid(25.0, 150.0, 48)
+        magnitude_db = np.zeros_like(frequencies)
+        trend_db = np.zeros_like(frequencies)
+        centre = int(np.argmin(np.abs(frequencies - 65.0)))
+        magnitude_db[centre] = -6.0  # a 6 dB dip below the flat trend
+
+        benign_gd = np.zeros_like(frequencies)
+        severe_gd = np.zeros_like(frequencies)
+        severe_gd[centre - 1 : centre + 2] = 1000.0 / frequencies[
+            centre - 1 : centre + 2
+        ]
+
+        benign_score = gd_weighted_null_score(magnitude_db, trend_db, frequencies, benign_gd)
+        severe_score = gd_weighted_null_score(magnitude_db, trend_db, frequencies, severe_gd)
+
+        # No excess GD: the weighted score matches the plain magnitude dip.
+        self.assertAlmostEqual(benign_score, 6.0, places=3)
+        # Real excess GD at the same dip inflates its severity.
+        self.assertGreater(severe_score, benign_score)
+        self.assertGreater(severe_score, 6.0)
+
+        # Excess GD with no accompanying magnitude dip is not scored as one.
+        no_dip_magnitude = np.zeros_like(frequencies)
+        self.assertEqual(
+            gd_weighted_null_score(no_dip_magnitude, trend_db, frequencies, severe_gd),
+            0.0,
+        )
 
     def test_excess_gd_score_is_limited_to_integration_range(self):
         sample_rate = 4000.0
@@ -296,6 +353,15 @@ class PipelineTests(unittest.TestCase):
                 loaded["settings"]["ranking"]["magnitude_basis"],
                 "raw, unsmoothed",
             )
+            self.assertEqual(loaded["settings"]["ranking"]["tie_tolerance_db"], 0.0)
+            for row in result["pairs"]:
+                self.assertIn("magnitude_only_null_score_db", row)
+                self.assertIn("post_eq_magnitude_only_null_score_db", row)
+                self.assertGreaterEqual(
+                    row["null_score_db"], row["magnitude_only_null_score_db"] - 1e-9
+                )
+                self.assertGreaterEqual(row["delay_plateau_ms"], 0.0)
+                self.assertGreaterEqual(row["gain_plateau_db"], 0.0)
             report = root / "report.html"
             build_report(cache, results_path, report, top=2, limit=3)
             first_render = report.read_bytes()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import itertools
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -25,6 +26,28 @@ class SearchOptions:
     max_boost_db: float = 0.0
     max_cut_db: float = 18.0
     eq_bands: int = 7
+    tie_tolerance_db: float = 0.0
+
+
+PLATEAU_TOLERANCE_DB = 0.5
+
+
+def _plateau_width(scores_1d: np.ndarray, values: np.ndarray, index: int) -> float:
+    """Width, in ``values`` units, of the near-optimal region around ``index``.
+
+    Walks outward from the chosen index while the score stays within
+    ``PLATEAU_TOLERANCE_DB`` of its value there. A wide plateau means the
+    chosen delay/gain is robust to small real-world drift (quantization,
+    temperature, cable length); a narrow one is a razor's-edge optimum.
+    """
+    threshold = scores_1d[index] + PLATEAU_TOLERANCE_DB
+    left = index
+    while left > 0 and scores_1d[left - 1] <= threshold:
+        left -= 1
+    right = index
+    while right < scores_1d.size - 1 and scores_1d[right + 1] <= threshold:
+        right += 1
+    return float(values[right] - values[left])
 
 
 def _best_configurations(
@@ -33,7 +56,7 @@ def _best_configurations(
     second: int,
     delays: np.ndarray,
     gains: np.ndarray,
-) -> list[tuple[int, float, float, float]]:
+) -> list[tuple[int, float, float, float, float, float]]:
     polarities = np.asarray([1.0, -1.0])
     gain_linear = 10.0 ** (gains / 20.0)
     shifted = context.trend_spectra[second][None, :] * np.exp(
@@ -59,15 +82,41 @@ def _best_configurations(
     result = []
     for flat_index in flat_indices:
         polarity_index, delay_index, gain_index = np.unravel_index(int(flat_index), shape)
+        delay_plateau_ms = _plateau_width(
+            scores[polarity_index, :, gain_index], delays, delay_index
+        )
+        gain_plateau_db = _plateau_width(
+            scores[polarity_index, delay_index, :], gains, gain_index
+        )
         result.append(
             (
                 int(polarities[polarity_index]),
                 float(delays[delay_index]),
                 float(gains[gain_index]),
                 minimum,
+                delay_plateau_ms,
+                gain_plateau_db,
             )
         )
     return result
+
+
+def _banded_sort_key(rows: list[dict], primary: str, tolerance_db: float) -> list[float]:
+    """Primary sort key, optionally binned into ``tolerance_db``-wide bands.
+
+    With ``tolerance_db <= 0`` (the default) this is just the raw metric,
+    giving byte-identical behaviour to strict lexicographic ranking. With a
+    positive tolerance, primary-metric differences smaller than the
+    tolerance are treated as ties so the secondary/tertiary metrics decide
+    between pairs that are indistinguishable in practice.
+    """
+    if tolerance_db <= 0.0:
+        return [float(row[primary]) for row in rows]
+    minimum = min(float(row[primary]) for row in rows)
+    return [
+        math.floor((float(row[primary]) - minimum) / tolerance_db + 1e-9)
+        for row in rows
+    ]
 
 
 def run_search(
@@ -101,7 +150,14 @@ def run_search(
             context, first, second, delays, gains
         )
         finalists = []
-        for polarity, delay_ms, gain_db, null_score in configurations:
+        for (
+            polarity,
+            delay_ms,
+            gain_db,
+            _magnitude_null_score,
+            delay_plateau_ms,
+            gain_plateau_db,
+        ) in configurations:
             diagnostics = pair_diagnostics(
                 context,
                 first,
@@ -112,9 +168,11 @@ def run_search(
                 include_decay=False,
                 eq_options=eq_options,
             )
-            # Preserve the exhaustive score exactly; the diagnostic
-            # recomputation is equivalent but may differ at the final bit.
-            diagnostics["null_score_db"] = null_score
+            # null_score_db (GD-weighted severity, from pair_diagnostics) now
+            # decides finalist ties, not the fast search's plain-magnitude
+            # minimum; that value survives as magnitude_only_null_score_db.
+            diagnostics["delay_plateau_ms"] = delay_plateau_ms
+            diagnostics["gain_plateau_db"] = gain_plateau_db
             finalists.append((polarity, delay_ms, gain_db, diagnostics))
         polarity, delay_ms, gain_db, diagnostics = min(
             finalists,
@@ -141,29 +199,34 @@ def run_search(
         if progress:
             progress(ordinal, len(combinations), f"{first + 1}+{second + 1}")
 
-    pairs.sort(
-        key=lambda row: (
-            row["null_score_db"],
-            row["excess_gd_ms"],
-            row["raw_tail_ms"],
-            row["first"],
-            row["second"],
-        )
+    raw_bands = _banded_sort_key(pairs, "null_score_db", options.tie_tolerance_db)
+    raw_order = sorted(
+        range(len(pairs)),
+        key=lambda i: (
+            raw_bands[i],
+            pairs[i]["excess_gd_ms"],
+            pairs[i]["raw_tail_ms"],
+            pairs[i]["first"],
+            pairs[i]["second"],
+        ),
     )
+    pairs = [pairs[i] for i in raw_order]
     reference_spl = pairs[0]["spl_db"]
     for rank, row in enumerate(pairs, start=1):
         row["rank"] = rank
         row["relative_spl_db"] = float(row["spl_db"] - reference_spl)
-    eq_pairs = sorted(
-        pairs,
-        key=lambda row: (
-            row["post_eq_null_score_db"],
-            row["post_eq_excess_gd_ms"],
-            row["post_eq_tail_ms"],
-            row["first"],
-            row["second"],
+    eq_bands = _banded_sort_key(pairs, "post_eq_null_score_db", options.tie_tolerance_db)
+    eq_order = sorted(
+        range(len(pairs)),
+        key=lambda i: (
+            eq_bands[i],
+            pairs[i]["post_eq_excess_gd_ms"],
+            pairs[i]["post_eq_tail_ms"],
+            pairs[i]["first"],
+            pairs[i]["second"],
         ),
     )
+    eq_pairs = [pairs[i] for i in eq_order]
     eq_reference_spl = eq_pairs[0]["post_eq_spl_db"]
     for eq_rank, row in enumerate(eq_pairs, start=1):
         row["eq_rank"] = eq_rank
@@ -209,6 +272,22 @@ def run_search(
                 ],
                 "excess_gd_range_hz": list(eq_range),
                 "magnitude_basis": "raw, unsmoothed",
+                "tie_tolerance_db": options.tie_tolerance_db,
+                "null_score_gd_weighting": (
+                    "null_score_db/post_eq_null_score_db scale magnitude dips up "
+                    "where they coincide with excess group delay (destructive-"
+                    "interference nulls, not just amplitude ripple); the plain "
+                    "magnitude-only value survives as "
+                    "magnitude_only_null_score_db/post_eq_magnitude_only_null_score_db. "
+                    "The fast delay/gain/polarity search itself stays "
+                    "magnitude-only for speed."
+                ),
+                "plateau_diagnostics": (
+                    "delay_plateau_ms/gain_plateau_db report how far delay/gain "
+                    f"can drift from the chosen value while the raw magnitude "
+                    f"null score stays within {PLATEAU_TOLERANCE_DB:g} dB of its "
+                    "optimum; wider is more robust to real-world drift"
+                ),
             },
         },
         "cache_manifest_format": manifest.get("format_version"),
