@@ -1,21 +1,19 @@
 # Scoring / EQ improvement plan
 
 Source: code review of `dsp.py` (scoring primitives, target-curve/EQ fitting)
-and `engine.py` (search/ranking). All items from the original review —
-including the three deferred design-philosophy proposals (tie-tolerance
-ranking, delay/gain plateau diagnostics, excess-GD-aware dip scoring) — are
-now implemented (see git history). What remains is a narrower, still-open
-question about the null-score metric.
+and `engine.py` (search/ranking). All items from the original review are now
+implemented (see git history), including the wide-dip detection blind spot:
+`dip_below_trend_db` now also flags a dip via a two-sided check (best level
+well to the left *and* well to the right of each point) so a dip much wider
+than the one-octave trend's smoothing window is no longer absorbed into that
+trend and under-scored, without flagging an ordinary monotonic rolloff as a
+false positive (a rolloff never recovers on at least one side).
 
 ## Deferred
 
-1. **`null_scores`'s one-octave trend is self-referential and still misses
-   wide dips / peaks.** Because the "trend" is a ~1-octave smoothing of the
-   same measured curve, dips wider than roughly an octave are partly
-   absorbed into the trend and under-scored, and peaks above trend are never
-   penalized. Excess-GD weighting (now implemented) addresses the *severity*
-   of a detected dip, not this detection blind spot — a wide, phase-benign
-   shelf-like suck-out from path-length differences could still slip
-   through. This is documented/intentional for narrow comb-filtering nulls;
-   flagged here in case a supplementary wide-window or peak-aware check is
-   wanted later.
+1. **Peaks above trend are never penalized.** Only dips (magnitude below the
+   trend/baseline) count toward `null_score_db`; a reinforcement peak scores
+   zero regardless of size. This is documented/intentional — a peak adds
+   output rather than destructively cancelling it, and is generally less of
+   a summing-position problem than a null — but is flagged here in case a
+   symmetric (peak-aware) variant is wanted later.

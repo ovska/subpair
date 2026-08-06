@@ -20,6 +20,7 @@ from subpair.dsp import (
     excess_group_delay,
     gd_weighted_null_score,
     log_frequency_grid,
+    null_scores,
     peq_response,
 )
 from subpair.html_report import build_report
@@ -188,6 +189,34 @@ class PipelineTests(unittest.TestCase):
         half_octave = int(round(48 / 4))
         self.assertLess(float(authority[centre - half_octave]), 0.95)
         self.assertLess(float(authority[centre + half_octave]), 0.95)
+
+    def test_null_scores_detects_a_wide_shelf_dip(self):
+        # A dip much wider than the ~1-octave trend window is largely
+        # absorbed into that trend (the trend just follows it down), so the
+        # narrow-only detector badly under-reports a real, sustained 10 dB
+        # departure from the rest of the band as roughly half that.
+        ppo = 48
+        frequencies = log_frequency_grid(20.0, 300.0, ppo)
+        magnitude_db = np.zeros_like(frequencies)
+        dip_low, dip_high = 40.0, 40.0 * 2.0 ** 2.5  # 2.5-octave-wide dip
+        mask = (frequencies >= dip_low) & (frequencies <= dip_high)
+        magnitude_db[mask] = -10.0
+        spectrum = 10.0 ** (magnitude_db / 20.0)
+        score = float(null_scores(spectrum[None, :], frequencies, ppo)[0])
+        self.assertGreater(score, 8.0)
+
+    def test_null_scores_does_not_flag_a_smooth_monotonic_rolloff(self):
+        # A plain rolloff has no "recovery" side, unlike a real bounded dip,
+        # and must not be scored as though its whole range were a null.
+        ppo = 48
+        frequencies = log_frequency_grid(25.0, 150.0, ppo)
+        magnitude_db = np.minimum(
+            -6.0 * np.log2(55.0 / np.maximum(frequencies, 1.0)), 0.0
+        )
+        total_range_db = float(magnitude_db.max() - magnitude_db.min())
+        spectrum = 10.0 ** (magnitude_db / 20.0)
+        score = float(null_scores(spectrum[None, :], frequencies, ppo)[0])
+        self.assertLess(score, 0.5 * total_range_db)
 
     def test_gd_weighted_null_score_inflates_dips_with_real_excess_gd(self):
         frequencies = log_frequency_grid(25.0, 150.0, 48)

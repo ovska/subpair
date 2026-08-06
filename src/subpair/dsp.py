@@ -80,26 +80,87 @@ def broad_trend_db(values: np.ndarray, ppo: int) -> np.ndarray:
     )
 
 
+def _grid_ppo(frequencies: np.ndarray) -> float:
+    """Points-per-octave implied by a log-frequency grid's actual spacing."""
+    if frequencies.size < 2:
+        return 48.0
+    steps = np.diff(np.log2(np.asarray(frequencies, dtype=np.float64)))
+    return max(1.0, 1.0 / float(np.median(steps)))
+
+
+WIDE_DIP_MARGIN_OCTAVES = 1.0
+
+
+def _two_sided_wide_dip_db(magnitude_db: np.ndarray, frequencies: np.ndarray) -> np.ndarray:
+    """Dip below the higher of the best level well to the left AND well to the right.
+
+    A genuine cancellation dip, however wide, sits between normal-level
+    content on both sides and this flags it at close to its true depth. A
+    smooth monotonic rolloff never recovers on at least one side, so it
+    always scores zero here regardless of how much total range it spans:
+    that's the deliberate difference from a single global reference (a
+    percentile, a single wide trend), which cannot tell "sustained decline"
+    from "bounded dip" apart. The margin before a side starts counting keeps
+    this from just re-detecting narrow, already-``broad_trend_db``-covered
+    notches off their own immediate shoulders, and near the array's own
+    edges - where one side has no room left for a margin plus a reference -
+    it stays silent rather than guessing.
+    """
+    magnitude_db = np.asarray(magnitude_db, dtype=np.float64)
+    n = magnitude_db.shape[-1]
+    margin_bins = int(round(_grid_ppo(frequencies) * WIDE_DIP_MARGIN_OCTAVES))
+    if n <= margin_bins:
+        return np.zeros_like(magnitude_db)
+    left_reference = np.full_like(magnitude_db, -np.inf)
+    right_reference = np.full_like(magnitude_db, -np.inf)
+    left_cummax = np.maximum.accumulate(magnitude_db, axis=-1)
+    right_cummax = np.maximum.accumulate(magnitude_db[..., ::-1], axis=-1)[..., ::-1]
+    left_reference[..., margin_bins:] = left_cummax[..., : n - margin_bins]
+    right_reference[..., : n - margin_bins] = right_cummax[..., margin_bins:]
+    reference = np.minimum(left_reference, right_reference)
+    return np.maximum(0.0, reference - magnitude_db)
+
+
+def dip_below_trend_db(
+    magnitude_db: np.ndarray, trend_db: np.ndarray, frequencies: np.ndarray
+) -> np.ndarray:
+    """Per-frequency dip depth: below the narrow trend OR a two-sided wide check.
+
+    ``trend_db`` (see ``broad_trend_db``) is a ~1-octave smoothing of the
+    same curve it's compared against, so it is a good reference for narrow
+    comb-filtering nulls but a dip much wider than that window is largely
+    absorbed into the trend itself and under-reported (the trend just
+    follows it down). ``_two_sided_wide_dip_db`` catches that case without
+    the false positives a single global baseline gives on an ordinary
+    monotonic rolloff.
+    """
+    magnitude_db = np.asarray(magnitude_db, dtype=np.float64)
+    narrow_dip = np.maximum(0.0, np.asarray(trend_db, dtype=np.float64) - magnitude_db)
+    wide_dip = _two_sided_wide_dip_db(magnitude_db, frequencies)
+    return np.maximum(narrow_dip, wide_dip)
+
+
 def null_scores(
     spectra: np.ndarray,
     frequencies: np.ndarray,
     ppo: int,
     score_slice: slice | None = None,
 ) -> np.ndarray:
-    """Max dip of magnitude below its one-octave trend.
+    """Max dip of magnitude below its one-octave trend or a wide two-sided check.
 
     When ``score_slice`` is given, ``spectra``/``frequencies`` are assumed to
     carry real spectral content beyond the reported band (see
-    ``AnalysisContext.trend_frequencies``) so the trend is not biased by
-    edge-replicated smoothing; the max-dip search itself is still restricted
-    to the reported band via the slice.
+    ``AnalysisContext.trend_frequencies``) so neither the trend nor the wide
+    check in ``dip_below_trend_db`` are biased by edge-replicated or
+    edge-truncated data; the max-dip search itself is still restricted to
+    the reported band via the slice.
     """
     magnitude_db = db20(spectra)
     trend = broad_trend_db(magnitude_db, ppo)
+    dip = dip_below_trend_db(magnitude_db, trend, frequencies)
     if score_slice is not None:
-        magnitude_db = magnitude_db[..., score_slice]
-        trend = trend[..., score_slice]
-    return np.maximum(0.0, np.max(trend - magnitude_db, axis=-1))
+        dip = dip[..., score_slice]
+    return np.max(dip, axis=-1)
 
 
 def peq_response(
@@ -193,8 +254,7 @@ def _excess_gd_authority(
     excess_cycles = np.abs(excess_group_delay_ms) * frequencies / 1000.0
     if frequencies.size < 3:
         return 1.0 / (1.0 + (excess_cycles / 0.35) ** 4)
-    steps = np.diff(np.log2(frequencies))
-    ppo = max(1.0, 1.0 / float(np.median(steps)))
+    ppo = _grid_ppo(frequencies)
     analysis_sigma = max(0.5, (ppo / 12.0) / 2.354820045)
     smoothed_cycles = ndimage.gaussian_filter1d(
         excess_cycles, sigma=analysis_sigma, mode="nearest", truncate=3.0
@@ -241,15 +301,18 @@ def gd_weighted_null_score(
 ) -> float:
     """Max magnitude dip below trend, scaled up where it coincides with excess GD.
 
-    A plain magnitude dip is scored the same whether it is a shallow,
-    EQ-fixable amplitude ripple or a genuine destructive-interference null
-    (acoustically irreparable and audible as smearing). This reuses the same
-    excess-GD risk gate as the EQ authority curve (``_excess_gd_authority``)
-    to inflate dip severity where it coincides with real excess group delay,
-    so the reported/ranked score reflects how *fixable* a dip is, not just
-    how deep it looks in magnitude alone. A dip with zero depth stays zero
-    regardless of nearby group delay; group-delay-only regions are already
-    handled separately by the EQ authority curve.
+    Dip depth itself comes from ``dip_below_trend_db``: below the narrow
+    trend OR a two-sided wide check, so a dip much wider than the trend's
+    ~1-octave window is not missed. A plain magnitude dip is scored
+    the same whether it is a shallow, EQ-fixable amplitude ripple or a
+    genuine destructive-interference null (acoustically irreparable and
+    audible as smearing). This reuses the same excess-GD risk gate as the EQ
+    authority curve (``_excess_gd_authority``) to inflate dip severity where
+    it coincides with real excess group delay, so the reported/ranked score
+    reflects how *fixable* a dip is, not just how deep it looks in magnitude
+    alone. A dip with zero depth stays zero regardless of nearby group
+    delay; group-delay-only regions are already handled separately by the
+    EQ authority curve.
 
     This is deliberately not used inside the fast exhaustive delay/gain/
     polarity search: true excess group delay needs a minimum-phase
@@ -257,7 +320,7 @@ def gd_weighted_null_score(
     grid (and coarse-grid phase unwrapping is fragile exactly at deep
     nulls). It is computed once per finalist instead.
     """
-    dip_db = np.maximum(0.0, np.asarray(trend_db) - np.asarray(magnitude_db))
+    dip_db = dip_below_trend_db(magnitude_db, trend_db, frequencies)
     if dip_db.size == 0:
         return 0.0
     gd_risk = 1.0 - _excess_gd_authority(frequencies, excess_group_delay_ms)
@@ -789,7 +852,7 @@ def pair_diagnostics(
             magnitude_db, trend_db, context.frequencies, excess_curve
         ),
         "magnitude_only_null_score_db": float(
-            np.max(np.maximum(0.0, trend_db - magnitude_db))
+            np.max(dip_below_trend_db(magnitude_db, trend_db, context.frequencies))
         ),
         "excess_gd_ms": float(excess_score),
         "raw_tail_ms": float(np.max(raw_tail_by_band)),
@@ -798,7 +861,7 @@ def pair_diagnostics(
             post_magnitude_db, post_trend_db, context.frequencies, post_excess_curve
         ),
         "post_eq_magnitude_only_null_score_db": float(
-            np.max(np.maximum(0.0, post_trend_db - post_magnitude_db))
+            np.max(dip_below_trend_db(post_magnitude_db, post_trend_db, context.frequencies))
         ),
         "post_eq_excess_gd_ms": float(post_excess_score),
         "post_eq_tail_ms": float(np.max(tail_by_band)),

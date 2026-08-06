@@ -63,9 +63,23 @@ the requested step.
 Two rankings are calculated, both strictly lexicographic:
 
 1. **Raw:** an excess-GD-weighted maximum dip of the raw magnitude below a
-   one-octave broad trend, energy-weighted mean absolute excess group delay,
-   then worst raw time-to-minus-20-dB across one-third-octave bands.
+   one-octave broad trend or a wide two-sided check, energy-weighted mean
+   absolute excess group delay, then worst raw time-to-minus-20-dB across
+   one-third-octave bands.
 2. **EQ'd:** the same three measurements after applying the fitted PEQs.
+
+The one-octave trend is itself a smoothing of the curve it's compared
+against, so a dip much wider than that window (a broadband suck-out from a
+large path-length difference between the two subs, say) is largely absorbed
+into the trend and under-reported. A second check catches this: at each
+frequency it looks for the best level well to the left *and* well to the
+right (past a one-octave margin so it isn't just re-detecting a narrow
+notch off its own shoulders); if both sides recover to a normal level, the
+gap between that and the current level counts as a dip, however wide. A
+plain monotonic rolloff — expected at a subwoofer's low end — never
+recovers on at least one side, so it is never flagged by this check
+regardless of its total range; only a single global reference (a
+percentile, a single very wide trend) would get that wrong.
 
 A magnitude dip that coincides with real excess group delay is a genuine
 destructive-interference null — acoustically irreparable and audible as
