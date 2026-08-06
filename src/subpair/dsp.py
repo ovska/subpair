@@ -44,6 +44,25 @@ def log_frequency_grid(low: float, high: float, ppo: int = 48) -> np.ndarray:
     return grid
 
 
+def margin_frequencies(
+    frequencies: np.ndarray, ppo: int, margin_bins: int
+) -> tuple[np.ndarray, slice]:
+    """Extend a log-frequency grid by ``margin_bins`` samples on each side.
+
+    ``broad_trend_db`` smooths with ``mode="nearest"``, which replicates the
+    edge sample rather than using real spectral content beyond the reported
+    band; that biases the trend (and any score derived from it) close to the
+    band boundaries. Evaluating the trend over this wider, real-data grid and
+    cropping the result back with the returned slice removes that bias
+    without changing what is actually reported or scored.
+    """
+    frequencies = np.asarray(frequencies, dtype=np.float64)
+    below = frequencies[0] * 2.0 ** (-np.arange(margin_bins, 0, -1) / ppo)
+    above = frequencies[-1] * 2.0 ** (np.arange(1, margin_bins + 1) / ppo)
+    extended = np.concatenate([below, frequencies, above])
+    return extended, slice(margin_bins, margin_bins + frequencies.size)
+
+
 def _interp_complex(source_f: np.ndarray, source_h: np.ndarray, target_f: np.ndarray) -> np.ndarray:
     return np.interp(target_f, source_f, source_h.real) + 1j * np.interp(
         target_f, source_f, source_h.imag
@@ -61,9 +80,25 @@ def broad_trend_db(values: np.ndarray, ppo: int) -> np.ndarray:
     )
 
 
-def null_scores(spectra: np.ndarray, frequencies: np.ndarray, ppo: int) -> np.ndarray:
+def null_scores(
+    spectra: np.ndarray,
+    frequencies: np.ndarray,
+    ppo: int,
+    score_slice: slice | None = None,
+) -> np.ndarray:
+    """Max dip of magnitude below its one-octave trend.
+
+    When ``score_slice`` is given, ``spectra``/``frequencies`` are assumed to
+    carry real spectral content beyond the reported band (see
+    ``AnalysisContext.trend_frequencies``) so the trend is not biased by
+    edge-replicated smoothing; the max-dip search itself is still restricted
+    to the reported band via the slice.
+    """
     magnitude_db = db20(spectra)
     trend = broad_trend_db(magnitude_db, ppo)
+    if score_slice is not None:
+        magnitude_db = magnitude_db[..., score_slice]
+        trend = trend[..., score_slice]
     return np.maximum(0.0, np.max(trend - magnitude_db, axis=-1))
 
 
@@ -218,8 +253,18 @@ def fit_eq_filters(
     ppo: int,
     excess_group_delay_ms: np.ndarray,
     options: EqOptions,
+    margin_spectrum: np.ndarray | None = None,
+    margin_slice: slice | None = None,
 ) -> tuple[list[dict[str, float]], np.ndarray, dict[str, Any]]:
-    """Fit a bounded PEQ bank toward a range- and excess-GD-aware target."""
+    """Fit a bounded PEQ bank toward a range- and excess-GD-aware target.
+
+    ``margin_spectrum``/``margin_slice`` are an optional wider companion to
+    ``spectrum``/``frequencies`` (see ``margin_frequencies``) used only to
+    compute the ``trend`` target without the edge bias that
+    ``broad_trend_db``'s ``mode="nearest"`` smoothing would otherwise
+    introduce at the band boundaries. All other fitting still uses the raw,
+    in-band ``spectrum``.
+    """
     frequencies = np.asarray(frequencies, dtype=np.float64)
     correction_range = options.correction_range or (
         float(frequencies[0]),
@@ -240,6 +285,9 @@ def fit_eq_filters(
         percentile = 50.0 if options.max_boost_db > 0.0 else 30.0
         target_level = float(np.percentile(base_db[in_range], percentile))
         nominal_target = np.full_like(base_db, target_level)
+    elif margin_spectrum is not None and margin_slice is not None:
+        nominal_target = broad_trend_db(db20(margin_spectrum), ppo)[margin_slice]
+        target_level = float(np.median(nominal_target[in_range]))
     else:
         nominal_target = broad_trend_db(base_db, ppo)
         target_level = float(np.median(nominal_target[in_range]))
@@ -550,18 +598,26 @@ class AnalysisContext:
                 f"({self.sample_rate / 2:g} Hz)"
             )
         self.frequencies = log_frequency_grid(*self.band, self.ppo)
+        self.trend_frequencies, self.trend_slice = margin_frequencies(
+            self.frequencies, self.ppo, self.ppo
+        )
         fft_frequencies = np.fft.rfftfreq(self.length, 1.0 / self.sample_rate)
         peak_absolute = (
             self.measurements[0].start_time_seconds
             + int(np.argmax(np.abs(self.measurements[0].impulse))) / self.sample_rate
         )
         spectra = []
+        trend_spectra = []
         for measurement in self.measurements:
             raw = np.fft.rfft(measurement.impulse)
             shift = measurement.start_time_seconds - peak_absolute
             absolute = raw * np.exp(-2j * np.pi * fft_frequencies * shift)
             spectra.append(_interp_complex(fft_frequencies, absolute, self.frequencies))
+            trend_spectra.append(
+                _interp_complex(fft_frequencies, absolute, self.trend_frequencies)
+            )
         self.spectra = np.asarray(spectra, dtype=np.complex128)
+        self.trend_spectra = np.asarray(trend_spectra, dtype=np.complex128)
         self._padded_spectra: np.ndarray | None = None
         self._padded_frequencies: np.ndarray | None = None
 
@@ -588,6 +644,14 @@ class AnalysisContext:
         phase = np.exp(-2j * np.pi * self.frequencies * delay_ms / 1000.0)
         return self.spectra[first] + factor * self.spectra[second] * phase
 
+    def sum_on_trend_grid(
+        self, first: int, second: int, polarity: int, delay_ms: float, gain_db: float
+    ) -> np.ndarray:
+        """Same as ``sum_on_grid`` but on the margin-extended trend grid."""
+        factor = polarity * 10.0 ** (gain_db / 20.0)
+        phase = np.exp(-2j * np.pi * self.trend_frequencies * delay_ms / 1000.0)
+        return self.trend_spectra[first] + factor * self.trend_spectra[second] * phase
+
     def sum_full(
         self, first: int, second: int, polarity: int, delay_ms: float, gain_db: float
     ) -> tuple[np.ndarray, np.ndarray]:
@@ -610,7 +674,11 @@ def pair_diagnostics(
     eq_options = eq_options or EqOptions(correction_range=context.band)
     grid_sum = context.sum_on_grid(first, second, polarity, delay_ms, gain_db)
     magnitude_db = db20(grid_sum)
-    trend_db = broad_trend_db(magnitude_db, context.ppo)
+    # The trend is smoothed over a margin-extended grid with real spectral
+    # content beyond the reported band, then cropped back, so it is not
+    # biased by edge-replicated ("nearest") smoothing at the band boundaries.
+    trend_wide_sum = context.sum_on_trend_grid(first, second, polarity, delay_ms, gain_db)
+    trend_db = broad_trend_db(db20(trend_wide_sum), context.ppo)[context.trend_slice]
     full_sum, full_frequencies = context.sum_full(
         first, second, polarity, delay_ms, gain_db
     )
@@ -627,6 +695,8 @@ def pair_diagnostics(
         context.ppo,
         excess_curve,
         eq_options,
+        margin_spectrum=trend_wide_sum,
+        margin_slice=context.trend_slice,
     )
     eq_full = filters_response(full_frequencies, context.sample_rate, filters)
     n_fft = 2 * (full_sum.size - 1)
@@ -641,7 +711,9 @@ def pair_diagnostics(
     )
     post_grid = grid_sum * eq_grid
     post_magnitude_db = db20(post_grid)
-    post_trend_db = broad_trend_db(post_magnitude_db, context.ppo)
+    eq_trend_wide = filters_response(context.trend_frequencies, context.sample_rate, filters)
+    post_trend_wide_sum = trend_wide_sum * eq_trend_wide
+    post_trend_db = broad_trend_db(db20(post_trend_wide_sum), context.ppo)[context.trend_slice]
     post_excess_score, post_excess_curve = excess_group_delay(
         post_full,
         full_frequencies,
