@@ -64,8 +64,8 @@ Two rankings are calculated, both strictly lexicographic:
 
 1. **Raw:** an excess-GD-weighted maximum dip of the raw magnitude below a
    one-octave broad trend or a wide two-sided check, energy-weighted mean
-   absolute excess group delay, then worst raw time-to-minus-20-dB across
-   one-third-octave bands.
+   absolute excess group delay, the 95th-percentile excess-GD tail, then
+   worst raw time-to-minus-20-dB across one-third-octave bands.
 2. **EQ'd:** the same three measurements after applying the fitted PEQs.
 
 The one-octave trend is itself a smoothing of the curve it's compared
@@ -110,6 +110,17 @@ over `--eq-range` (or the complete analysis band when `--eq-range` is not
 specified). Minimum-phase extraction and phase differentiation still use the
 full cached bandwidth and analysis grid so correction-range boundaries do not
 create Hilbert or numerical derivative artifacts.
+
+That scalar is an *energy-weighted* mean, so a badly smeared region that
+happens to sit in a magnitude dip or near a band edge (where SPL is
+naturally low) barely moves it — two sums can look equally clean on that
+metric while one is audibly ringing somewhere the ear doesn't need much
+level to notice it. `excess_gd_tail_ms`/`post_eq_excess_gd_tail_ms` — the
+third tie-break level in each ranking — is the 95th percentile of `|excess
+GD|` across the same range, with every frequency counted equally regardless
+of level. It exists to catch a sum that looks flat and clean on magnitude
+but is smeary in phase: a case the energy-weighted mean and the null-score
+metric (which only look where magnitude itself is unusual) can both miss.
 
 There is no weighted blend. Each later metric only breaks an exact tie in the
 earlier metrics. `--tie-tolerance-db` (0–3 dB, default 0) widens "tie" to any
