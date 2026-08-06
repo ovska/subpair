@@ -99,6 +99,7 @@ class EqOptions:
     correction_range: tuple[float, float] | None = None
     correction_slope_db_per_octave: float = 48.0
     max_boost_db: float = 0.0
+    max_cut_db: float = 18.0
     max_filters: int = 7
 
     def __post_init__(self) -> None:
@@ -112,6 +113,8 @@ class EqOptions:
             raise ValueError("EQ correction range slope must be between 0 and 48 dB/oct")
         if not 0.0 <= self.max_boost_db <= 12.0:
             raise ValueError("EQ maximum boost must be between 0 and 12 dB")
+        if not 0.0 <= self.max_cut_db <= 30.0:
+            raise ValueError("EQ maximum cut must be between 0 and 30 dB")
         if not 0 <= self.max_filters <= 16:
             raise ValueError("EQ filter count must be between 0 and 16")
 
@@ -225,7 +228,9 @@ def fit_eq_filters(
         nominal_target = broad_trend_db(base_db, ppo)
         target_level = float(np.median(nominal_target[in_range]))
 
-    desired = np.clip(nominal_target - base_db, -12.0, options.max_boost_db)
+    desired = np.clip(
+        nominal_target - base_db, -options.max_cut_db, options.max_boost_db
+    )
     range_authority = _correction_range_authority(
         frequencies, correction_range, options.correction_slope_db_per_octave
     )
@@ -278,7 +283,9 @@ def fit_eq_filters(
             # miniDSP recommends Q <= 1 and warns against filling narrow nulls.
             maximum_q = 1.0 if correction_db > 0.0 else 10.0
             q = float(np.clip(fc / bandwidth, 0.4, maximum_q))
-            gain_db = float(np.clip(correction_db, -12.0, options.max_boost_db))
+            gain_db = float(
+                np.clip(correction_db, -options.max_cut_db, options.max_boost_db)
+            )
 
             def trial_response(gain: float) -> tuple[np.ndarray, np.ndarray]:
                 response = total * peq_response(

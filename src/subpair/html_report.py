@@ -436,6 +436,7 @@ def build_report(
             eq_settings.get("correction_slope_db_per_octave", 48.0)
         ),
         max_boost_db=float(eq_settings.get("max_boost_db", 0.0)),
+        max_cut_db=float(eq_settings.get("max_cut_db", 18.0)),
         max_filters=int(eq_settings.get("max_filters", 7)),
     )
     required_ranking_fields = {
