@@ -36,18 +36,21 @@ def _best_configurations(
 ) -> list[tuple[int, float, float, float]]:
     polarities = np.asarray([1.0, -1.0])
     gain_linear = 10.0 ** (gains / 20.0)
-    shifted = context.spectra[second][None, :] * np.exp(
-        -2j * np.pi * delays[:, None] * context.frequencies[None, :] / 1000.0
+    shifted = context.trend_spectra[second][None, :] * np.exp(
+        -2j * np.pi * delays[:, None] * context.trend_frequencies[None, :] / 1000.0
     )
     candidates = (
-        context.spectra[first][None, None, None, :]
+        context.trend_spectra[first][None, None, None, :]
         + polarities[:, None, None, None]
         * gain_linear[None, None, :, None]
         * shifted[None, :, None, :]
     )
     shape = candidates.shape[:-1]
     scores = null_scores(
-        candidates.reshape((-1, candidates.shape[-1])), context.frequencies, context.ppo
+        candidates.reshape((-1, candidates.shape[-1])),
+        context.trend_frequencies,
+        context.ppo,
+        score_slice=context.trend_slice,
     ).reshape(shape)
     minimum = float(np.min(scores))
     # Preserve exact primary-score ties so the expensive second and third
