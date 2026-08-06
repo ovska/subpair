@@ -247,6 +247,28 @@ class PipelineTests(unittest.TestCase):
             0.0,
         )
 
+    def test_gd_weighted_null_score_only_penalises_non_minimum_phase_peaks(self):
+        frequencies = log_frequency_grid(25.0, 150.0, 48)
+        trend_db = np.zeros_like(frequencies)
+        magnitude_db = np.zeros_like(frequencies)
+        centre = int(np.argmin(np.abs(frequencies - 65.0)))
+        magnitude_db[centre] = 6.0  # a 6 dB peak above the flat trend
+
+        benign_gd = np.zeros_like(frequencies)
+        severe_gd = np.zeros_like(frequencies)
+        severe_gd[centre - 1 : centre + 2] = 1000.0 / frequencies[
+            centre - 1 : centre + 2
+        ]
+
+        # A minimum-phase peak (no excess GD) is left alone entirely.
+        benign_score = gd_weighted_null_score(magnitude_db, trend_db, frequencies, benign_gd)
+        self.assertAlmostEqual(benign_score, 0.0, places=6)
+
+        # The same peak, but with real excess GD (non-minimum-phase, a
+        # resonance/ringing signature), is penalised.
+        severe_score = gd_weighted_null_score(magnitude_db, trend_db, frequencies, severe_gd)
+        self.assertGreater(severe_score, 0.0)
+
     def test_excess_gd_score_is_limited_to_integration_range(self):
         sample_rate = 4000.0
         n_fft = 8192

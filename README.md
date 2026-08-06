@@ -88,8 +88,20 @@ metric scales dip severity up (by up to +150%) where it overlaps excess GD,
 using the same risk gate that reduces EQ authority there (see below); a dip
 with no excess GD nearby scores the same as before. The plain, unweighted
 dip depth is still reported separately as `magnitude_only_null_score_db` /
-`post_eq_magnitude_only_null_score_db`. This weighting is applied once per
-finalist, not inside the fast exhaustive delay/gain/polarity search itself:
+`post_eq_magnitude_only_null_score_db`.
+
+A magnitude peak above trend still scores nothing on its own — reinforcement
+adds output rather than destructively cancelling it, and isn't the kind of
+summing-position problem a null is. But a peak that only exists *with* real
+excess group delay is a resonance/ringing signature (comb reinforcement with
+genuine energy storage that its own magnitude doesn't explain), not a benign
+constructive bump, and is scored the same way a dip's severity is inflated:
+proportional to the excess-GD risk alone. A minimum-phase peak (negligible
+excess GD) still scores exactly zero; only a non-minimum-phase one counts.
+
+This GD weighting (both the dip-severity boost and the peak penalty) is
+applied once per finalist, not inside the fast exhaustive delay/gain/polarity
+search itself:
 true excess GD needs a minimum-phase extraction per candidate, which is too
 expensive to run over that whole grid.
 

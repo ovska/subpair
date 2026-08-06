@@ -314,17 +314,32 @@ def gd_weighted_null_score(
     delay; group-delay-only regions are already handled separately by the
     EQ authority curve.
 
+    A magnitude peak above the trend is deliberately *not* scored as a dip
+    is, even at the same excess-GD risk: reinforcement adds output rather
+    than destructively cancelling it. But a peak that only exists because of
+    real excess group delay - not minimum-phase, i.e. not explained by its
+    own magnitude shape - is a resonance/ringing signature (comb reinforcement
+    with genuine energy storage), not a benign constructive bump, and is
+    scored the same way a dip's severity is inflated: proportional to
+    ``gd_risk`` alone, so a minimum-phase peak (``gd_risk`` near 0) still
+    scores exactly zero, and only a non-minimum-phase peak counts at all.
+
     This is deliberately not used inside the fast exhaustive delay/gain/
     polarity search: true excess group delay needs a minimum-phase
     extraction per candidate, which is too expensive to run over that whole
     grid (and coarse-grid phase unwrapping is fragile exactly at deep
     nulls). It is computed once per finalist instead.
     """
+    magnitude_db = np.asarray(magnitude_db, dtype=np.float64)
+    trend_db = np.asarray(trend_db, dtype=np.float64)
     dip_db = dip_below_trend_db(magnitude_db, trend_db, frequencies)
-    if dip_db.size == 0:
-        return 0.0
+    peak_db = np.maximum(0.0, magnitude_db - trend_db)
     gd_risk = 1.0 - _excess_gd_authority(frequencies, excess_group_delay_ms)
-    severity_db = dip_db * (1.0 + DIP_GD_SEVERITY_WEIGHT * gd_risk)
+    dip_severity_db = dip_db * (1.0 + DIP_GD_SEVERITY_WEIGHT * gd_risk)
+    peak_severity_db = peak_db * DIP_GD_SEVERITY_WEIGHT * gd_risk
+    severity_db = np.maximum(dip_severity_db, peak_severity_db)
+    if severity_db.size == 0:
+        return 0.0
     return float(np.max(severity_db))
 
 
