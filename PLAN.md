@@ -19,11 +19,25 @@ implemented (see git history), including:
   Scored proportional to GD risk alone, so a minimum-phase peak still scores
   exactly zero.
 - A new ranking criterion for overall smear that the energy-weighted excess-
-  GD mean can miss: `excess_gd_tail_ms`/`post_eq_excess_gd_tail_ms`, the
-  95th percentile of `|excess GD|` across the same range as the mean, but
-  unweighted by level. Inserted as a new tie-break level right after the
-  mean in both the raw and EQ'd rankings (and in the finalist delay/gain/
-  polarity tie-break), so a sum that's flat on magnitude but smeary
-  somewhere quiet no longer slips through.
+  GD mean can miss: `excess_gd_tail_ms`/`post_eq_excess_gd_tail_ms`,
+  `|excess GD|` integrated over log-frequency across the same range as the
+  mean, unweighted by level. Inserted as a new tie-break level right after
+  the mean in both the raw and EQ'd rankings (and in the finalist
+  delay/gain/polarity tie-break), so a sum that's flat on magnitude but
+  smeary somewhere quiet no longer slips through.
+- Both the EQ-authority gate and that tail metric were originally built on
+  a moving average / percentile, verified (numerically, not just in theory)
+  to dilute or completely miss a narrow, severe excess-GD spike relative to
+  a wider, shallower feature of the same peak height or area: e.g. a 1-bin,
+  1-cycle spike left `_excess_gd_authority` at 0.88 (almost fully trusting
+  EQ there) while a 3-bin spike of the same height correctly dropped it to
+  0.09, and `excess_gd_tail_ms` reported exactly 0.0 for any feature
+  narrower than its percentile's own width cutoff, however severe.
+  `_excess_gd_authority` now uses a *maximum* filter (not an average) over
+  the same minimum window, so peak height - not width - drives the gate;
+  `excess_gd_tail_ms` now integrates `|excess GD|` over log-frequency
+  (`np.trapezoid`, matching how the energy-weighted mean already integrates)
+  instead of taking a percentile, so a narrow severe spike and a wider
+  shallower bump of the same area score the same.
 
 Nothing is currently deferred.

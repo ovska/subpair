@@ -64,8 +64,8 @@ Two rankings are calculated, both strictly lexicographic:
 
 1. **Raw:** an excess-GD-weighted maximum dip of the raw magnitude below a
    one-octave broad trend or a wide two-sided check, energy-weighted mean
-   absolute excess group delay, the 95th-percentile excess-GD tail, then
-   worst raw time-to-minus-20-dB across one-third-octave bands.
+   absolute excess group delay, the shape-neutral excess-GD tail integral,
+   then worst raw time-to-minus-20-dB across one-third-octave bands.
 2. **EQ'd:** the same three measurements after applying the fitted PEQs.
 
 The one-octave trend is itself a smoothing of the curve it's compared
@@ -116,11 +116,18 @@ happens to sit in a magnitude dip or near a band edge (where SPL is
 naturally low) barely moves it — two sums can look equally clean on that
 metric while one is audibly ringing somewhere the ear doesn't need much
 level to notice it. `excess_gd_tail_ms`/`post_eq_excess_gd_tail_ms` — the
-third tie-break level in each ranking — is the 95th percentile of `|excess
-GD|` across the same range, with every frequency counted equally regardless
-of level. It exists to catch a sum that looks flat and clean on magnitude
-but is smeary in phase: a case the energy-weighted mean and the null-score
-metric (which only look where magnitude itself is unusual) can both miss.
+third tie-break level in each ranking — integrates `|excess GD|` over
+log-frequency across the same range, with every frequency weighted equally
+regardless of level, using the same `np.trapezoid`-style integration as the
+energy-weighted scalar rather than a plain index-based average. It is
+deliberately *shape-neutral*: a narrow, severe spike and a wider, shallower
+bump of the same area (peak height times width) score the same, rather than
+a peak detector (which only sees the narrow one) or a percentile (which is
+blind to anything narrower than its own width cutoff, however severe, the
+opposite failure). It exists to catch a sum that looks flat and clean on
+magnitude but is smeary in phase somewhere — a case the energy-weighted
+mean and the null-score metric (which only look where magnitude itself is
+unusual) can both miss.
 
 There is no weighted blend. Each later metric only breaks an exact tie in the
 earlier metrics. `--tie-tolerance-db` (0–3 dB, default 0) widens "tie" to any
@@ -173,14 +180,22 @@ a hard target curtain. The fitted PEQs may still have their natural skirts
 outside the range.
 
 EQ authority is reduced where absolute excess group delay is large relative
-to the local period. Subpair smooths delay on the log-frequency grid, detects
-significant peaks, expands each into a gate at least one-third octave wide,
-and smooths the final nonlinear authority curve. It therefore cannot follow
-narrow point-to-point GD wiggles or jump abruptly from low to full authority
-over a couple of hertz. Authority falls rapidly as gated excess GD approaches
-0.35 cycles, so the aggressive target does not blindly boost phase-storage
-nulls which are unlikely to respond to EQ. The effective, range- and
-excess-GD-aware target is available as a hidden trace on each magnitude plot.
+to the local period. Subpair lightly denoises delay on the log-frequency
+grid (well under one bin, just enough that a single noisy sample can't set
+a gate by itself), then takes a *maximum* — not a moving average — over at
+least a one-third-octave window before smoothing only the resulting gate's
+edges. A moving average would dilute a peak in proportion to how much
+narrower it is than the averaging window, so a genuinely severe but narrow
+excess-GD spike could end up almost entirely ignored while a wider, shallower
+bump of the very same peak height was heavily gated; the maximum filter
+instead gates a narrow spike and a wide bump of equal height alike. It
+therefore cannot follow narrow point-to-point GD wiggles or jump abruptly
+from low to full authority over a couple of hertz, but does still respond
+fully to a genuinely narrow, severe spike. Authority falls rapidly as gated
+excess GD approaches 0.35 cycles, so the aggressive target does not blindly
+boost phase-storage nulls which are unlikely to respond to EQ. The effective,
+range- and excess-GD-aware target is available as a hidden trace on each
+magnitude plot.
 
 The post-EQ tail score is a deterministic, one-third-octave CSD-style
 analytic-envelope estimate and should be treated as a comparative metric, not

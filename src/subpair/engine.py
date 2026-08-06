@@ -12,7 +12,7 @@ import numpy as np
 
 from .cache import load_cache, write_json
 from .dsp import (
-    EXCESS_GD_TAIL_PERCENTILE,
+    EXCESS_GD_TAIL_POWER,
     AnalysisContext,
     EqOptions,
     inclusive_range,
@@ -301,11 +301,13 @@ def run_search(
                     "magnitude-only for speed."
                 ),
                 "excess_gd_tail": (
-                    f"excess_gd_tail_ms/post_eq_excess_gd_tail_ms are the "
-                    f"{EXCESS_GD_TAIL_PERCENTILE:g}th percentile of |excess GD| "
+                    "excess_gd_tail_ms/post_eq_excess_gd_tail_ms are |excess GD| "
+                    f"integrated over log-frequency (power={EXCESS_GD_TAIL_POWER:g}) "
                     "across the same range as excess_gd_ms, unweighted by level "
-                    "(unlike the energy-weighted mean), so a sum that is flat on "
-                    "magnitude but smeary in phase somewhere quiet is still caught"
+                    "(unlike the energy-weighted mean) and by shape (a narrow "
+                    "severe spike and a wider shallower bump of the same area "
+                    "score the same), so a sum that is flat on magnitude but "
+                    "smeary in phase somewhere quiet is still caught"
                 ),
                 "plateau_diagnostics": (
                     "delay_plateau_ms/gain_plateau_db report how far delay/gain "
