@@ -18,5 +18,12 @@ implemented (see git history), including:
   resonance/ringing signature, not benign constructive reinforcement.
   Scored proportional to GD risk alone, so a minimum-phase peak still scores
   exactly zero.
+- A new ranking criterion for overall smear that the energy-weighted excess-
+  GD mean can miss: `excess_gd_tail_ms`/`post_eq_excess_gd_tail_ms`, the
+  95th percentile of `|excess GD|` across the same range as the mean, but
+  unweighted by level. Inserted as a new tie-break level right after the
+  mean in both the raw and EQ'd rankings (and in the finalist delay/gain/
+  polarity tie-break), so a sum that's flat on magnitude but smeary
+  somewhere quiet no longer slips through.
 
 Nothing is currently deferred.

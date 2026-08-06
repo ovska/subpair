@@ -259,7 +259,10 @@ def _print_ranking(result: dict, top: int) -> None:
     def print_mode(rows: list[dict], eq: bool) -> None:
         label = "EQ'd" if eq else "Raw"
         print(f"\n{label} ranking")
-        print("Rank  Pair     Pol   Delay ms  Gain dB  Null dB  Excess ms  Tail ms  Rel SPL")
+        print(
+            "Rank  Pair     Pol   Delay ms  Gain dB  Null dB  Excess ms  "
+            "Excess95 ms  Tail ms  Rel SPL"
+        )
         for row in rows[:top]:
             pair = f"{row['first']}+{row['second']}"
             polarity = "+" if row["polarity"] > 0 else "-"
@@ -268,6 +271,7 @@ def _print_ranking(result: dict, top: int) -> None:
                 f"{row['delay_ms']:>+9.3f}  {row['gain_db']:>+7.2f}  "
                 f"{row['post_eq_null_score_db' if eq else 'null_score_db']:>7.3f}  "
                 f"{row['post_eq_excess_gd_ms' if eq else 'excess_gd_ms']:>9.3f}  "
+                f"{row['post_eq_excess_gd_tail_ms' if eq else 'excess_gd_tail_ms']:>11.3f}  "
                 f"{row['post_eq_tail_ms' if eq else 'raw_tail_ms']:>7.1f}  "
                 f"{row['post_eq_relative_spl_db' if eq else 'relative_spl_db']:>+7.2f}"
             )

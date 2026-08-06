@@ -16,6 +16,7 @@ from subpair.dsp import (
     _denoised_residual,
     _excess_gd_authority,
     db20,
+    excess_gd_tail_ms,
     fit_eq_filters,
     excess_group_delay,
     gd_weighted_null_score,
@@ -292,6 +293,33 @@ class PipelineTests(unittest.TestCase):
         self.assertGreater(full_score, 0.5)
         self.assertLess(limited_score, full_score * 0.01)
 
+    def test_excess_gd_tail_ms_catches_a_localised_spike_the_mean_misses(self):
+        frequencies = log_frequency_grid(25.0, 150.0, 48)
+        excess_ms = np.zeros_like(frequencies)
+        # A narrow but severe smeary region, comfortably past the worst-5%
+        # cutoff (95th percentile) so it's unambiguously inside the tail.
+        spike_width = max(1, int(round(frequencies.size * 0.12)))
+        excess_ms[:spike_width] = 5.0
+        mean_ms = float(np.mean(np.abs(excess_ms)))
+        tail_ms = excess_gd_tail_ms(excess_ms, frequencies)
+        # The plain mean is diluted by the mostly-clean rest of the band.
+        self.assertLess(mean_ms, 1.0)
+        # The tail statistic still reports close to the true worst region.
+        self.assertGreater(tail_ms, 4.0)
+
+    def test_excess_gd_tail_ms_respects_integration_range(self):
+        frequencies = log_frequency_grid(25.0, 150.0, 48)
+        excess_ms = np.zeros_like(frequencies)
+        centre = int(np.argmin(np.abs(frequencies - 125.0)))
+        half_width = max(1, int(round(frequencies.size * 0.06)))
+        excess_ms[centre - half_width : centre + half_width] = 5.0
+        full_tail = excess_gd_tail_ms(excess_ms, frequencies)
+        limited_tail = excess_gd_tail_ms(
+            excess_ms, frequencies, integration_range=(30.0, 90.0)
+        )
+        self.assertGreater(full_tail, 1.0)
+        self.assertEqual(limited_tail, 0.0)
+
     def test_rejects_mismatched_lengths(self):
         with tempfile.TemporaryDirectory() as temporary:
             rows = []
@@ -374,7 +402,12 @@ class PipelineTests(unittest.TestCase):
                 sorted(row["eq_rank"] for row in result["pairs"]), list(range(1, 7))
             )
             raw_keys = [
-                (row["null_score_db"], row["excess_gd_ms"], row["raw_tail_ms"])
+                (
+                    row["null_score_db"],
+                    row["excess_gd_ms"],
+                    row["excess_gd_tail_ms"],
+                    row["raw_tail_ms"],
+                )
                 for row in result["pairs"]
             ]
             self.assertEqual(raw_keys, sorted(raw_keys))
@@ -382,6 +415,7 @@ class PipelineTests(unittest.TestCase):
                 (
                     row["post_eq_null_score_db"],
                     row["post_eq_excess_gd_ms"],
+                    row["post_eq_excess_gd_tail_ms"],
                     row["post_eq_tail_ms"],
                 )
                 for row in sorted(result["pairs"], key=lambda row: row["eq_rank"])

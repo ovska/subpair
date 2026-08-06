@@ -642,6 +642,37 @@ def excess_group_delay(
     return float(1000.0 * numerator / denominator), 1000.0 * group_delay
 
 
+EXCESS_GD_TAIL_PERCENTILE = 95.0
+
+
+def excess_gd_tail_ms(
+    excess_group_delay_ms: np.ndarray,
+    frequencies: np.ndarray,
+    integration_range: tuple[float, float] | None = None,
+    percentile: float = EXCESS_GD_TAIL_PERCENTILE,
+) -> float:
+    """Robust near-worst-case |excess GD|: the level only the worst tail exceeds.
+
+    ``excess_group_delay``'s scalar is an *energy-weighted* mean, so a badly
+    smeared region that happens to sit in a magnitude dip or near a band
+    edge (where SPL is naturally low) barely moves it - two sums can look
+    equally clean on that metric while one is audibly ringing somewhere the
+    ear doesn't need much level to notice it. This statistic ignores level
+    entirely: every frequency in range counts equally, so a sum that is flat
+    on magnitude but smeary in phase is still caught. ``percentile=95``
+    (the default) is the value only the worst 5% of the (optionally
+    range-restricted) band exceeds.
+    """
+    frequencies = np.asarray(frequencies, dtype=np.float64)
+    values = np.abs(np.asarray(excess_group_delay_ms, dtype=np.float64))
+    if integration_range is not None:
+        low, high = integration_range
+        mask = (frequencies >= low) & (frequencies <= high)
+        if np.any(mask):
+            values = values[mask]
+    return float(np.percentile(values, percentile))
+
+
 def _band_centres(low: float, high: float, ppo: int) -> np.ndarray:
     return log_frequency_grid(low, high, ppo)
 
@@ -870,6 +901,9 @@ def pair_diagnostics(
             np.max(dip_below_trend_db(magnitude_db, trend_db, context.frequencies))
         ),
         "excess_gd_ms": float(excess_score),
+        "excess_gd_tail_ms": excess_gd_tail_ms(
+            excess_curve, context.frequencies, eq_options.correction_range
+        ),
         "raw_tail_ms": float(np.max(raw_tail_by_band)),
         "raw_tail_by_band_ms": [round(float(value), 6) for value in raw_tail_by_band],
         "post_eq_null_score_db": gd_weighted_null_score(
@@ -879,6 +913,9 @@ def pair_diagnostics(
             np.max(dip_below_trend_db(post_magnitude_db, post_trend_db, context.frequencies))
         ),
         "post_eq_excess_gd_ms": float(post_excess_score),
+        "post_eq_excess_gd_tail_ms": excess_gd_tail_ms(
+            post_excess_curve, context.frequencies, eq_options.correction_range
+        ),
         "post_eq_tail_ms": float(np.max(tail_by_band)),
         "tail_by_band_ms": [round(float(value), 6) for value in tail_by_band],
         "filters": filters,

@@ -11,7 +11,14 @@ from typing import Callable
 import numpy as np
 
 from .cache import load_cache, write_json
-from .dsp import AnalysisContext, EqOptions, inclusive_range, null_scores, pair_diagnostics
+from .dsp import (
+    EXCESS_GD_TAIL_PERCENTILE,
+    AnalysisContext,
+    EqOptions,
+    inclusive_range,
+    null_scores,
+    pair_diagnostics,
+)
 
 
 @dataclass(frozen=True)
@@ -179,6 +186,7 @@ def run_search(
             key=lambda item: (
                 item[3]["null_score_db"],
                 item[3]["excess_gd_ms"],
+                item[3]["excess_gd_tail_ms"],
                 item[3]["raw_tail_ms"],
                 0 if item[0] > 0 else 1,
                 item[1],
@@ -205,6 +213,7 @@ def run_search(
         key=lambda i: (
             raw_bands[i],
             pairs[i]["excess_gd_ms"],
+            pairs[i]["excess_gd_tail_ms"],
             pairs[i]["raw_tail_ms"],
             pairs[i]["first"],
             pairs[i]["second"],
@@ -221,6 +230,7 @@ def run_search(
         key=lambda i: (
             eq_bands[i],
             pairs[i]["post_eq_excess_gd_ms"],
+            pairs[i]["post_eq_excess_gd_tail_ms"],
             pairs[i]["post_eq_tail_ms"],
             pairs[i]["first"],
             pairs[i]["second"],
@@ -264,23 +274,38 @@ def run_search(
                 "common_delay": "energy-weighted median removed from excess GD",
             },
             "ranking": {
-                "raw": ["null_score_db", "excess_gd_ms", "raw_tail_ms"],
+                "raw": [
+                    "null_score_db",
+                    "excess_gd_ms",
+                    "excess_gd_tail_ms",
+                    "raw_tail_ms",
+                ],
                 "eq": [
                     "post_eq_null_score_db",
                     "post_eq_excess_gd_ms",
+                    "post_eq_excess_gd_tail_ms",
                     "post_eq_tail_ms",
                 ],
                 "excess_gd_range_hz": list(eq_range),
                 "magnitude_basis": "raw, unsmoothed",
                 "tie_tolerance_db": options.tie_tolerance_db,
                 "null_score_gd_weighting": (
-                    "null_score_db/post_eq_null_score_db scale magnitude dips up "
+                    "null_score_db/post_eq_null_score_db scale magnitude dips up, "
+                    "and score magnitude peaks that only exist alongside it, "
                     "where they coincide with excess group delay (destructive-"
-                    "interference nulls, not just amplitude ripple); the plain "
-                    "magnitude-only value survives as "
+                    "interference nulls or non-minimum-phase resonance, not just "
+                    "amplitude ripple or benign reinforcement); the plain "
+                    "magnitude-only dip value survives as "
                     "magnitude_only_null_score_db/post_eq_magnitude_only_null_score_db. "
                     "The fast delay/gain/polarity search itself stays "
                     "magnitude-only for speed."
+                ),
+                "excess_gd_tail": (
+                    f"excess_gd_tail_ms/post_eq_excess_gd_tail_ms are the "
+                    f"{EXCESS_GD_TAIL_PERCENTILE:g}th percentile of |excess GD| "
+                    "across the same range as excess_gd_ms, unweighted by level "
+                    "(unlike the energy-weighted mean), so a sum that is flat on "
+                    "magnitude but smeary in phase somewhere quiet is still caught"
                 ),
                 "plateau_diagnostics": (
                     "delay_plateau_ms/gain_plateau_db report how far delay/gain "
