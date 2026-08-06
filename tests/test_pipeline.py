@@ -13,6 +13,7 @@ from subpair.cli import _build_parser
 from subpair.engine import SearchOptions, run_search
 from subpair.dsp import (
     EqOptions,
+    _denoised_residual,
     _excess_gd_authority,
     db20,
     fit_eq_filters,
@@ -101,6 +102,48 @@ class PipelineTests(unittest.TestCase):
         np.testing.assert_allclose(disabled_response, 1.0)
         with self.assertRaisesRegex(ValueError, "between 0 and 16"):
             EqOptions(max_filters=17)
+
+    def test_denoised_residual_suppresses_spikes_but_keeps_broad_dips(self):
+        ppo = 48
+        residual = np.zeros(200)
+        spike_index = 100
+        residual[spike_index] = -6.0
+        plateau_start = 40
+        plateau_end = plateau_start + int(round(ppo / 6))
+        residual[plateau_start:plateau_end] = -6.0
+        smoothed = _denoised_residual(residual, ppo)
+        self.assertLess(abs(float(smoothed[spike_index])), 3.0)
+        plateau_centre = (plateau_start + plateau_end) // 2
+        self.assertGreater(abs(float(smoothed[plateau_centre])), 5.0)
+
+    def test_eq_fitter_targets_broad_bump_not_isolated_noise_spike(self):
+        frequencies = log_frequency_grid(25.0, 150.0, 48)
+        magnitude_db = np.zeros_like(frequencies)
+        spike_index = int(np.argmin(np.abs(frequencies - 130.0)))
+        magnitude_db[spike_index] = 6.0
+        bump_centre = int(np.argmin(np.abs(frequencies - 60.0)))
+        half_width = max(4, int(round(48 / 12)))
+        magnitude_db[bump_centre - half_width : bump_centre + half_width] = 4.0
+        spectrum = 10.0 ** (magnitude_db / 20.0)
+        options = EqOptions(
+            target="flat",
+            correction_range=(25.0, 150.0),
+            correction_slope_db_per_octave=0.0,
+            max_boost_db=0.0,
+            max_filters=1,
+        )
+        filters, _, _ = fit_eq_filters(
+            spectrum,
+            frequencies,
+            4000.0,
+            48,
+            np.zeros_like(frequencies),
+            options,
+        )
+        self.assertEqual(len(filters), 1)
+        self.assertLess(
+            abs(filters[0]["fc_hz"] - frequencies[bump_centre]) / frequencies[bump_centre], 0.15
+        )
 
     def test_excess_gd_authority_uses_a_broad_smooth_gate(self):
         frequencies = log_frequency_grid(25.0, 150.0, 48)
