@@ -565,3 +565,534 @@ The work is complete when:
 - `tests/test_pipeline.py`: scorer and search regression coverage.
 - Additional focused test modules/fixtures if `test_pipeline.py` becomes too large.
 - `README.md`: target semantics, versioning, result fields, and search behavior.
+
+---
+
+# Low-frequency excess-group-delay reliability and an independent low-shelf tool
+
+## Summary
+
+Two related, independently shippable pieces of work to make sub-bass behavior more
+trustworthy and more controllable:
+
+- **Part A** makes `excess_group_delay()` aware of the *native* frequency resolution
+  implied by the cached impulse response's length (i.e. the sweep/capture duration),
+  and progressively widens smoothing of the excess-GD curve as evaluated frequency
+  approaches that resolution limit, so near-zero measurement noise in the sub-bass
+  stops masquerading as real excess group delay in scores, authority gating, and
+  plots.
+- **Part B** adds a broad low-shelf filter as a fixed, user-specified tonal control,
+  separate from the greedy PEQ bell fitter (`fit_eq_filters`) and excluded from
+  ranking, for people who want a general "more/less sub-bass" tilt rather than
+  (or in addition to) corrective EQ.
+
+Both parts touch `dsp.py` primitives; Part A also touches `engine.py`'s result schema,
+Part B only touches `report`/`verify` and does not touch `search` or ranking at all.
+They can be implemented and shipped independently of each other and independently of
+the target-specific scoring plan above (that plan reduces neutral diagnostics into
+target-specific scores; this plan improves one of those diagnostics upstream of any
+target, and adds a control that deliberately sits outside the scored diagnostics).
+
+## Problem statement
+
+### Part A: sweep length sets an absolute-Hz resolution that becomes huge in octave terms near DC
+
+`AnalysisContext` builds its evaluation grid with `log_frequency_grid()`, a constant
+points-per-octave (`ppo`, default 48) grid. `excess_group_delay()` computes the
+minimum-phase excess phase from the *zero-padded* full-band spectrum
+(`AnalysisContext.sum_full`, padded to `next_fast_len(length * minphase_pad_factor)`),
+interpolates it onto that log grid, and differentiates it with `np.gradient(phase,
+omega, edge_order=2)`.
+
+Zero-padding does not add real spectral information; it only presents a smooth,
+exact sinc interpolation of the frequency-domain content that a sweep of the
+*original, unpadded* length (`context.length` samples at `context.sample_rate`, i.e.
+capture duration `T = length / sample_rate`) actually contains. That capture sets a
+native resolution `Δf_native = sample_rate / length` that is constant in Hz,
+regardless of `ppo` or the padding factor. The number of native-resolution samples
+packed into one octave around frequency `f` is proportional to `f / Δf_native`, which
+shrinks linearly as `f` falls. A sweep long enough to give excellent, densely-sampled
+resolution at 200 Hz can have only a handful of genuinely independent samples per
+octave below 30 Hz.
+
+Any real-world artifact with a characteristic width of roughly one native bin —
+mic/preamp noise, HVAC or traffic rumble picked up in the tail, nonlinear distortion
+residue, or ordinary DFT leakage from a decaying IR that has not fully settled within
+`length` samples — therefore looks, on the finely-sampled log-frequency evaluation
+grid, like a small number of nearly-uncorrelated phase perturbations spread across a
+large fraction of an octave near DC. `np.gradient` divides those phase differences by
+the (very small, in absolute Hz/rad·s⁻¹) step between adjacent log-grid points, so the
+same absolute phase jitter that is invisible at 100 Hz turns into large, sign-flipping
+group-delay swings — "squiggles hovering around ±0" — below roughly a few multiples of
+`Δf_native`. Two consequences already observed in practice, both driven by the same
+root cause:
+
+- `excess_gd_ms`/`post_eq_excess_gd_ms` (an *energy-weighted* mean, tie-break #2) and
+  especially `excess_gd_tail_ms`/`post_eq_excess_gd_tail_ms` (a deliberately
+  *level-independent* integral, tie-break #3 — see `README.md`) can swing
+  meaningfully between two searches that differ only in how long the REW sweep/capture
+  was, with no change to the actual acoustic placement.
+- `_excess_gd_authority()` (the same curve, used to throttle PEQ correction authority
+  and to inflate `gd_weighted_null_score()`'s dip/peak severity) can gate away
+  legitimate correction authority — or inflate a null score — in the sub-bass based on
+  resolution noise rather than a genuine non-minimum-phase problem.
+
+`_excess_gd_authority()` already applies a *fixed*-width (in log-frequency bins, hence
+constant in octaves) light Gaussian denoise before its maximum-filter gate. A
+fixed-octave-width smoothing is the right idea in principle — this codebase already
+uses that pattern for `broad_trend_db()` and the `_excess_gd_authority` gate itself —
+but it does not know that a fixed octave width corresponds to far fewer *real*
+samples near DC than it does an octave higher up, so it under-smooths exactly where
+smoothing is needed most.
+
+### Part B: there is no dedicated tonality control
+
+`fit_eq_filters()` only ever proposes RBJ constant-Q *peaking* (bell) biquads
+(`peq_response()`), constrained to correct measured deviation from a target curve
+within `--max-boost`/`--max-cut`/`--eq-range`/excess-GD authority. There is no shelf
+biquad in `dsp.py`, and no way to ask for "more sub-bass" or "less sub-bass" as a
+deliberate, broad tonal preference independent of what the corrective fitter would
+choose. A user who wants a house-curve-style low shelf currently has to apply it
+outside subpair entirely, losing the ability to see it in the report or fold it into
+`verify`.
+
+## Goals
+
+- Make `excess_gd_ms`, `post_eq_excess_gd_ms`, `excess_gd_tail_ms`,
+  `post_eq_excess_gd_tail_ms`, the excess-GD authority gate, and the report's excess-GD
+  plot materially more stable across sweep-length/capture-duration changes that do not
+  reflect a real change in the measured system, especially below a few multiples of
+  the cache's native frequency resolution.
+- Preserve full sensitivity to genuine, resolution-supported low-frequency excess-GD
+  features (a real port/passive-radiator resonance, a real destructive null with
+  measurable group-delay signature) — this is smoothing away *noise*, not lowering
+  detection sensitivity for real problems.
+- Surface the native resolution and the reliability threshold it implies, so users can
+  see when their sweep is marginal for the band they asked to analyze.
+- Add a broad low-shelf boost/cut as a fixed, explicitly-configured tonal filter,
+  independent of `fit_eq_filters()`'s bell bank and of `--eq-bands`/`--max-boost`/
+  `--max-cut`/`--eq-range` budgets, and excluded from every ranking key.
+- Keep both changes deterministic, offline-first, and consistent with the existing
+  "no weighted blend, strict lexicographic ranking" principle.
+
+## Non-goals
+
+- Do not change minimum-phase extraction itself (`minimum_phase_log_spectrum`,
+  `minphase_pad_factor`, the cepstral method, or the 160 dB magnitude floor). Zero
+  padding for *interpolation smoothness* is unrelated to the *native resolution* limit
+  this plan addresses, and remains as-is.
+- Do not change magnitude-based dip/peak detection (`dip_below_trend_db`,
+  `null_scores`, `broad_trend_db`). Those already compare raw magnitude against an
+  octave-smoothed trend rather than differentiating it, which is a fundamentally
+  different (and already reasonably robust) design; this plan is scoped to the
+  group-delay *derivative* path specifically, per the reported symptom.
+- Do not make `fit_eq_filters()` aware of, or compensate for, the low shelf. The two
+  stay independent by construction (Part B design decision below).
+- Do not change `search`'s CLI surface, `SearchOptions`, or `engine.py` ranking keys
+  for Part B; the shelf never participates in `null_score_db`/`excess_gd_ms`/tail
+  scoring or pair ordering.
+- Do not add resampling or any reinterpretation of measurement data; the fix is purely
+  about how much to trust/smooth already-correct spectral estimates, not about
+  changing what was measured.
+
+## Part A: resolution-aware group-delay smoothing
+
+### A.1 Native frequency resolution as a first-class quantity
+
+Add `native_resolution_hz = sample_rate / length` to `AnalysisContext.__post_init__`
+(computed from the *unpadded* `self.length`, not `self._padded_fft_length`), stored
+alongside the existing `sample_rate`/`length` attributes. This is the one new fact the
+rest of Part A derives from.
+
+### A.2 A reliability-driven smoothing width
+
+Add a small helper, e.g.:
+
+```python
+def gd_smoothing_octaves(
+    frequencies: np.ndarray,
+    native_resolution_hz: float,
+    min_native_bins: float = MIN_RELIABLE_NATIVE_BINS,
+) -> np.ndarray:
+    """Half-width, in octaves, needed so ~min_native_bins native bins fall inside it."""
+    return np.log2(1.0 + min_native_bins * native_resolution_hz / np.asarray(frequencies))
+```
+
+`MIN_RELIABLE_NATIVE_BINS` (proposed default 6, tune against Phase A0 fixtures) is the
+number of independent native-resolution samples a local average needs to meaningfully
+suppress zero-mean noise. This intentionally mirrors `_excess_gd_authority`'s existing
+"fixed width in octaves" pattern, but the width itself now depends on position: it is
+negligible once `f >> native_resolution_hz` (long sweep, or well above the sub-bass)
+and grows without bound as `f → 0` or as the sweep gets shorter.
+
+### A.3 Variable-width smoothing implementation
+
+`scipy.ndimage.gaussian_filter1d`/`maximum_filter1d` only support a single fixed
+`sigma`/`size` per call, so a genuinely per-point-variable-width smoother needs new
+code. Two implementation strategies are acceptable; pick one after a Phase A0
+brute-force comparison:
+
+1. **Sigma-ladder blend (recommended starting point):** precompute the curve smoothed
+   at a small fixed ladder of octave widths (e.g. `0, 0.25, 0.5, 1, 2, 4, 8` octaves via
+   repeated `gaussian_filter1d` calls on the *log-frequency-indexed* array, which is
+   already uniformly spaced so a bin-count sigma is exact), then for each grid point
+   linearly blend between the two ladder rungs bracketing that point's
+   `gd_smoothing_octaves()` value. Fully vectorized, deterministic, `O(K·N)` for a
+   small constant `K`.
+2. **Exact variable-width boxcar via prefix sums:** since the evaluation grid is
+   sorted, a per-point window `[f / 2**w(f), f * 2**w(f)]` can be resolved with
+   `np.searchsorted` on the log-frequency axis and a cumulative-sum array in `O(N log
+   N)`. Simpler to prove exactly correct, but a boxcar's harder edge is more likely to
+   show up as visible plot artifacts than the Gaussian blend.
+
+Whichever is chosen, write it as a private, directly testable function (this
+codebase's convention — see `_denoised_residual`, `_excess_gd_authority` — is to keep
+such helpers private but import them by name in `tests/test_pipeline.py`), and add a
+slow, obviously-correct reference implementation (an explicit per-index Python loop
+building a local Gaussian/boxcar window from `gd_smoothing_octaves()`) used only in
+tests to check the vectorized version point-by-point on small synthetic arrays.
+
+### A.4 Where it plugs into `excess_group_delay()`
+
+Inside `excess_group_delay()`:
+
+1. Compute the raw `group_delay` via `np.gradient` exactly as today.
+2. Remove the energy-weighted median common delay from the *raw* curve, over
+   `score_mask`, exactly as today — the common-delay estimate should stay maximally
+   robust and should not be biased by smoothing choices made afterward.
+3. Apply the new adaptive smoothing to the resulting zero-centered curve, over the
+   *entire* evaluation grid (not just `score_mask`/`integration_range` — the smoothed
+   curve is also what gets returned as `excess_curve_ms` for full-band consumers like
+   `_excess_gd_authority` and the report plot).
+4. Use the smoothed curve for both the returned curve and the energy-weighted scalar
+   integral (`excess_score`), so every downstream consumer —
+   `excess_gd_ms`/`post_eq_excess_gd_ms`, `excess_gd_tail_ms`, `_excess_gd_authority`
+   (and therefore `fit_eq_filters`'s target shrinkage and
+   `gd_weighted_null_score`'s dip/peak inflation) and the report's excess-GD trace —
+   sees one consistent, resolution-aware curve without duplicating the smoothing logic
+   at each call site.
+
+`_excess_gd_authority()`'s own fixed-width denoise-then-maximum-filter-then-smooth
+pipeline is left unchanged; it now simply operates on an already-denoised curve. Its
+existing behavior at frequencies well above the native-resolution limit (i.e. every
+case the current tests cover, since existing synthetic fixtures use short, clean
+impulses with plenty of native resolution across the tested band) must stay
+byte-identical — that is the key regression guarantee for this change, and should be
+asserted directly in Phase A1.
+
+### A.5 Result schema, settings metadata, and report visibility
+
+`excess_gd_ms`, `post_eq_excess_gd_ms`, `excess_gd_tail_ms`, and
+`post_eq_excess_gd_tail_ms` are ranking-relevant serialized fields
+(`engine.py`'s `pairs` rows), so this is a scoring-affecting change and must bump
+`result["format_version"]` (currently `4`). Update `html_report.py`'s `format_version
+< 4` guard to the new minimum and its error message.
+
+Add a `native_resolution` block next to the existing `minimum_phase`/`ranking`
+metadata in `run_search()`'s serialized `settings`, e.g.:
+
+```json
+"native_resolution": {
+  "hz": 0.73,
+  "min_reliable_native_bins": 6,
+  "note": "excess-GD curves are progressively smoothed below roughly N x this value; wider octave smoothing near DC compensates for how few independent frequency samples a sweep of this length provides there"
+}
+```
+
+Consider (Phase A4, optional polish) a non-fatal CLI warning from `fetch`/`search` when
+`native_resolution_hz` is a large fraction of `band[0]` (e.g. fewer than
+`MIN_RELIABLE_NATIVE_BINS` native bins exist below the requested lower band edge at
+all), pointing the user at a longer sweep/capture. This is advisory only; it must not
+block `search` from running.
+
+## Part B: an independent low-shelf tonality tool
+
+### B.1 Scope decision: report/verify-time overlay, not a search-time or scored option
+
+**Design decision — confirm before implementing.** The shelf is implemented as a
+fixed filter applied only when generating a `report` or running `verify`, using flags
+passed to that command, not stored in or read from `search-results.json`. It never
+reaches `engine.py`, `SearchOptions`, or any ranking key. Rationale:
+
+- "Independent of other filters" is read as independent of `fit_eq_filters()`'s
+  correction budget and objective, not merely "a different filter type inside the same
+  budget." A house-curve tonal preference is orthogonal to *placement* quality
+  (dip/null/excess-GD severity), which is what the search ranks. Coupling the shelf
+  into `broad_trend_db`/dip-vs-trend/excess-GD-authority math would let a purely
+  aesthetic choice quietly change which placement wins, which conflicts with this
+  project's existing "no weighted blend, objective ranking" stance.
+  If a future user wants the shelf to influence which pair wins, that is a materially
+  different feature (a target-policy-level house curve) and belongs with the
+  target-specific scoring plan above, not here.
+  If this scoping is wrong for the intended use case, the alternative — a
+  `SearchOptions`/`EqOptions` field serialized into settings and picked up by
+  `report`/`verify` automatically — is a small extension of the same filter code; flag
+  this back before Phase B0 if that's actually wanted.
+- Keeping it at report/verify time means changing shelf gain/frequency is instant (no
+  re-running the potentially slow exhaustive `search`), and adds zero risk to
+  `engine.py`.
+- A well-formed RBJ shelf biquad is itself minimum-phase, so even though it changes
+  magnitude, it does not introduce "excess" (non-minimum-phase) group delay by the
+  definitions this codebase already uses — `gd_weighted_null_score`/
+  `_excess_gd_authority` would not flag a *correctly implemented* shelf as a resonance
+  even if it were later included in a GD-aware calculation. "Ignoring group delay" is
+  therefore mostly moot for a shelf specifically (unlike a narrow bell mis-tuned to
+  fight a real cancellation); the real reason to exclude it from scoring is the
+  taste-vs-objective-ranking argument above, not a group-delay concern.
+
+Because the ranking table's numbers describe the corrected-but-unshelved response, the
+report must not silently show a plot/PEQ block that includes the shelf next to metrics
+that don't. Label the shelf trace and PEQ text block explicitly as not reflected in the
+ranking metrics (see B.4).
+
+### B.2 Filter design
+
+Add `low_shelf_response(frequencies, sample_rate, fc, gain_db, slope=1.0) ->
+np.ndarray` to `dsp.py`, parallel in style to `peq_response()`: the RBJ Audio EQ
+Cookbook low-shelf biquad (`A = 10**(gain_db/40)`, `alpha` from `slope` via the
+standard shelf-slope formula, `b0..b2`/`a0..a2`, then the same `z1 = exp(-1j*omega)`
+complex-response evaluation `peq_response` already uses). `slope` is the RBJ "S"
+shelf-slope parameter, `0 < S <= 1` (`S = 1` is the steepest shelf without gain
+overshoot); expose it bounded `0.1..1.0`, default `1.0`.
+
+Tests: DC gain converges to `gain_db` as `fc, f -> 0` relative spacing; response at
+frequencies well above `fc` converges to 0 dB; response is monotonic between those
+limits for `slope = 1`; a specific `(fc, gain_db, slope)` triple matches a
+hand-computed reference value at `fc` itself (a standard cookbook sanity check).
+
+### B.3 CLI surface
+
+Add to both `report` and `verify` subparsers in `cli.py`:
+
+- `--low-shelf-freq HZ` (float, default `None`)
+- `--low-shelf-gain DB` (bounded e.g. `-15..15`, default `0.0`)
+- `--low-shelf-slope` (bounded `0.1..1.0`, default `1.0`, `argparse.SUPPRESS`-level
+  advanced knob like `--ppo`)
+
+Validate (in `cli.py`, matching the existing `_bounded_float`/`argparse.ArgumentError`
+style, not deep in `dsp.py`): `--low-shelf-gain` nonzero requires `--low-shelf-freq`;
+`--low-shelf-freq` without a nonzero gain is accepted but inert (documented as a no-op,
+not an error, so scripts can pass a fixed frequency and toggle gain to `0` to disable).
+Do not tie these bounds to `--max-boost`/`--max-cut` — they are a different, wider
+control surface with a different purpose.
+
+### B.4 Report integration
+
+In `build_report()`, when the shelf is active, compute `low_shelf_response()` once
+over `context.frequencies` (for the pair-detail magnitude plot) and over the
+`padded_spectra()` frequency grid (for CSD/tail if extended there — see below), and
+combine it with each displayed pair's already-fitted filter response
+(`eq_grid`/`eq_full` from `pair_diagnostics`) purely for a new, separately computed
+"with shelf" curve. Do not fold it into `data["post_eq_db"]`/`data["filters"]` or any
+field the ranking table reads.
+
+- Add an extra, clearly labeled Plotly trace to `_magnitude_figure` (e.g. "Post-EQ +
+  low shelf (tonal, not scored)"), toggleable like the existing "Combined PEQ response"
+  legend-click behavior.
+- Extend `_peq_text` to append a visually separated block when the shelf is active,
+  e.g. a blank line followed by `LS Fc {fc:.1f} Hz  Gain {gain:+.1f} dB  Slope
+  {slope:.2f}  (tonal, not scored)`, so the exported filter text a user pastes into
+  their own DSP includes it without conflating it with the fitted `PK` lines above.
+- Add one sentence to the report's settings/legend text and to the pair-detail
+  configuration line making clear the shelf does not affect ranking. Do not touch
+  `_ranking_table`, `_overview_figure`, or any ranking/rank/score field.
+
+### B.5 Verify integration
+
+`run_verification()` predicts a specific pair's summed response
+(`context.sum_on_grid`) and compares it to one new physical measurement. When the
+shelf flags are passed to `verify`, apply `low_shelf_response()` to the *predicted*
+curve before computing `deviation`/`max_deviation_db`, since `verify` is inherently
+about validating one concrete, fully-specified configuration — if the user intends to
+run the shelf on their real DSP (or already has), the prediction should include it so
+the comparison is meaningful. Label the verification plot/summary line with the active
+shelf settings when present, matching the report's "not part of the placement search"
+framing is unnecessary here since `verify` has no ranking to protect — the shelf is
+just part of "the configuration being checked" for this command.
+
+### B.6 What stays untouched
+
+`fit_eq_filters()`, `EqOptions`, `SearchOptions`, `engine.py`, `run_search()`'s
+serialized settings/pairs, and `search`'s CLI surface are unmodified by Part B in the
+design above. `search-results.json`'s `format_version` is unaffected by Part B (it may
+still bump for Part A, independently).
+
+## Implementation phases
+
+### Phase A0: freeze behavior and build fixtures
+
+- [ ] Add a short-sweep synthetic fixture: reuse `_synthetic_ir()`'s pattern but with a
+      short `length` (coarse `native_resolution_hz`) and injected small, zero-mean,
+      seeded-random phase/amplitude perturbation concentrated in the sub-bass, so the
+      "squiggle" failure mode is directly reproducible in a test.
+- [ ] Add a long-sweep fixture covering the same band, to confirm fine native
+      resolution produces negligible extra smoothing (near-identity behavior).
+- [ ] Add a fixture with a genuine, resolution-supported low-frequency excess-GD
+      feature (e.g. a synthetic secondary reflection/mode with real group-delay
+      signature well above the noise floor) to prove real problems are still caught.
+- [ ] Record current (pre-change) `excess_gd_ms`/`excess_gd_tail_ms`/
+      `_excess_gd_authority` output for all of the above as a regression baseline.
+
+### Phase A1: native resolution and adaptive smoothing primitives
+
+- [ ] Add `AnalysisContext.native_resolution_hz`.
+- [ ] Implement `gd_smoothing_octaves()` and the chosen variable-width smoother
+      (Section A.3), with the slow per-index reference implementation used only in
+      tests.
+- [ ] Unit-test the smoother directly against the reference implementation on small
+      synthetic arrays, independent of the rest of the pipeline.
+
+### Phase A2: wire into `excess_group_delay()`
+
+- [ ] Apply the smoother per Section A.4's ordering (common-delay removal before
+      smoothing).
+- [ ] Confirm the long-sweep fixture and all pre-existing `test_pipeline.py` excess-GD
+      tests (`test_excess_gd_*`, `test_gd_weighted_null_score_*`) are byte-identical
+      before/after.
+- [ ] Confirm the short-sweep noisy fixture's `excess_gd_tail_ms` drops materially and
+      stops swinging under small perturbations of the injected noise's random seed.
+- [ ] Confirm the genuine-low-frequency-feature fixture's score is not meaningfully
+      reduced.
+
+### Phase A3: schema, settings, and report
+
+- [ ] Bump `format_version`; update `html_report.py`'s minimum-version guard and error
+      text.
+- [ ] Add the `native_resolution` settings block in `run_search()`.
+- [ ] Confirm the report's excess-GD plot and pair-detail text read the new curve with
+      no other changes required (it already consumes `data["excess_curve_ms"]`/
+      `post_eq_excess_curve_ms"` from `pair_diagnostics`).
+
+### Phase A4: polish and documentation
+
+- [ ] Optional non-fatal low-resolution CLI warning (Section A.5).
+- [ ] Document the native-resolution concept and `MIN_RELIABLE_NATIVE_BINS` in
+      `README.md` alongside the existing excess-GD prose.
+- [ ] Update `CLAUDE.md` if the smoothing helper's location/name differs from this
+      plan's proposal.
+
+### Phase B0: low-shelf primitive
+
+- [ ] Implement `low_shelf_response()` and its direct unit tests (Section B.2).
+- [ ] Confirm it composes correctly in cascade with `filters_response()`'s existing
+      multiplicative pattern (a shelf response is just another factor multiplied into
+      the total complex response).
+
+### Phase B1: CLI and validation
+
+- [ ] Add `--low-shelf-freq`/`--low-shelf-gain`/`--low-shelf-slope` to `report` and
+      `verify` parsers, with the gain/frequency co-requirement validated in `cli.py`.
+- [ ] CLI parsing tests mirroring `test_search_max_cut_and_tie_tolerance_arguments`.
+
+### Phase B2: report integration
+
+- [ ] Wire the shelf into `build_report()`/`_magnitude_figure()`/`_peq_text()` per
+      Section B.4.
+- [ ] Integration test: build a report twice (shelf on/off) from the same
+      `search-results.json` and confirm every ranking-table cell and `rank`/`eq_rank`
+      value is byte-identical, while the shelf trace/PEQ text block differs — this is
+      the test that actually proves independence from scoring, not just an assertion
+      in prose.
+
+### Phase B3: verify integration
+
+- [ ] Wire the shelf into `run_verification()`'s predicted curve per Section B.5.
+- [ ] Integration test comparing `max_deviation_db` with/without a known synthetic
+      shelf applied to both the "measured" and predicted curves (should match) versus
+      only one side (should show the expected offset), to confirm the shelf is applied
+      to the correct curve at the correct point in the comparison.
+
+## Test matrix
+
+### Part A
+
+- Adaptive smoother matches its slow reference implementation on synthetic arrays.
+- Long/fine-resolution sweeps: `excess_group_delay`, `excess_gd_tail_ms`,
+  `_excess_gd_authority`, `gd_weighted_null_score` all byte-identical to pre-change
+  behavior.
+- Short/coarse-resolution sweeps with injected zero-mean sub-bass noise: scores are
+  materially smaller and stable across different random seeds/noise realizations of
+  the same underlying (noise-free) response.
+- A genuine, resolution-supported low-frequency excess-GD feature is still detected at
+  essentially unchanged severity.
+- `format_version` bump rejects old `search-results.json` files with a precise
+  "rerun `subpair search`" message, exactly like the existing `< 4` guard.
+- Full existing `test_pipeline.py` suite passes unmodified in intent (values may
+  change only where the fixtures are specifically the short-sweep/noisy case).
+
+### Part B
+
+- `low_shelf_response()` DC/high-frequency asymptotes, monotonicity, and a
+  hand-computed reference point.
+- CLI bounds/co-requirement validation for `--low-shelf-*` on both `report` and
+  `verify`.
+- Report byte-identical ranking output with shelf on vs off (Phase B2's key test).
+- Report PEQ text and magnitude plot clearly separate shelf output from fitted `PK`
+  filters.
+- Verify's predicted-vs-measured comparison applies the shelf only where intended
+  (Phase B3's key test).
+- `search` and `SearchOptions`/`EqOptions` remain completely unaware of the shelf
+  (no new fields, no CLI flags on `search`).
+
+## Risks and decisions to resolve
+
+1. **Scope of Part B (Section B.1):** report/verify-only versus a `search`-level,
+   serialized, ranking-excluded setting. The plan above assumes the former; confirm
+   before implementation, since choosing the latter changes which files Part B
+   touches (adds `SearchOptions`/`EqOptions` fields and a settings/schema addition,
+   though still no ranking-key changes).
+2. **`MIN_RELIABLE_NATIVE_BINS` and the sigma-ladder rungs are empirical constants.**
+   Tune them against Phase A0 fixtures rather than guessing; document the chosen
+   values' rationale the way `DIP_GD_SEVERITY_WEIGHT`/`DSP_TARGET_MIN_PHASE_DIP_WEIGHT`
+   are already documented in `dsp.py`.
+3. **Over-smoothing risk:** a real, narrow, low-frequency destructive null with a
+   genuine group-delay signature must not be smoothed into invisibility. Phase A0's
+   "genuine feature" fixture is the concrete guard for this; if it fails, prefer
+   shrinking `MIN_RELIABLE_NATIVE_BINS` or narrowing the sigma-ladder's top rung over
+   abandoning the approach.
+4. **Boxcar vs Gaussian ladder-blend (Section A.3):** decide based on Phase A0/A1
+   results, not in advance; both are valid, the tradeoff is exactness vs smoothness of
+   the transition.
+5. **Shelf gain bound (`-15..15` dB proposed):** confirm against realistic tonal-shaping
+   use cases; unlike `--max-boost`/`--max-cut` this is not bounding a *correction*, so
+   the right ceiling is more a "sane CLI default" than a acoustically-derived limit.
+
+## Acceptance criteria
+
+- Excess-GD scores and authority gating are materially stable across sweep-length
+  changes that do not reflect a real acoustic difference, verified by the Phase A0
+  noisy-fixture test.
+- Genuine low-frequency excess-GD features remain fully detected, verified by the
+  Phase A0 genuine-feature fixture.
+- Existing (fine-resolution) synthetic tests are unaffected.
+- `format_version` is bumped and old result files fail with a clear message.
+- Report exposes the native-resolution context near the existing minimum-phase/ranking
+  explanation text.
+- A broad low-shelf boost/cut is available on `report` and `verify`, is clearly
+  distinguished from fitted PEQ bells in both the plot and the exported filter text,
+  and provably does not change `search`'s output, ranking, or any `null_score_db`/
+  `excess_gd_*` value.
+- `verify` correctly reflects an active shelf in its predicted-vs-measured comparison.
+- Full test suite passes; README documents both features.
+
+## Expected file changes
+
+- `src/subpair/dsp.py`: `AnalysisContext.native_resolution_hz`,
+  `gd_smoothing_octaves()`, the variable-width smoother, updated
+  `excess_group_delay()`; `low_shelf_response()`.
+- `src/subpair/engine.py`: `format_version` bump and `native_resolution` settings
+  block (Part A only).
+- `src/subpair/cli.py`: `--low-shelf-freq`/`--low-shelf-gain`/`--low-shelf-slope` on
+  `report` and `verify`, with validation (Part B only).
+- `src/subpair/html_report.py`: `format_version` guard bump (Part A); shelf trace,
+  `_peq_text` extension, settings-block rendering (Part B).
+- `src/subpair/verification.py`: shelf application to the predicted curve (Part B
+  only).
+- `tests/test_pipeline.py`: adaptive-smoother reference tests, short/long-sweep
+  fixtures, low-shelf unit and integration tests; additional fixture helpers alongside
+  `_synthetic_ir()`.
+- `README.md`: native-resolution/adaptive-smoothing explanation next to the existing
+  excess-GD prose; low-shelf usage under a new or existing `subpair report`/`subpair
+  verify` section.
+- `CLAUDE.md`: update the `dsp.py`/architecture summary once implemented, per its own
+  instruction to keep pace with `PLAN.md`'s status.
