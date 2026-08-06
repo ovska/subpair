@@ -70,17 +70,6 @@ def _best_configurations(
     return result
 
 
-def _best_configuration(
-    context: AnalysisContext,
-    first: int,
-    second: int,
-    delays: np.ndarray,
-    gains: np.ndarray,
-) -> tuple[int, float, float, float]:
-    """Compatibility helper returning the first primary-score optimum."""
-    return _best_configurations(context, first, second, delays, gains)[0]
-
-
 def run_search(
     cache_dir: Path,
     output_path: Path,
