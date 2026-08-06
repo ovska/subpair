@@ -195,6 +195,22 @@ def _excess_gd_authority(
     )
 
 
+def _denoised_residual(residual: np.ndarray, ppo: int) -> np.ndarray:
+    """Lightly smooth a target-error curve for peak/bandwidth detection only.
+
+    Picking candidate filters directly from raw, single-bin target error is
+    sensitive to measurement ripple: a one-bin noise spike can steer a narrow,
+    high-Q cut at an artifact instead of a real modal peak. A sub-octave
+    (~1/12-octave FWHM) Gaussian suppresses that without blurring genuine room
+    modes, which are rarely narrower than this. The resulting filter is still
+    accepted or rejected against the true, unsmoothed residual.
+    """
+    sigma = max(0.6, (ppo / 12.0) / 2.354820045)
+    return ndimage.gaussian_filter1d(
+        np.asarray(residual, dtype=np.float64), sigma=sigma, mode="nearest", truncate=3.0
+    )
+
+
 def fit_eq_filters(
     spectrum: np.ndarray,
     frequencies: np.ndarray,
@@ -247,10 +263,15 @@ def fit_eq_filters(
         total_db = db20(total)
         residual = desired - total_db
         current_error = float(np.mean(objective_weights * residual**2))
-        candidate_score = np.abs(residual)
+        # Peak location, sign, and bandwidth are read from a lightly denoised
+        # copy of the residual so single-bin measurement ripple cannot steer a
+        # narrow, high-Q cut at a noise artifact. Acceptance below is still
+        # judged against the true, unsmoothed residual/desired curve.
+        smoothed_residual = _denoised_residual(residual, ppo)
+        candidate_score = np.abs(smoothed_residual)
         candidate_score[~in_range] = 0.0
         if options.max_boost_db <= 0.0:
-            candidate_score[residual > 0.0] = 0.0
+            candidate_score[smoothed_residual > 0.0] = 0.0
         if float(np.max(candidate_score)) < threshold_db:
             break
 
@@ -266,16 +287,16 @@ def fit_eq_filters(
         ordered = ordered[:32]
         best: tuple[float, np.ndarray, dict[str, float]] | None = None
         for peak_index in ordered:
-            correction_db = float(residual[peak_index])
+            correction_db = float(smoothed_residual[peak_index])
             if abs(correction_db) < threshold_db:
                 continue
             sign = 1.0 if correction_db > 0.0 else -1.0
             half = abs(correction_db) / 2.0
             left = int(peak_index)
             right = int(peak_index)
-            while left > 0 and sign * residual[left] > half:
+            while left > 0 and sign * smoothed_residual[left] > half:
                 left -= 1
-            while right < residual.size - 1 and sign * residual[right] > half:
+            while right < smoothed_residual.size - 1 and sign * smoothed_residual[right] > half:
                 right += 1
             fc = float(frequencies[peak_index])
             bandwidth = max(float(frequencies[right] - frequencies[left]), fc / 20.0)
