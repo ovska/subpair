@@ -23,6 +23,7 @@ class SearchOptions:
     eq_range_hz: tuple[float, float] | None = None
     eq_range_slope_db_per_octave: float = 48.0
     max_boost_db: float = 0.0
+    max_cut_db: float = 18.0
     eq_bands: int = 7
 
 
@@ -98,6 +99,7 @@ def run_search(
         correction_range=eq_range,
         correction_slope_db_per_octave=options.eq_range_slope_db_per_octave,
         max_boost_db=options.max_boost_db,
+        max_cut_db=options.max_cut_db,
         max_filters=options.eq_bands,
     )
     combinations = list(itertools.combinations(range(len(measurements)), 2))
@@ -192,6 +194,7 @@ def run_search(
                 "correction_range_hz": list(eq_range),
                 "correction_slope_db_per_octave": eq_options.correction_slope_db_per_octave,
                 "max_boost_db": eq_options.max_boost_db,
+                "max_cut_db": eq_options.max_cut_db,
                 "max_filters": eq_options.max_filters,
                 "excess_gd_guard": (
                     "smoothed excess-GD peaks are expanded into broad gates; "

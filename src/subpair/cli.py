@@ -134,6 +134,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="maximum combined PEQ boost, 0..12 dB (default: 0)",
     )
     search.add_argument(
+        "--max-cut",
+        type=_bounded_float(0.0, 30.0),
+        default=18.0,
+        metavar="DB",
+        help="maximum single-filter PEQ cut, 0..30 dB (default: 18)",
+    )
+    search.add_argument(
         "--eq-bands",
         type=_bounded_int(0, 16),
         default=7,
@@ -270,6 +277,7 @@ def _search(args: argparse.Namespace) -> int:
         eq_range_hz=tuple(args.eq_range) if args.eq_range else None,
         eq_range_slope_db_per_octave=args.eq_range_slope,
         max_boost_db=args.max_boost,
+        max_cut_db=args.max_cut,
         eq_bands=args.eq_bands,
     )
 
