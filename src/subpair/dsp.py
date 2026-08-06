@@ -597,6 +597,33 @@ class AnalysisContext:
                 f"Band upper edge {self.band[1]:g} Hz must be below Nyquist "
                 f"({self.sample_rate / 2:g} Hz)"
             )
+        self._padded_fft_length = next_fast_len(self.length * self.minphase_pad_factor)
+        if self._padded_fft_length % 2:
+            self._padded_fft_length = next_fast_len(self._padded_fft_length + 1)
+        # sum_full/padded_spectra apply each measurement's start-time offset
+        # as a pure frequency-domain phase ramp, which is a *circular* shift
+        # over the zero-padded FFT frame. If the offset exceeds the available
+        # zero padding, real impulse content wraps around the frame instead
+        # of landing in the padding, silently corrupting the minimum-phase,
+        # excess-GD, and CSD-tail results for that pair. Measurements sharing
+        # a loopback-derived time base (the documented assumption) will have
+        # offsets of at most a few milliseconds, far inside this margin.
+        available_padding_seconds = (
+            self._padded_fft_length - self.length
+        ) / self.sample_rate
+        safe_shift_seconds = 0.5 * available_padding_seconds
+        common_start = min(row.start_time_seconds for row in self.measurements)
+        for measurement in self.measurements:
+            offset_seconds = abs(measurement.start_time_seconds - common_start)
+            if offset_seconds > safe_shift_seconds:
+                raise ValueError(
+                    f"Measurement {measurement.title!r} start time is "
+                    f"{offset_seconds * 1000.0:.3f} ms from the earliest "
+                    "loaded measurement, which exceeds the safe zero-padded "
+                    f"analysis window ({safe_shift_seconds * 1000.0:.3f} ms); "
+                    "loaded measurements must share a loopback-derived "
+                    "absolute time base"
+                )
         self.frequencies = log_frequency_grid(*self.band, self.ppo)
         self.trend_frequencies, self.trend_slice = margin_frequencies(
             self.frequencies, self.ppo, self.ppo
@@ -623,9 +650,7 @@ class AnalysisContext:
 
     def padded_spectra(self) -> tuple[np.ndarray, np.ndarray]:
         if self._padded_spectra is None or self._padded_frequencies is None:
-            n_fft = next_fast_len(self.length * self.minphase_pad_factor)
-            if n_fft % 2:
-                n_fft = next_fast_len(n_fft + 1)
+            n_fft = self._padded_fft_length
             frequencies = np.fft.rfftfreq(n_fft, 1.0 / self.sample_rate)
             common_start = min(row.start_time_seconds for row in self.measurements)
             rows = []
