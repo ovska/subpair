@@ -199,8 +199,8 @@ class EqOptions:
     max_filters: int = 7
 
     def __post_init__(self) -> None:
-        if self.target not in {"trend", "flat"}:
-            raise ValueError("EQ target must be 'trend' or 'flat'")
+        if self.target not in {"trend", "flat", "dsp"}:
+            raise ValueError("EQ target must be 'trend', 'flat', or 'dsp'")
         if self.correction_range is not None:
             low, high = self.correction_range
             if low <= 0 or high <= low:
@@ -280,6 +280,7 @@ def _excess_gd_authority(
 
 
 DIP_GD_SEVERITY_WEIGHT = 1.5  # up to +150% dip severity where excess GD is worst
+DSP_TARGET_MIN_PHASE_DIP_WEIGHT = 0.2  # 'dsp' target: minimum-phase dips barely count
 
 
 def gd_weighted_null_score(
@@ -287,6 +288,7 @@ def gd_weighted_null_score(
     trend_db: np.ndarray,
     frequencies: np.ndarray,
     excess_group_delay_ms: np.ndarray,
+    dsp_target: bool = False,
 ) -> float:
     """Max magnitude dip below trend, scaled up where it coincides with excess GD.
 
@@ -313,6 +315,21 @@ def gd_weighted_null_score(
     ``gd_risk`` alone, so a minimum-phase peak (``gd_risk`` near 0) still
     scores exactly zero, and only a non-minimum-phase peak counts at all.
 
+    ``dsp_target=True`` (the ``'dsp'`` EQ target) is for placements that
+    will be corrected by a full-featured external DSP rather than subpair's
+    own conservative fitter: a *minimum-phase* dip is, by definition, fully
+    correctable by any minimum-phase EQ (a boost that follows the same
+    minimum-phase relationship exactly restores both magnitude and phase),
+    so it barely counts here at ``gd_risk`` near 0
+    (``DSP_TARGET_MIN_PHASE_DIP_WEIGHT`` instead of the usual full weight).
+    But a *non*-minimum-phase dip remains a genuine, DSP-unfixable
+    cancellation regardless of target, so both modes converge to the same
+    maximum severity as ``gd_risk`` rises to 1 - the ranking in ``dsp`` mode
+    ends up preferring flat excess group delay over flat raw magnitude, since
+    magnitude-only problems are assumed to be someone else's problem to fix
+    later. Peak scoring is unaffected by ``dsp_target``: minimum-phase peaks
+    already score zero in every mode.
+
     This is deliberately not used inside the fast exhaustive delay/gain/
     polarity search: true excess group delay needs a minimum-phase
     extraction per candidate, which is too expensive to run over that whole
@@ -324,7 +341,10 @@ def gd_weighted_null_score(
     dip_db = dip_below_trend_db(magnitude_db, trend_db, frequencies)
     peak_db = np.maximum(0.0, magnitude_db - trend_db)
     gd_risk = 1.0 - _excess_gd_authority(frequencies, excess_group_delay_ms)
-    dip_severity_db = dip_db * (1.0 + DIP_GD_SEVERITY_WEIGHT * gd_risk)
+    max_dip_multiplier = 1.0 + DIP_GD_SEVERITY_WEIGHT
+    base_dip_multiplier = DSP_TARGET_MIN_PHASE_DIP_WEIGHT if dsp_target else 1.0
+    dip_multiplier = base_dip_multiplier + (max_dip_multiplier - base_dip_multiplier) * gd_risk
+    dip_severity_db = dip_db * dip_multiplier
     peak_severity_db = peak_db * DIP_GD_SEVERITY_WEIGHT * gd_risk
     severity_db = np.maximum(dip_severity_db, peak_severity_db)
     if severity_db.size == 0:
@@ -383,7 +403,7 @@ def fit_eq_filters(
     )
     if not np.any(in_range):
         raise ValueError("EQ correction range contains no evaluation frequencies")
-    if options.target == "flat":
+    if options.target in ("flat", "dsp"):
         percentile = 50.0 if options.max_boost_db > 0.0 else 30.0
         target_level = float(np.percentile(base_db[in_range], percentile))
         nominal_target = np.full_like(base_db, target_level)
@@ -411,7 +431,7 @@ def fit_eq_filters(
 
     total = np.ones_like(spectrum, dtype=np.complex128)
     filters: list[dict[str, float]] = []
-    threshold_db = 0.35 if options.target == "flat" else 0.75
+    threshold_db = 0.35 if options.target in ("flat", "dsp") else 0.75
     objective_weights = np.maximum(0.15, gd_authority)
     for _ in range(options.max_filters):
         total_db = db20(total)
@@ -901,9 +921,10 @@ def pair_diagnostics(
         context.frequencies,
         integration_range=eq_options.correction_range,
     )
+    dsp_target = eq_options.target == "dsp"
     result: dict[str, Any] = {
         "null_score_db": gd_weighted_null_score(
-            magnitude_db, trend_db, context.frequencies, excess_curve
+            magnitude_db, trend_db, context.frequencies, excess_curve, dsp_target=dsp_target
         ),
         "magnitude_only_null_score_db": float(
             np.max(dip_below_trend_db(magnitude_db, trend_db, context.frequencies))
@@ -915,7 +936,11 @@ def pair_diagnostics(
         "raw_tail_ms": float(np.max(raw_tail_by_band)),
         "raw_tail_by_band_ms": [round(float(value), 6) for value in raw_tail_by_band],
         "post_eq_null_score_db": gd_weighted_null_score(
-            post_magnitude_db, post_trend_db, context.frequencies, post_excess_curve
+            post_magnitude_db,
+            post_trend_db,
+            context.frequencies,
+            post_excess_curve,
+            dsp_target=dsp_target,
         ),
         "post_eq_magnitude_only_null_score_db": float(
             np.max(dip_below_trend_db(post_magnitude_db, post_trend_db, context.frequencies))

@@ -133,6 +133,38 @@ class PipelineTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "between 0 and 16"):
             EqOptions(max_filters=17)
 
+    def test_dsp_eq_target_fits_the_same_flat_curve_as_flat(self):
+        frequencies = log_frequency_grid(25.0, 150.0, 48)
+        magnitude_db = 6.0 * np.log2(frequencies / 55.0)
+        spectrum = 10.0 ** (magnitude_db / 20.0)
+        common = dict(
+            correction_range=(30.0, 90.0),
+            correction_slope_db_per_octave=48.0,
+            max_boost_db=6.0,
+        )
+        flat_filters, flat_response, flat_metadata = fit_eq_filters(
+            spectrum,
+            frequencies,
+            4000.0,
+            48,
+            np.zeros_like(frequencies),
+            EqOptions(target="flat", **common),
+        )
+        dsp_filters, dsp_response, dsp_metadata = fit_eq_filters(
+            spectrum,
+            frequencies,
+            4000.0,
+            48,
+            np.zeros_like(frequencies),
+            EqOptions(target="dsp", **common),
+        )
+        self.assertEqual(dsp_metadata["target_level_db"], flat_metadata["target_level_db"])
+        np.testing.assert_allclose(
+            dsp_metadata["nominal_target_db"], flat_metadata["nominal_target_db"]
+        )
+        self.assertEqual(len(dsp_filters), len(flat_filters))
+        np.testing.assert_allclose(db20(dsp_response), db20(flat_response), atol=1e-9)
+
     def test_denoised_residual_suppresses_spikes_but_keeps_broad_dips(self):
         ppo = 48
         residual = np.zeros(200)
@@ -293,6 +325,56 @@ class PipelineTests(unittest.TestCase):
         # resonance/ringing signature), is penalised.
         severe_score = gd_weighted_null_score(magnitude_db, trend_db, frequencies, severe_gd)
         self.assertGreater(severe_score, 0.0)
+
+    def test_gd_weighted_null_score_dsp_target_lightly_penalises_min_phase_dips(self):
+        frequencies = log_frequency_grid(25.0, 150.0, 48)
+        trend_db = np.zeros_like(frequencies)
+        dip_db = np.zeros_like(frequencies)
+        centre = int(np.argmin(np.abs(frequencies - 65.0)))
+        dip_db[centre] = -6.0  # a 6 dB minimum-phase dip
+
+        peak_db = np.zeros_like(frequencies)
+        peak_db[centre] = 6.0  # a 6 dB minimum-phase peak
+
+        benign_gd = np.zeros_like(frequencies)
+        severe_gd = np.zeros_like(frequencies)
+        severe_gd[centre - 1 : centre + 2] = 1000.0 / frequencies[
+            centre - 1 : centre + 2
+        ]
+
+        # A minimum-phase dip counts for its full depth normally, but only
+        # lightly under the 'dsp' target (assumed fully fixable by DSP).
+        normal_dip = gd_weighted_null_score(dip_db, trend_db, frequencies, benign_gd)
+        dsp_dip = gd_weighted_null_score(
+            dip_db, trend_db, frequencies, benign_gd, dsp_target=True
+        )
+        self.assertAlmostEqual(normal_dip, 6.0, places=3)
+        self.assertLess(dsp_dip, normal_dip)
+        self.assertGreater(dsp_dip, 0.0)
+
+        # A non-minimum-phase dip (real excess GD) still scores up to
+        # roughly the same severity in both targets: 'dsp' mode does not
+        # excuse a genuinely unfixable cancellation.
+        normal_severe = gd_weighted_null_score(dip_db, trend_db, frequencies, severe_gd)
+        dsp_severe = gd_weighted_null_score(
+            dip_db, trend_db, frequencies, severe_gd, dsp_target=True
+        )
+        self.assertLess(abs(normal_severe - dsp_severe) / normal_severe, 0.1)
+
+        # Minimum-phase and non-minimum-phase peaks are unaffected by
+        # dsp_target in either direction.
+        self.assertEqual(
+            gd_weighted_null_score(peak_db, trend_db, frequencies, benign_gd),
+            gd_weighted_null_score(
+                peak_db, trend_db, frequencies, benign_gd, dsp_target=True
+            ),
+        )
+        self.assertEqual(
+            gd_weighted_null_score(peak_db, trend_db, frequencies, severe_gd),
+            gd_weighted_null_score(
+                peak_db, trend_db, frequencies, severe_gd, dsp_target=True
+            ),
+        )
 
     def test_excess_gd_score_is_limited_to_integration_range(self):
         sample_rate = 4000.0

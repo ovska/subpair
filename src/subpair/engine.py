@@ -262,8 +262,21 @@ def run_search(
                 "max_cut_db": eq_options.max_cut_db,
                 "max_filters": eq_options.max_filters,
                 "excess_gd_guard": (
-                    "smoothed excess-GD peaks are expanded into broad gates; "
-                    "authority falls as gated delay approaches 0.35 cycles"
+                    "denoised excess-GD peaks are expanded into a gate at "
+                    "least one-third octave wide via a maximum (not "
+                    "averaging) filter, so a narrow severe spike is gated "
+                    "the same as a wider bump of equal height; authority "
+                    "falls as gated delay approaches 0.35 cycles"
+                ),
+                "dsp_target": (
+                    "the 'dsp' target uses the same flat curve as 'flat', "
+                    "but null_score_db/post_eq_null_score_db barely count a "
+                    "minimum-phase dip at low excess GD (it is fully "
+                    "correctable by any minimum-phase EQ); a non-minimum-"
+                    "phase dip still scores up to the same maximum as other "
+                    "targets, so ranking in 'dsp' mode favours flat excess "
+                    "group delay over flat raw magnitude. Minimum-phase "
+                    "peaks already score zero in every target."
                 ),
             },
             "minimum_phase": {
