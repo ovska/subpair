@@ -97,6 +97,7 @@ allows 0–16 bands and defaults to 7; zero cleanly disables EQ. The default
 `--eq-target trend` follows the broad response and `--max-boost 0` preserves
 cuts-only behaviour. `--eq-target flat` or `--aggressive-correction` uses a
 flat in-range target; `--max-boost` permits 0–12 dB of *combined* boost.
+`--max-cut` bounds any single filter's cut depth, 0–30 dB (default 18).
 
 Boost filters are capped at Q 1 so the fitter cannot use a sharp resonant bell
 to fill a narrow cancellation. Cuts may use Q up to 10 for modal peaks. The
