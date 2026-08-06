@@ -103,9 +103,13 @@ def _build_parser() -> argparse.ArgumentParser:
     search.add_argument("--ppo", type=_positive_int, default=48, help=argparse.SUPPRESS)
     search.add_argument(
         "--eq-target",
-        choices=("trend", "flat"),
+        choices=("trend", "flat", "dsp"),
         default="trend",
-        help="PEQ target: broad trend or aggressive flat response",
+        help=(
+            "PEQ target: broad trend, aggressive flat response, or 'dsp' "
+            "(flat response; ranking barely penalises minimum-phase dips, "
+            "for placements an external DSP will correct)"
+        ),
     )
     search.add_argument(
         "--aggressive-correction",

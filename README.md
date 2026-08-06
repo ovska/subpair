@@ -167,6 +167,21 @@ cuts-only behaviour. `--eq-target flat` or `--aggressive-correction` uses a
 flat in-range target; `--max-boost` permits 0–12 dB of *combined* boost.
 `--max-cut` bounds any single filter's cut depth, 0–30 dB (default 18).
 
+`--eq-target dsp` fits the same flat curve as `flat`, for placements you
+intend to correct with a full-featured external DSP rather than subpair's
+own conservative fitter. It changes *ranking*, not just the suggested PEQ:
+`null_score_db`/`post_eq_null_score_db` barely count a minimum-phase dip at
+low excess GD, since any minimum-phase EQ (which describes essentially all
+DSP/PEQ hardware) can restore both its magnitude and phase exactly, as long
+as the correction fits inside your own `--max-boost`/`--max-cut`. A
+non-minimum-phase dip — real excess group delay, a genuine destructive-
+interference null — still scores up to the same maximum severity as the
+other targets, since no amount of magnitude-only correction fixes that.
+Practically, `dsp` mode ends up preferring flat excess group delay over
+flat raw magnitude: with ordinary magnitude problems assumed fixable later,
+what's left to differentiate placements is largely what a DSP can't fix.
+Minimum-phase peaks already score zero in every target, `dsp` included.
+
 Boost filters are capped at Q 1 so the fitter cannot use a sharp resonant bell
 to fill a narrow cancellation. Cuts may use Q up to 10 for modal peaks. The
 combined response is checked against `--max-boost` after every candidate, and
