@@ -230,6 +230,41 @@ def _excess_gd_authority(
     )
 
 
+DIP_GD_SEVERITY_WEIGHT = 1.5  # up to +150% dip severity where excess GD is worst
+
+
+def gd_weighted_null_score(
+    magnitude_db: np.ndarray,
+    trend_db: np.ndarray,
+    frequencies: np.ndarray,
+    excess_group_delay_ms: np.ndarray,
+) -> float:
+    """Max magnitude dip below trend, scaled up where it coincides with excess GD.
+
+    A plain magnitude dip is scored the same whether it is a shallow,
+    EQ-fixable amplitude ripple or a genuine destructive-interference null
+    (acoustically irreparable and audible as smearing). This reuses the same
+    excess-GD risk gate as the EQ authority curve (``_excess_gd_authority``)
+    to inflate dip severity where it coincides with real excess group delay,
+    so the reported/ranked score reflects how *fixable* a dip is, not just
+    how deep it looks in magnitude alone. A dip with zero depth stays zero
+    regardless of nearby group delay; group-delay-only regions are already
+    handled separately by the EQ authority curve.
+
+    This is deliberately not used inside the fast exhaustive delay/gain/
+    polarity search: true excess group delay needs a minimum-phase
+    extraction per candidate, which is too expensive to run over that whole
+    grid (and coarse-grid phase unwrapping is fragile exactly at deep
+    nulls). It is computed once per finalist instead.
+    """
+    dip_db = np.maximum(0.0, np.asarray(trend_db) - np.asarray(magnitude_db))
+    if dip_db.size == 0:
+        return 0.0
+    gd_risk = 1.0 - _excess_gd_authority(frequencies, excess_group_delay_ms)
+    severity_db = dip_db * (1.0 + DIP_GD_SEVERITY_WEIGHT * gd_risk)
+    return float(np.max(severity_db))
+
+
 def _denoised_residual(residual: np.ndarray, ppo: int) -> np.ndarray:
     """Lightly smooth a target-error curve for peak/bandwidth detection only.
 
@@ -298,6 +333,10 @@ def fit_eq_filters(
     range_authority = _correction_range_authority(
         frequencies, correction_range, options.correction_slope_db_per_octave
     )
+    # Same excess-GD risk gate as gd_weighted_null_score, opposite use: there
+    # it inflates a dip's reported severity where GD is bad (it's a real,
+    # unfixable cancellation); here it shrinks the EQ target there (a filter
+    # can't repair phase-domain cancellation by boosting/cutting magnitude).
     gd_authority = _excess_gd_authority(frequencies, excess_group_delay_ms)
     authority = range_authority * gd_authority
     desired *= authority
@@ -746,11 +785,19 @@ def pair_diagnostics(
         integration_range=eq_options.correction_range,
     )
     result: dict[str, Any] = {
-        "null_score_db": float(np.max(np.maximum(0.0, trend_db - magnitude_db))),
+        "null_score_db": gd_weighted_null_score(
+            magnitude_db, trend_db, context.frequencies, excess_curve
+        ),
+        "magnitude_only_null_score_db": float(
+            np.max(np.maximum(0.0, trend_db - magnitude_db))
+        ),
         "excess_gd_ms": float(excess_score),
         "raw_tail_ms": float(np.max(raw_tail_by_band)),
         "raw_tail_by_band_ms": [round(float(value), 6) for value in raw_tail_by_band],
-        "post_eq_null_score_db": float(
+        "post_eq_null_score_db": gd_weighted_null_score(
+            post_magnitude_db, post_trend_db, context.frequencies, post_excess_curve
+        ),
+        "post_eq_magnitude_only_null_score_db": float(
             np.max(np.maximum(0.0, post_trend_db - post_magnitude_db))
         ),
         "post_eq_excess_gd_ms": float(post_excess_score),

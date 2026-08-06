@@ -147,6 +147,16 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="COUNT",
         help="maximum PEQ band count, 0..16 (default: 7)",
     )
+    search.add_argument(
+        "--tie-tolerance-db",
+        type=_bounded_float(0.0, 3.0),
+        default=0.0,
+        metavar="DB",
+        help=(
+            "treat null-score differences below this as ties before falling "
+            "back to excess-GD/tail, 0..3 dB (default: 0, strict lexicographic)"
+        ),
+    )
     search.add_argument("--top", type=_positive_int, default=10, help="rows to print")
 
     report = commands.add_parser("report", help="write the self-contained HTML report")
@@ -279,6 +289,7 @@ def _search(args: argparse.Namespace) -> int:
         max_boost_db=args.max_boost,
         max_cut_db=args.max_cut,
         eq_bands=args.eq_bands,
+        tie_tolerance_db=args.tie_tolerance_db,
     )
 
     def progress(done: int, total: int, pair: str) -> None:

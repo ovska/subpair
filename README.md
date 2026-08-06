@@ -62,10 +62,22 @@ the requested step.
 
 Two rankings are calculated, both strictly lexicographic:
 
-1. **Raw:** maximum dip of the raw magnitude below a one-octave broad trend,
-   energy-weighted mean absolute excess group delay, then worst raw
-   time-to-minus-20-dB across one-third-octave bands.
+1. **Raw:** an excess-GD-weighted maximum dip of the raw magnitude below a
+   one-octave broad trend, energy-weighted mean absolute excess group delay,
+   then worst raw time-to-minus-20-dB across one-third-octave bands.
 2. **EQ'd:** the same three measurements after applying the fitted PEQs.
+
+A magnitude dip that coincides with real excess group delay is a genuine
+destructive-interference null — acoustically irreparable and audible as
+smearing, not just a shallow, EQ-fixable amplitude ripple. The null-score
+metric scales dip severity up (by up to +150%) where it overlaps excess GD,
+using the same risk gate that reduces EQ authority there (see below); a dip
+with no excess GD nearby scores the same as before. The plain, unweighted
+dip depth is still reported separately as `magnitude_only_null_score_db` /
+`post_eq_magnitude_only_null_score_db`. This weighting is applied once per
+finalist, not inside the fast exhaustive delay/gain/polarity search itself:
+true excess GD needs a minimum-phase extraction per candidate, which is too
+expensive to run over that whole grid.
 
 The excess-GD scalar used by both rankings is normalized and integrated only
 over `--eq-range` (or the complete analysis band when `--eq-range` is not
@@ -74,12 +86,24 @@ full cached bandwidth and analysis grid so correction-range boundaries do not
 create Hilbert or numerical derivative artifacts.
 
 There is no weighted blend. Each later metric only breaks an exact tie in the
-earlier metrics. Magnitude scoring and PEQ fitting use the raw log-grid samples
-without fractional-octave or variable smoothing. The one-octave trend is only
-the broad reference from which raw dips and the conservative target are
-measured. Both rankings use the same per-pair polarity, delay, and gain tuple
-selected by the exhaustive raw search; the EQ'd ranking answers which of those
-selected sums responds best to the requested correction.
+earlier metrics. `--tie-tolerance-db` (0–3 dB, default 0) widens "tie" to any
+null-score difference within that many dB, so the fast-search's finalist
+tie-break and the raw/EQ'd pair rankings fall through to excess-GD and tail
+time between practically-indistinguishable null scores instead of a
+below-audibility difference deciding the winner outright. The default of 0
+preserves strict lexicographic behaviour. Magnitude scoring and PEQ fitting
+use the raw log-grid samples without fractional-octave or variable
+smoothing. The one-octave trend is only the broad reference from which raw
+dips and the conservative target are measured. Both rankings use the same
+per-pair polarity, delay, and gain tuple selected by the exhaustive raw
+search; the EQ'd ranking answers which of those selected sums responds best
+to the requested correction.
+
+Each pair also reports `delay_plateau_ms`/`gain_plateau_db`: how far delay
+or gain can drift from the chosen value while the raw magnitude null score
+stays within 0.5 dB of its optimum. A wide plateau is a forgiving setting;
+a narrow one is a razor's-edge optimum easily upset by real-world delay
+drift, temperature, or DSP quantization.
 
 For minimum phase, subpair uses the real-cepstrum form of the Hilbert
 transform on the *full available 0-to-Nyquist magnitude*, not a brick-wall
