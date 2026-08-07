@@ -241,26 +241,71 @@ class PipelineTests(unittest.TestCase):
         extension = low_end_extension_hz(flat_trend, frequencies, reference_db=10.0)
         self.assertIsNone(extension)
 
-    def test_low_end_extension_hz_group_average_departure_ranks_by_same_frequency_spl(self):
-        # This is how run_search actually uses reference_db=0.0: compare
-        # each pair's curve against the *elementwise average* curve across
-        # every pair in the search, not a single scalar. A and B share the
-        # exact same peak (20 dB, both above 50 Hz) - a peak-scalar-average
-        # design would treat them identically - but A is 7 dB louder than B
-        # specifically below 50 Hz, which is what should actually decide
-        # low-end extension.
+    def test_low_end_extension_hz_departure_from_a_reference_curve_ranks_by_same_frequency_spl(self):
+        # low_end_extension_hz doesn't care how its caller built the
+        # reference curve subtracted into the departure it's given - this
+        # exercises the generic mechanism with a simple two-curve average as
+        # the reference. A and B share the exact same peak (20 dB, both
+        # above 50 Hz) - a peak-scalar-average design would treat them
+        # identically - but A is 7 dB louder than B specifically below
+        # 50 Hz, which is what should actually decide low-end extension.
         frequencies = log_frequency_grid(25.0, 150.0, 48)
         louder_at_low_end = np.where(frequencies <= 50.0, 5.0, 20.0)
         quieter_at_low_end = np.where(frequencies <= 50.0, -2.0, 20.0)
-        group_average = 0.5 * (louder_at_low_end + quieter_at_low_end)
+        reference_curve = 0.5 * (louder_at_low_end + quieter_at_low_end)
         louder_extension = low_end_extension_hz(
-            louder_at_low_end - group_average, frequencies, reference_db=0.0
+            louder_at_low_end - reference_curve, frequencies, reference_db=0.0
         )
         quieter_extension = low_end_extension_hz(
-            quieter_at_low_end - group_average, frequencies, reference_db=0.0
+            quieter_at_low_end - reference_curve, frequencies, reference_db=0.0
         )
         self.assertAlmostEqual(louder_extension, 25.0, places=3)
         self.assertLess(abs(quieter_extension - 50.0) / 50.0, 0.02)
+
+    def test_low_end_extension_hz_best_curve_beats_average_curve_as_a_reference(self):
+        # run_search actually uses the *elementwise maximum* across every
+        # pair's curve as the reference, not the mean - this reproduces why.
+        # Most real placements roll off toward the bottom of the band to
+        # some degree, so an *average* curve already has a "typical"
+        # rolloff baked into its own shape: a pair (B) that rolls off by
+        # only a fairly ordinary amount can still be *above* a mean that
+        # includes several worse pairs (C, D) everywhere, and therefore
+        # reads as "fully extended" even though it clearly falls behind the
+        # best available pair (A) starting well above the band edge - the
+        # exact failure mode reported against the real cache (two pairs a
+        # genuine 6 dB apart at 30 Hz both read as fully extended against
+        # their mean). The *best* curve has no such baked-in rolloff.
+        frequencies = log_frequency_grid(25.0, 150.0, 48)
+        corner_a, corner_b = 30.0, 45.0
+
+        def rolloff(corner: float, plateau_db: float) -> np.ndarray:
+            return np.where(
+                frequencies >= corner,
+                plateau_db,
+                plateau_db - 6.0 * np.log2(corner / frequencies),
+            )
+
+        loudest = rolloff(corner_a, 18.0)  # extends well past 30 Hz
+        moderate = rolloff(corner_b, 18.0)  # starts rolling off at 45 Hz
+        quiet_one = rolloff(corner_b, 8.0)
+        quiet_two = rolloff(corner_b, 6.0)
+        curves = [loudest, moderate, quiet_one, quiet_two]
+
+        average_curve = np.mean(curves, axis=0)
+        average_extension = low_end_extension_hz(
+            moderate - average_curve, frequencies, reference_db=0.0
+        )
+        self.assertAlmostEqual(average_extension, 25.0, places=3)
+
+        best_curve = np.max(curves, axis=0)
+        best_extension = low_end_extension_hz(
+            moderate - best_curve, frequencies, reference_db=0.0
+        )
+        # -3 dB is half an octave below the 45 Hz corner at 6 dB/octave:
+        # 45 * 2**-0.5 =~ 31.8 Hz - well below "fully extended" (25 Hz) but
+        # a real, in-band corner, unlike the average-referenced case above.
+        self.assertGreater(best_extension, 30.0)
+        self.assertLess(best_extension, 35.0)
 
     def test_ranking_table_renders_none_extension_as_an_empty_gray_cell(self):
         base = {
@@ -1187,7 +1232,7 @@ class PipelineTests(unittest.TestCase):
             self.assertIn("EQ authority", page)
             self.assertIn("background:hsla(", page)
             self.assertTrue(
-                all(table.count("background:hsla(") == 18 for table in ranking_tables(page))
+                all(table.count("background:hsla(") == 17 for table in ranking_tables(page))
             )
             self.assertNotIn(".plotly-graph-div { width:100% !important; }", page)
             self.assertIn(".overview-panels,#pair-details { position:relative; }", page)

@@ -118,18 +118,26 @@ the real logic. Data flows strictly one-way through `.subpair-cache/`:
      ranking tuple — see "Key invariants" below. `low_end_extension_hz()`
      itself is self-referential (scores a curve against its own envelope
      peak) unless a caller passes `reference_db`; `run_search` uses this by
-     computing the *elementwise average* trend curve across every pair in
-     the search and calling it with each pair's `(trend - average)`
-     departure curve and `reference_db=0.0`, so the reported Hz is a
-     same-frequency, cross-pair-comparable answer rather than a
-     self-referential shape estimate — comparing only against a single
-     scalar (a pair's own peak, or the loudest pair's peak) was tried and
-     reverted; it breaks down for a bandpass-shaped sum, since a pair whose
-     peak sits at a different frequency than the reference can read as
-     *less* extended while actually being louder at the low end. The
-     function returns `None` (not a misleading in-band or edge number) when
-     a curve's departure never gets within threshold of the reference even
-     at its own best point; render that as an empty/gray cell, never as a
+     computing the *elementwise maximum* trend curve (the best SPL any pair
+     actually achieves, per frequency — not necessarily from the same pair
+     throughout) across every pair in the search and calling it with each
+     pair's `(trend - best_curve)` departure curve and `reference_db=0.0`,
+     so the reported Hz is a same-frequency, cross-pair-comparable answer
+     rather than a self-referential shape estimate. Two alternatives were
+     tried and reverted: comparing only against a single scalar (a pair's
+     own peak, or the loudest pair's peak) breaks down for a bandpass-shaped
+     sum, since a pair whose peak sits at a different frequency than the
+     reference can read as *less* extended while actually being louder at
+     the low end; comparing against the *elementwise average* curve breaks
+     down because most real placements roll off toward the bottom of the
+     band to some degree, so the average curve already has a "typical"
+     rolloff baked into its own shape, hiding exactly that amount of rolloff
+     in any pair that isn't unusually bad — confirmed on a real search where
+     two pairs a genuine 6 dB apart at 30 Hz both read as fully extended
+     against their average. The function returns `None` (not a misleading
+     in-band or edge number) when a curve's departure never gets within
+     threshold of the reference even at its own best point; render that as
+     an empty/gray cell, never as a
      number.
    - `ShelfOptions`/`low_shelf_response` add a fixed, user-specified broad
      low-shelf tonal control. It is a `search`-time `EqOptions.shelf` field
