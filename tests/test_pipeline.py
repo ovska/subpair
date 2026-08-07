@@ -48,8 +48,11 @@ def _synthetic_ir(sample_rate: float, length: int, delay: int, modes: list[tuple
 class PipelineTests(unittest.TestCase):
     def test_report_result_limit_argument(self):
         parser = _build_parser()
-        self.assertEqual(parser.parse_args(["report"]).limit, 15)
+        defaults = parser.parse_args(["report"])
+        self.assertEqual(defaults.limit, 15)
+        self.assertFalse(defaults.raw)
         self.assertEqual(parser.parse_args(["report", "--limit", "24"]).limit, 24)
+        self.assertTrue(parser.parse_args(["report", "--raw"]).raw)
 
     def test_search_max_cut_and_tie_tolerance_arguments(self):
         parser = _build_parser()
@@ -958,7 +961,7 @@ class PipelineTests(unittest.TestCase):
                     r'<table id="ranking-(?:raw|eq)".*?</table>', page, flags=re.DOTALL
                 )
 
-            self.assertEqual(len(ranking_tables(no_shelf_page)), 2)
+            self.assertEqual(len(ranking_tables(no_shelf_page)), 1)
             self.assertEqual(ranking_tables(no_shelf_page), ranking_tables(shelf_page))
             self.assertNotIn("LS Fc", no_shelf_page)
             self.assertNotIn("not scored", no_shelf_page)
@@ -973,24 +976,22 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(first_render, report.read_bytes())
             page = first_render.decode()
             self.assertIn("plotly.js", page.lower())
-            self.assertIn("id=\"ranking-raw\"", page)
             self.assertIn("id=\"ranking-eq\"", page)
-            self.assertIn("id=\"selected-pairs-magnitude-raw\"", page)
-            self.assertIn("id=\"selected-pairs-excess-raw\"", page)
+            self.assertNotIn("id=\"ranking-raw\"", page)
             self.assertIn("id=\"selected-pairs-magnitude-eq\"", page)
             self.assertIn("id=\"selected-pairs-excess-eq\"", page)
-            self.assertIn("setReportMode('raw')", page)
-            self.assertIn("setReportMode('eq')", page)
-            self.assertIn("setOverviewView('raw','magnitude')", page)
-            self.assertIn("setOverviewView('eq','excess')", page)
-            self.assertIn('data-pair-tabs="raw"', page)
-            self.assertIn('data-pair-tabs="eq"', page)
+            self.assertNotIn("id=\"selected-pairs-magnitude-raw\"", page)
+            self.assertNotIn("setReportMode", page)
+            self.assertIn("setOverviewView('magnitude')", page)
+            self.assertIn("setOverviewView('excess')", page)
+            self.assertIn("data-pair-tabs", page)
             self.assertIn("Hotkeys 1–9", page)
             self.assertIn("aria-keyshortcuts", page)
             self.assertIn("document.addEventListener('keydown'", page)
-            self.assertIn("showing up to 3 pairs per mode", page)
-            self.assertEqual(page.count('class="pair-select"'), 6)
-            self.assertEqual(page.count(" checked aria-label"), 4)
+            self.assertIn("activatePair(key);\n});", page)
+            self.assertIn("showing up to 3 pairs", page)
+            self.assertEqual(page.count('class="pair-select"'), 3)
+            self.assertEqual(page.count(" checked aria-label"), 2)
             table_pair_keys = set(
                 re.findall(
                     r'class="pair-select"[^>]*data-pair-key="([^"]+)"', page
@@ -1012,16 +1013,37 @@ class PipelineTests(unittest.TestCase):
             self.assertIn('"shape":"spline"', page)
             self.assertIn("EQ authority", page)
             self.assertIn("background:hsla(", page)
+            self.assertTrue(
+                all(table.count("background:hsla(") == 15 for table in ranking_tables(page))
+            )
+            self.assertNotIn(".plotly-graph-div { width:100% !important; }", page)
+            self.assertIn(".sizing-plots { visibility:hidden; }", page)
+            self.assertIn("Plotly.relayout(plot,{autosize:true})", page)
+            self.assertNotIn("window.dispatchEvent(new Event('resize'))", page)
             self.assertIn("Extension", page)
             self.assertIn("not part of the ranking", page)
             self.assertIn("Fitted PEQ filters", page)
-            self.assertIn("Pre-EQ excess GD", page)
             self.assertIn("Post-EQ excess GD", page)
+            self.assertNotIn("Pre-EQ excess GD", page)
             self.assertIn("zero-referenced excess-GD overlay", page)
+            for key in detail_pair_keys:
+                self.assertLess(page.index(f'id="decay-{key}"'), page.index(f'id="excess-{key}"'))
             self.assertEqual(page.count('"staticPlot": true'), len(detail_pair_keys))
             self.assertEqual(page.count('"displayModeBar": false'), len(detail_pair_keys))
             self.assertNotIn("#f0abfc", page)
             self.assertGreater(report.stat().st_size, 1_000_000)
+
+            raw_report = root / "report-raw.html"
+            build_report(cache, results_path, raw_report, top=2, limit=3, raw=True)
+            raw_page = raw_report.read_text()
+            self.assertIn('id="ranking-raw"', raw_page)
+            self.assertNotIn('id="ranking-eq"', raw_page)
+            self.assertIn('id="selected-pairs-magnitude-raw"', raw_page)
+            self.assertNotIn("Fitted PEQ filters", raw_page)
+            self.assertNotIn("Combined PEQ response (all bands)", raw_page)
+            self.assertNotIn("EQ authority", raw_page)
+            self.assertIn("Raw CSD-style decay", raw_page)
+            self.assertNotIn("Post-EQ CSD-style decay", raw_page)
 
     def test_synthetic_search_and_report_with_monotonic_gd_baseline(self):
         sample_rate = 4000.0

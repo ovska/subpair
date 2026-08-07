@@ -10,7 +10,6 @@ from typing import Any
 import numpy as np
 import plotly.graph_objects as go
 from plotly.offline import get_plotlyjs
-from plotly.subplots import make_subplots
 
 from .cache import load_cache
 from .dsp import AnalysisContext, EqOptions, ShelfOptions, db20, pair_diagnostics
@@ -44,7 +43,9 @@ def _plot_html(figure: go.Figure, div_id: str, *, static: bool = False) -> str:
     )
 
 
-def _magnitude_figure(pair: dict[str, Any], data: dict[str, Any]) -> go.Figure:
+def _magnitude_figure(
+    pair: dict[str, Any], data: dict[str, Any], *, raw: bool = False
+) -> go.Figure:
     f = data["frequencies"]
     figure = go.Figure()
     figure.add_trace(
@@ -64,62 +65,72 @@ def _magnitude_figure(pair: dict[str, Any], data: dict[str, Any]) -> go.Figure:
         )
     )
     figure.add_trace(
-        go.Scatter(x=f, y=data["sum_db"], name="Raw sum", line={"color": "#7dd3fc", "width": 1})
-    )
-    figure.add_trace(
         go.Scatter(
             x=f,
-            y=data["eq_target_db"],
-            name="EQ target (range/GD aware)",
-            line={"color": "#e879f9", "width": 1.5},
-            visible="legendonly",
+            y=data["sum_db"],
+            name="Raw sum",
+            line={"color": "#7dd3fc", "width": 1},
+            visible=True if raw else "legendonly",
         )
     )
-    figure.add_trace(
-        go.Scatter(
-            x=f,
-            y=data["post_eq_db"],
-            name="Post-EQ sum",
-            line={"color": "#86efac", "width": 1.7},
-            visible="legendonly",
-        )
-    )
-    figure.add_trace(
-        go.Scatter(
-            x=f,
-            y=np.asarray(data["post_eq_db"]) - np.asarray(data["sum_db"]),
-            name="Combined PEQ response (all bands)",
-            line={"color": "#c4b5fd", "width": 1.7},
-            visible="legendonly",
-            yaxis="y2",
-        )
-    )
-    if "post_eq_shelf_db" in data:
+    if not raw:
         figure.add_trace(
             go.Scatter(
                 x=f,
-                y=data["post_eq_shelf_db"],
-                name="Post-EQ + low shelf (tonal, not scored)",
-                line={"color": "#fdba74", "width": 1.7},
+                y=data["eq_target_db"],
+                name="EQ target (range/GD aware)",
+                line={"color": "#e879f9", "width": 1.5},
                 visible="legendonly",
             )
         )
-    figure.update_layout(
-        title="Magnitude: solos and optimised sum",
-        xaxis={"type": "log", "title": "Frequency (Hz)"},
-        yaxis={"title": "Level (dB; cache reference)"},
-        yaxis2={
+        figure.add_trace(
+            go.Scatter(
+                x=f,
+                y=data["post_eq_db"],
+                name="Post-EQ sum",
+                line={"color": "#86efac", "width": 1.7},
+            )
+        )
+        figure.add_trace(
+            go.Scatter(
+                x=f,
+                y=np.asarray(data["post_eq_db"]) - np.asarray(data["sum_db"]),
+                name="Combined PEQ response (all bands)",
+                line={"color": "#c4b5fd", "width": 1.7},
+                visible="legendonly",
+                yaxis="y2",
+            )
+        )
+        if "post_eq_shelf_db" in data:
+            figure.add_trace(
+                go.Scatter(
+                    x=f,
+                    y=data["post_eq_shelf_db"],
+                    name="Post-EQ + low shelf (tonal, not scored)",
+                    line={"color": "#fdba74", "width": 1.7},
+                    visible="legendonly",
+                )
+            )
+    layout: dict[str, Any] = {
+        "title": (
+            "Magnitude: solos and raw sum" if raw else "Magnitude: solos and EQ’d sum"
+        ),
+        "xaxis": {"type": "log", "title": "Frequency (Hz)"},
+        "yaxis": {"title": "Level (dB; cache reference)"},
+        "margin": {"l": 62, "r": 70, "t": 52, "b": 55},
+        "legend": {"orientation": "h", "y": -0.22},
+        "template": "plotly_dark",
+        "height": 510,
+    }
+    if not raw:
+        layout["yaxis2"] = {
             "title": "Combined PEQ gain (dB)",
             "overlaying": "y",
             "side": "right",
             "showgrid": False,
             "visible": False,
-        },
-        margin={"l": 62, "r": 70, "t": 52, "b": 55},
-        legend={"orientation": "h", "y": -0.22},
-        template="plotly_dark",
-        height=510,
-    )
+        }
+    figure.update_layout(**layout)
     return figure
 
 
@@ -212,17 +223,19 @@ def _overview_excess_figure(
     return figure
 
 
-def _excess_figure(data: dict[str, Any]) -> go.Figure:
+def _excess_figure(data: dict[str, Any], *, raw: bool = False) -> go.Figure:
     figure = go.Figure()
+    prefix = "" if raw else "post_eq_"
+    label = "Raw" if raw else "Post-EQ"
     figure.add_trace(
         go.Scatter(
             x=data["frequencies"],
-            y=data["excess_curve_ms"],
+            y=data[f"{prefix}excess_curve_ms"],
             line={"color": "#c4b5fd", "width": 2, "shape": "spline", "smoothing": 1.0},
-            name="Excess GD",
+            name=f"{label} excess GD",
         )
     )
-    baseline_ms = np.asarray(data["excess_baseline_ms"])
+    baseline_ms = np.asarray(data[f"{prefix}excess_baseline_ms"])
     # A "flat" baseline is a single constant (already implied by the y=0
     # reference line below); only draw it when it actually varies, i.e. the
     # 'monotonic' --gd-baseline mode.
@@ -235,17 +248,18 @@ def _excess_figure(data: dict[str, Any]) -> go.Figure:
                 name="Monotonic baseline",
             )
         )
-    figure.add_trace(
-        go.Scatter(
-            x=data["frequencies"],
-            y=100.0 * np.asarray(data["eq_authority"]),
-            line={"color": "#86efac", "width": 1.5},
-            name="EQ authority",
-            yaxis="y2",
+    if not raw:
+        figure.add_trace(
+            go.Scatter(
+                x=data["frequencies"],
+                y=100.0 * np.asarray(data["eq_authority"]),
+                line={"color": "#86efac", "width": 1.5},
+                name="EQ authority",
+                yaxis="y2",
+            )
         )
-    )
     figure.add_hline(y=0.0, line={"color": "#64748b", "width": 1})
-    peak_ms = float(data["excess_gd_peak_ms"])
+    peak_ms = float(data[f"{prefix}excess_gd_peak_ms"])
     for sign in (1.0, -1.0):
         figure.add_hline(
             y=sign * peak_ms,
@@ -261,44 +275,38 @@ def _excess_figure(data: dict[str, Any]) -> go.Figure:
         xanchor="right",
         yanchor="bottom",
     )
-    figure.update_layout(
-        title="Excess group delay (display spline; raw data used for score)",
-        xaxis={"type": "log", "title": "Frequency (Hz)"},
-        yaxis={"title": "Excess GD (ms)"},
-        yaxis2={
+    layout = {
+        "title": f"{label} excess group delay (display spline; raw data used for score)",
+        "xaxis": {"type": "log", "title": "Frequency (Hz)"},
+        "yaxis": {"title": "Excess GD (ms)"},
+        "margin": {"l": 62, "r": 24, "t": 52, "b": 55},
+        "template": "plotly_dark",
+        "height": 390,
+    }
+    if not raw:
+        layout["yaxis2"] = {
             "title": "EQ authority (%)",
             "overlaying": "y",
             "side": "right",
             "range": [0, 105],
-        },
-        margin={"l": 62, "r": 24, "t": 52, "b": 55},
-        template="plotly_dark",
-        height=390,
-    )
+        }
+    figure.update_layout(**layout)
     return figure
 
 
-def _decay_figure(data: dict[str, Any]) -> go.Figure:
-    figure = make_subplots(
-        rows=1,
-        cols=2,
-        shared_yaxes=True,
-        subplot_titles=("Pre-EQ", "Post-EQ (bounded PEQ)"),
-        horizontal_spacing=0.08,
-    )
-    common = {
-        "x": 1000.0 * np.asarray(data["decay_times"]),
-        "y": data["decay_frequencies"],
-        "zmin": -40,
-        "zmax": 0,
-        "colorscale": "Turbo",
-        "colorbar": {"title": "dB"},
-    }
+def _decay_figure(data: dict[str, Any], *, raw: bool = False) -> go.Figure:
+    figure = go.Figure()
+    label = "Raw" if raw else "Post-EQ"
     figure.add_trace(
-        go.Heatmap(z=data["pre_decay_db"], showscale=False, **common), row=1, col=1
-    )
-    figure.add_trace(
-        go.Heatmap(z=data["post_decay_db"], showscale=True, **common), row=1, col=2
+        go.Heatmap(
+            x=1000.0 * np.asarray(data["decay_times"]),
+            y=data["decay_frequencies"],
+            z=data["pre_decay_db" if raw else "post_decay_db"],
+            zmin=-40,
+            zmax=0,
+            colorscale="Turbo",
+            colorbar={"title": "dB"},
+        )
     )
     overlay_common = {
         "mode": "lines",
@@ -312,34 +320,19 @@ def _decay_figure(data: dict[str, Any]) -> go.Figure:
     }
     figure.add_trace(
         go.Scatter(
-            x=data["excess_curve_ms"],
+            x=data["excess_curve_ms" if raw else "post_eq_excess_curve_ms"],
             y=data["frequencies"],
-            name="Pre-EQ excess GD",
+            name=f"{label} excess GD",
             line=overlay_common["line"],
             mode=overlay_common["mode"],
             hovertemplate=overlay_common["hovertemplate"],
         ),
-        row=1,
-        col=1,
     )
-    figure.add_trace(
-        go.Scatter(
-            x=data["post_eq_excess_curve_ms"],
-            y=data["frequencies"],
-            name="Post-EQ excess GD",
-            line=overlay_common["line"],
-            mode=overlay_common["mode"],
-            hovertemplate=overlay_common["hovertemplate"],
-        ),
-        row=1,
-        col=2,
-    )
-    figure.add_vline(x=0.0, line={"color": "#94a3b8", "width": 1}, row=1, col=1)
-    figure.add_vline(x=0.0, line={"color": "#94a3b8", "width": 1}, row=1, col=2)
+    figure.add_vline(x=0.0, line={"color": "#94a3b8", "width": 1})
     figure.update_xaxes(title_text="Time from sum peak (ms)")
-    figure.update_yaxes(type="log", title_text="Frequency (Hz)", row=1, col=1)
+    figure.update_yaxes(type="log", title_text="Frequency (Hz)")
     figure.update_layout(
-        title="CSD-style decay with zero-referenced excess-GD overlay",
+        title=f"{label} CSD-style decay with zero-referenced excess-GD overlay",
         template="plotly_dark",
         height=520,
         legend={"orientation": "h", "y": -0.18},
@@ -398,6 +391,7 @@ def _ranking_table(
         null_key: "low",
         excess_key: "low",
         tail_key: "low",
+        extension_key: "low",
         spl_key: "high",
     }
     metric_ranges: dict[str, tuple[float, float]] = {}
@@ -468,10 +462,13 @@ def build_report(
     top: int = 5,
     limit: int = 15,
     shelf: ShelfOptions | None = None,
+    raw: bool = False,
 ) -> Path:
     if limit < 1:
         raise ReportError("Report result limit must be at least 1")
     shelf = shelf or ShelfOptions()
+    if raw and shelf.active:
+        raise ReportError("--raw cannot be combined with post-EQ low-shelf settings")
     results = load_results(results_path)
     measurements, _ = load_cache(cache_dir)
     if len(measurements) != int(results.get("measurement_count", -1)):
@@ -514,27 +511,19 @@ def build_report(
             "Search results predate dual raw/EQ ranking; run 'subpair search' again"
         )
     context = AnalysisContext(measurements, band, int(settings["ppo"]))
-    raw_pairs = sorted(results["pairs"], key=lambda pair: int(pair["rank"]))[:limit]
-    eq_pairs = sorted(results["pairs"], key=lambda pair: int(pair["eq_rank"]))[:limit]
+    mode = "raw" if raw else "eq"
+    mode_label = "Raw" if raw else "EQ’d"
+    rank_key = "rank" if raw else "eq_rank"
+    pairs = sorted(results["pairs"], key=lambda pair: int(pair[rank_key]))[:limit]
 
     def pair_key(pair: dict[str, Any]) -> str:
         return f"{int(pair['first'])}-{int(pair['second'])}"
 
-    default_count = max(0, min(top, len(raw_pairs)))
-    raw_default_keys = {pair_key(pair) for pair in raw_pairs[:default_count]}
-    eq_default_keys = {pair_key(pair) for pair in eq_pairs[:default_count]}
+    default_count = max(0, min(top, len(pairs)))
+    default_keys = {pair_key(pair) for pair in pairs[:default_count]}
     detail_sections = []
     diagnostic_by_key: dict[str, dict[str, Any]] = {}
-    # Every displayed row can be selected interactively. Pre-render the union
-    # of the limited raw and EQ'd rankings so either table has instant, offline
-    # diagnostics without retaining every pair in the report.
-    displayed_pairs = list(raw_pairs)
-    displayed_keys = {pair_key(pair) for pair in displayed_pairs}
-    for pair in eq_pairs:
-        if pair_key(pair) not in displayed_keys:
-            displayed_pairs.append(pair)
-            displayed_keys.add(pair_key(pair))
-    for pair in displayed_pairs:
+    for pair in pairs:
         data = pair_diagnostics(
             context,
             int(pair["first"]) - 1,
@@ -547,50 +536,87 @@ def build_report(
             gd_baseline=gd_baseline,
         )
         key = pair_key(pair)
-        if shelf.active:
+        if shelf.active and not raw:
             shelf_response = shelf.response(context.frequencies, context.sample_rate)
             data["post_eq_shelf_db"] = np.asarray(data["post_eq_db"]) + db20(shelf_response)
         diagnostic_by_key[key] = data
-        peq = _peq_text(data["filters"], shelf)
+        metric_summary = (
+            f"Raw: null {pair['null_score_db']:.3f} dB · "
+            f"excess GD {pair['excess_gd_ms']:.3f} ms · "
+            f"peak {pair['excess_gd_peak_ms']:.2f} ms · "
+            f"tail {pair['raw_tail_ms']:.1f} ms"
+            if raw
+            else (
+                f"EQ’d: null {pair['post_eq_null_score_db']:.3f} dB · "
+                f"excess GD {pair['post_eq_excess_gd_ms']:.3f} ms · "
+                f"peak {pair['post_eq_excess_gd_peak_ms']:.2f} ms · "
+                f"tail {pair['post_eq_tail_ms']:.1f} ms"
+            )
+        )
+        eq_description = ""
+        peq_html = ""
+        if not raw:
+            eq_description = (
+                f"EQ: {html.escape(eq_options.target)} target, "
+                f"{eq_range[0]:g}–{eq_range[1]:g} Hz, "
+                f"{eq_options.correction_slope_db_per_octave:g} dB/oct curtain, "
+                f"max boost {eq_options.max_boost_db:g} dB, up to "
+                f"{eq_options.max_filters} PEQ bands; excess-GD guarded.<br>"
+            )
+            if shelf.active:
+                eq_description += (
+                    f"Low shelf: {shelf.gain_db:+.1f} dB at {shelf.freq_hz:g} Hz, "
+                    f"slope {shelf.slope:.2f} — a fixed tonal control, not reflected "
+                    "in the ranking metrics above.<br>"
+                )
+            peq = _peq_text(data["filters"], shelf)
+            peq_html = (
+                '<div class="peq"><h3>Fitted PEQ filters</h3>'
+                '<button onclick="copyPeq(this)">Copy</button>'
+                f"<pre>{html.escape(peq)}</pre></div>"
+            )
         detail_sections.append(
             f"""
             <section class="pair-detail" data-pair-key="{key}"
               data-pair-label="{pair['first']}+{pair['second']}"
-              data-raw-rank="{pair['rank']}" data-eq-rank="{pair['eq_rank']}"
+              data-rank="{pair[rank_key]}"
               hidden>
-              <h2><span data-mode-copy="raw">#{pair['rank']} Raw</span><span data-mode-copy="eq">#{pair['eq_rank']} EQ’d</span>:
+              <h2>#{pair[rank_key]} {mode_label}:
                 {html.escape(pair['first_name'])} + {html.escape(pair['second_name'])}</h2>
               <p class="configuration">Sub 2: {'normal' if pair['polarity'] > 0 else 'inverted'},
                 delay {pair['delay_ms']:+.3f} ms, gain {pair['gain_db']:+.2f} dB<br>
-                <span data-mode-copy="raw">Raw: null {pair['null_score_db']:.3f} dB ·
-                excess GD {pair['excess_gd_ms']:.3f} ms ·
-                peak {pair['excess_gd_peak_ms']:.2f} ms · tail {pair['raw_tail_ms']:.1f} ms</span>
-                <span data-mode-copy="eq">EQ’d: null {pair['post_eq_null_score_db']:.3f} dB ·
-                excess GD {pair['post_eq_excess_gd_ms']:.3f} ms ·
-                peak {pair['post_eq_excess_gd_peak_ms']:.2f} ms · tail {pair['post_eq_tail_ms']:.1f} ms</span><br>
-                EQ: {html.escape(eq_options.target)} target, {eq_range[0]:g}–{eq_range[1]:g} Hz,
-                {eq_options.correction_slope_db_per_octave:g} dB/oct curtain,
-                max boost {eq_options.max_boost_db:g} dB, up to
-                {eq_options.max_filters} PEQ bands; excess-GD guarded.<br>
-                {f'Low shelf: {shelf.gain_db:+.1f} dB at {shelf.freq_hz:g} Hz, slope {shelf.slope:.2f} — a fixed tonal control, not reflected in the ranking metrics above.<br>' if shelf.active else ''}
+                {metric_summary}<br>
+                {eq_description}
                 CSD overlay: excess GD with common delay removed; a vertical line is frequency-independent delay.</p>
-              {_plot_html(_magnitude_figure(pair, data), f'magnitude-{key}')}
-              {_plot_html(_excess_figure(data), f'excess-{key}')}
-              {_plot_html(_decay_figure(data), f'decay-{key}', static=True)}
-              <div class="peq"><h3>Fitted PEQ filters</h3><button onclick="copyPeq(this)">Copy</button>
-              <pre>{html.escape(peq)}</pre></div>
+              {_plot_html(_magnitude_figure(pair, data, raw=raw), f'magnitude-{key}')}
+              {_plot_html(_decay_figure(data, raw=raw), f'decay-{key}', static=True)}
+              {_plot_html(_excess_figure(data, raw=raw), f'excess-{key}')}
+              {peq_html}
             </section>
             """.strip()
         )
 
-    raw_overview = [(pair, diagnostic_by_key[pair_key(pair)]) for pair in raw_pairs]
-    eq_overview = [(pair, diagnostic_by_key[pair_key(pair)]) for pair in eq_pairs]
-    raw_default_json = json.dumps(
-        [pair_key(pair) for pair in raw_pairs[:default_count]], separators=(",", ":")
+    overview = [(pair, diagnostic_by_key[pair_key(pair)]) for pair in pairs]
+    default_json = json.dumps(
+        [pair_key(pair) for pair in pairs[:default_count]], separators=(",", ":")
     )
-    eq_default_json = json.dumps(
-        [pair_key(pair) for pair in eq_pairs[:default_count]], separators=(",", ":")
-    )
+    legend_handler = "" if raw else """
+document.querySelectorAll('.pair-detail .plotly-graph-div[id^="magnitude-"]').forEach(plot=>{
+  plot.on('plotly_legendclick',event=>{
+    const trace=plot.data[event.curveNumber];
+    if(trace && trace.name==='Combined PEQ response (all bands)') {
+      const willShow=trace.visible==='legendonly';
+      Plotly.relayout(plot,{'yaxis2.visible':willShow});
+    }
+  });
+});
+""".strip()
+    copy_peq_script = "" if raw else """
+function copyPeq(button) {
+  navigator.clipboard.writeText(button.parentElement.querySelector('pre').innerText);
+  const old=button.innerText; button.innerText='Copied'; setTimeout(()=>button.innerText=old,900);
+}
+""".strip()
 
     settings_json = html.escape(json.dumps(settings, sort_keys=True, indent=2))
     document = f"""<!doctype html>
@@ -606,16 +632,13 @@ body {{ margin:0; background:var(--bg); color:var(--text); font:15px/1.5 ui-sans
 main {{ width:min(1500px,96vw); margin:0 auto; padding:36px 0 80px; }}
 h1 {{ font-size:2.2rem; margin:0 0 4px; }} h2 {{ margin-top:0; }}
 .lede,.configuration,.note {{ color:var(--muted); }}
-.mode-tabs {{ display:inline-flex; gap:4px; margin:16px 0 20px; padding:4px; border:1px solid var(--line); border-radius:10px; background:#091322; }}
-.mode-tab {{ border:0; border-radius:7px; padding:9px 18px; color:var(--muted); background:transparent; cursor:pointer; font-weight:700; }}
-.mode-tab.active {{ color:#07111f; background:#7dd3fc; }}
 .chart-tabs,.pair-tabs {{ display:flex; flex-wrap:wrap; gap:6px; margin:14px 0; }}
 .chart-tab,.pair-tab {{ border:1px solid #3b506d; border-radius:7px; padding:7px 13px; color:var(--muted); background:#101e31; cursor:pointer; font-weight:650; }}
 .chart-tab.active,.pair-tab.active {{ color:#07111f; border-color:#7dd3fc; background:#7dd3fc; }}
 .pair-tabs {{ min-height:39px; margin:14px 0 2px; }}
 .empty-selection {{ align-self:center; color:var(--muted); }}
 [hidden] {{ display:none !important; }}
-[data-mode-copy="eq"] {{ display:none; }}
+.sizing-plots {{ visibility:hidden; }}
 .table-wrap {{ overflow:auto; border:1px solid var(--line); border-radius:12px; background:var(--card); }}
 table {{ width:100%; border-collapse:collapse; white-space:nowrap; }}
 th,td {{ padding:10px 13px; text-align:right; border-bottom:1px solid var(--line); }}
@@ -635,43 +658,22 @@ details {{ margin:22px 0; }} details pre {{ overflow:auto; color:var(--muted); }
 </head>
 <body><main>
 <h1>subpair ranking</h1>
-<p class="lede">{results['measurement_count']} positions · {band[0]:g}–{band[1]:g} Hz · {settings['ppo']} points/octave · dual lexicographic ranking · showing up to {limit} pairs per mode{' · monotonic GD baseline' if gd_baseline == 'monotonic' else ''}</p>
-<div class="mode-tabs" role="tablist" aria-label="Ranking response mode">
-  <button class="mode-tab active" id="raw-mode-tab" role="tab" aria-selected="true" onclick="setReportMode('raw')">Raw</button>
-  <button class="mode-tab" id="eq-mode-tab" role="tab" aria-selected="false" onclick="setReportMode('eq')">EQ’d</button>
+<p class="lede">{results['measurement_count']} positions · {band[0]:g}–{band[1]:g} Hz · {settings['ppo']} points/octave · {mode_label} lexicographic ranking · showing up to {limit} pairs{' · monotonic GD baseline' if gd_baseline == 'monotonic' else ''}</p>
+<p class="note">Check table rows to choose comparison pairs. The top {default_count} start selected; the pair tabs below the table open one full diagnostic at a time. Hotkeys 1–9 open the first nine selected tabs.</p>
+<div class="chart-tabs" role="tablist" aria-label="{mode_label} overview chart">
+  <button class="chart-tab active" data-overview-view="magnitude" role="tab" aria-selected="true" onclick="setOverviewView('magnitude')">Magnitude</button>
+  <button class="chart-tab" data-overview-view="excess" role="tab" aria-selected="false" onclick="setOverviewView('excess')">Excess GD</button>
 </div>
-<p class="note">Check table rows to choose comparison pairs. Each mode starts with its top {default_count}; the pair tabs below the table open one full diagnostic at a time. Hotkeys 1–9 open the first nine selected tabs.</p>
-<div data-mode-panel="raw">
-  <div class="chart-tabs" role="tablist" aria-label="Raw overview chart">
-    <button class="chart-tab active" data-overview-mode="raw" data-overview-view="magnitude" role="tab" aria-selected="true" onclick="setOverviewView('raw','magnitude')">Magnitude</button>
-    <button class="chart-tab" data-overview-mode="raw" data-overview-view="excess" role="tab" aria-selected="false" onclick="setOverviewView('raw','excess')">Excess GD</button>
-  </div>
-  <div data-overview-panel="raw" data-overview-view="magnitude">
-    {_plot_html(_overview_figure(raw_overview, 'raw', raw_default_keys), 'selected-pairs-magnitude-raw')}
-  </div>
-  <div data-overview-panel="raw" data-overview-view="excess" hidden>
-    {_plot_html(_overview_excess_figure(raw_overview, 'raw', raw_default_keys), 'selected-pairs-excess-raw')}
-  </div>
-  <p class="note">Raw ranking: raw-magnitude null depth, raw excess group delay, then raw tail.</p>
-  <div class="table-wrap">{_ranking_table(raw_pairs, 'raw', 'ranking-raw', raw_default_keys)}</div>
-  <div class="pair-tabs" data-pair-tabs="raw" role="tablist" aria-label="Selected raw pairs"></div>
+<div data-overview-panel data-overview-view="magnitude">
+  {_plot_html(_overview_figure(overview, mode, default_keys), f'selected-pairs-magnitude-{mode}')}
 </div>
-<div data-mode-panel="eq" hidden>
-  <div class="chart-tabs" role="tablist" aria-label="EQ’d overview chart">
-    <button class="chart-tab active" data-overview-mode="eq" data-overview-view="magnitude" role="tab" aria-selected="true" onclick="setOverviewView('eq','magnitude')">Magnitude</button>
-    <button class="chart-tab" data-overview-mode="eq" data-overview-view="excess" role="tab" aria-selected="false" onclick="setOverviewView('eq','excess')">Excess GD</button>
-  </div>
-  <div data-overview-panel="eq" data-overview-view="magnitude">
-    {_plot_html(_overview_figure(eq_overview, 'eq', eq_default_keys), 'selected-pairs-magnitude-eq')}
-  </div>
-  <div data-overview-panel="eq" data-overview-view="excess" hidden>
-    {_plot_html(_overview_excess_figure(eq_overview, 'eq', eq_default_keys), 'selected-pairs-excess-eq')}
-  </div>
-  <p class="note">EQ’d ranking: post-EQ raw-magnitude null depth, post-EQ excess group delay, then post-EQ tail.</p>
-  <div class="table-wrap">{_ranking_table(eq_pairs, 'eq', 'ranking-eq', eq_default_keys)}</div>
-  <div class="pair-tabs" data-pair-tabs="eq" role="tablist" aria-label="Selected EQ’d pairs"></div>
+<div data-overview-panel data-overview-view="excess" hidden>
+  {_plot_html(_overview_excess_figure(overview, mode, default_keys), f'selected-pairs-excess-{mode}')}
 </div>
-<p class="note">Click a table heading to sort. Metric cells run from green (best) to red (worst); lower is better except relative SPL, where higher is better. Each mode references its own rank 1 for relative SPL. Extension is an uncolored, informational F3-style estimate (lower is more extended) and is not part of the ranking.</p>
+<p class="note">{('Raw ranking: raw-magnitude null depth, raw excess group delay, then raw tail.' if raw else 'EQ’d ranking: post-EQ raw-magnitude null depth, post-EQ excess group delay, then post-EQ tail.')}</p>
+<div class="table-wrap">{_ranking_table(pairs, mode, f'ranking-{mode}', default_keys)}</div>
+<div class="pair-tabs" data-pair-tabs role="tablist" aria-label="Selected {mode_label} pairs"></div>
+<p class="note">Click a table heading to sort. Metric cells run from green (best) to red (worst); lower is better except relative SPL, where higher is better. Relative SPL references this ranking’s rank 1. Extension is an informational F3-style estimate (lower is more extended) and is not part of the ranking.</p>
 <div id="pair-details">{''.join(detail_sections)}</div>
 <details><summary>Analysis settings and minimum-phase convention</summary><pre>{settings_json}</pre></details>
 </main>
@@ -693,85 +695,71 @@ document.querySelectorAll('.ranking-table th[data-type]').forEach(th=>{{
     rows.forEach(row=>body.appendChild(row));
   }});
 }});
-document.querySelectorAll('.pair-detail .plotly-graph-div[id^="magnitude-"]').forEach(plot=>{{
-  plot.on('plotly_legendclick',event=>{{
-    const trace=plot.data[event.curveNumber];
-    if(trace && trace.name==='Combined PEQ response (all bands)') {{
-      const willShow=trace.visible==='legendonly';
-      Plotly.relayout(plot,{{'yaxis2.visible':willShow}});
-    }}
-  }});
-}});
-const selectedPairs={{
-  raw:new Set({raw_default_json}),
-  eq:new Set({eq_default_json})
-}};
-const activePairs={{
-  raw:Array.from(selectedPairs.raw)[0]||null,
-  eq:Array.from(selectedPairs.eq)[0]||null
-}};
-const overviewViews={{raw:'magnitude',eq:'magnitude'}};
+{legend_handler}
+const reportMode={json.dumps(mode)};
+const selectedPairs=new Set({default_json});
+let activePair=Array.from(selectedPairs)[0]||null;
 function sectionForKey(key) {{
   return Array.from(document.querySelectorAll('.pair-detail')).find(
     section=>section.dataset.pairKey===key
   )||null;
 }}
-function orderedSelectedKeys(mode) {{
-  const rankField=mode==='eq'?'eqRank':'rawRank';
-  return Array.from(selectedPairs[mode]).filter(key=>sectionForKey(key)).sort((a,b)=>{{
-    return Number(sectionForKey(a).dataset[rankField])-Number(sectionForKey(b).dataset[rankField]);
+function orderedSelectedKeys() {{
+  return Array.from(selectedPairs).filter(key=>sectionForKey(key)).sort((a,b)=>{{
+    return Number(sectionForKey(a).dataset.rank)-Number(sectionForKey(b).dataset.rank);
   }});
 }}
-function updateOverview(mode) {{
+function updateOverview() {{
   ['magnitude','excess'].forEach(view=>{{
-    const plot=document.getElementById('selected-pairs-'+view+'-'+mode);
+    const plot=document.getElementById('selected-pairs-'+view+'-'+reportMode);
     if(!plot||!plot.data) return;
     plot.data.forEach((trace,index)=>{{
-      const visible=selectedPairs[mode].has(trace.meta.pair_key);
+      const visible=selectedPairs.has(trace.meta.pair_key);
       if(trace.visible!==visible) Plotly.restyle(plot,{{visible:visible}},[index]);
     }});
   }});
 }}
-function setOverviewView(mode,view) {{
-  overviewViews[mode]=view;
-  document.querySelectorAll('[data-overview-panel="'+mode+'"]').forEach(panel=>{{
-    panel.hidden=panel.dataset.overviewView!==view;
-  }});
-  document.querySelectorAll('.chart-tab[data-overview-mode="'+mode+'"]').forEach(button=>{{
+function revealPlots(container) {{
+  container.classList.add('sizing-plots');
+  container.hidden=false;
+  const plots=Array.from(container.querySelectorAll('.plotly-graph-div')).filter(
+    plot=>plot.data
+  );
+  if(!plots.length) {{
+    container.classList.remove('sizing-plots');
+    return;
+  }}
+  Promise.all(plots.map(plot=>Plotly.relayout(plot,{{autosize:true}})))
+    .catch(()=>{{}})
+    .finally(()=>container.classList.remove('sizing-plots'));
+}}
+function setOverviewView(view) {{
+  document.querySelectorAll('[data-overview-panel]').forEach(panel=>panel.hidden=true);
+  const panel=document.querySelector('[data-overview-panel][data-overview-view="'+view+'"]');
+  if(panel) revealPlots(panel);
+  document.querySelectorAll('.chart-tab').forEach(button=>{{
     const active=button.dataset.overviewView===view;
     button.classList.toggle('active',active);
     button.setAttribute('aria-selected',String(active));
   }});
-  window.dispatchEvent(new Event('resize'));
 }}
-function syncDetailPlot(section,mode) {{
-  const plot=document.getElementById('magnitude-'+section.dataset.pairKey);
-  if(!plot||!plot.data) return;
-  const rawIndex=plot.data.findIndex(trace=>trace.name==='Raw sum');
-  const eqIndex=plot.data.findIndex(trace=>trace.name==='Post-EQ sum');
-  if(rawIndex>=0) Plotly.restyle(plot,{{visible:mode==='raw'?true:'legendonly'}},[rawIndex]);
-  if(eqIndex>=0) Plotly.restyle(plot,{{visible:mode==='eq'?true:'legendonly'}},[eqIndex]);
-}}
-function renderActiveDetail(mode) {{
+function renderActiveDetail() {{
   document.querySelectorAll('.pair-detail').forEach(section=>section.hidden=true);
-  const key=activePairs[mode];
-  if(!key) return;
-  const section=sectionForKey(key);
+  if(!activePair) return;
+  const section=sectionForKey(activePair);
   if(!section) return;
-  section.hidden=false;
-  syncDetailPlot(section,mode);
-  window.dispatchEvent(new Event('resize'));
+  revealPlots(section);
 }}
-function activatePair(mode,key) {{
-  if(!selectedPairs[mode].has(key)) return;
-  activePairs[mode]=key;
-  renderPairTabs(mode);
-  if(document.body.dataset.reportMode===mode) renderActiveDetail(mode);
+function activatePair(key) {{
+  if(!selectedPairs.has(key)) return;
+  activePair=key;
+  renderPairTabs();
+  renderActiveDetail();
 }}
-function renderPairTabs(mode) {{
-  const strip=document.querySelector('[data-pair-tabs="'+mode+'"]');
-  const keys=orderedSelectedKeys(mode);
-  if(!keys.includes(activePairs[mode])) activePairs[mode]=keys[0]||null;
+function renderPairTabs() {{
+  const strip=document.querySelector('[data-pair-tabs]');
+  const keys=orderedSelectedKeys();
+  if(!keys.includes(activePair)) activePair=keys[0]||null;
   strip.replaceChildren();
   if(!keys.length) {{
     const empty=document.createElement('span');
@@ -784,26 +772,26 @@ function renderPairTabs(mode) {{
     const section=sectionForKey(key);
     const button=document.createElement('button');
     button.type='button';
-    button.className='pair-tab'+(key===activePairs[mode]?' active':'');
+    button.className='pair-tab'+(key===activePair?' active':'');
     button.setAttribute('role','tab');
-    button.setAttribute('aria-selected',String(key===activePairs[mode]));
+    button.setAttribute('aria-selected',String(key===activePair));
     if(index<9) {{
       button.title='Hotkey '+String(index+1);
       button.setAttribute('aria-keyshortcuts',String(index+1));
     }}
     button.textContent=section.dataset.pairLabel;
-    button.addEventListener('click',()=>activatePair(mode,key));
+    button.addEventListener('click',()=>activatePair(key));
     strip.appendChild(button);
   }});
 }}
 document.querySelectorAll('.pair-select').forEach(checkbox=>{{
   checkbox.addEventListener('change',()=>{{
-    const mode=checkbox.dataset.mode, key=checkbox.dataset.pairKey;
-    if(checkbox.checked) selectedPairs[mode].add(key);
-    else selectedPairs[mode].delete(key);
-    renderPairTabs(mode);
-    updateOverview(mode);
-    if(document.body.dataset.reportMode===mode) renderActiveDetail(mode);
+    const key=checkbox.dataset.pairKey;
+    if(checkbox.checked) selectedPairs.add(key);
+    else selectedPairs.delete(key);
+    renderPairTabs();
+    updateOverview();
+    renderActiveDetail();
   }});
 }});
 document.addEventListener('keydown',event=>{{
@@ -813,36 +801,15 @@ document.addEventListener('keydown',event=>{{
   if(target instanceof HTMLElement && (
     target.isContentEditable||['INPUT','TEXTAREA','SELECT'].includes(target.tagName)
   )) return;
-  const mode=document.body.dataset.reportMode||'raw';
-  const key=orderedSelectedKeys(mode)[Number(event.key)-1];
+  const key=orderedSelectedKeys()[Number(event.key)-1];
   if(!key) return;
   event.preventDefault();
-  activatePair(mode,key);
+  activatePair(key);
 }});
-function setReportMode(mode) {{
-  document.body.dataset.reportMode=mode;
-  document.querySelectorAll('[data-mode-panel]').forEach(panel=>{{
-    panel.hidden=panel.dataset.modePanel!==mode;
-  }});
-  document.querySelectorAll('.mode-tab').forEach(button=>{{
-    const active=button.id===mode+'-mode-tab';
-    button.classList.toggle('active',active);
-    button.setAttribute('aria-selected',String(active));
-  }});
-  document.querySelectorAll('[data-mode-copy]').forEach(item=>{{
-    item.style.display=item.dataset.modeCopy===mode?'inline':'none';
-  }});
-  renderPairTabs(mode);
-  renderActiveDetail(mode);
-  setOverviewView(mode,overviewViews[mode]);
-}}
-function copyPeq(button) {{
-  navigator.clipboard.writeText(button.parentElement.querySelector('pre').innerText);
-  const old=button.innerText; button.innerText='Copied'; setTimeout(()=>button.innerText=old,900);
-}}
-renderPairTabs('raw');
-renderPairTabs('eq');
-setReportMode('raw');
+{copy_peq_script}
+renderPairTabs();
+setOverviewView('magnitude');
+renderActiveDetail();
 </script></body></html>"""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(document, encoding="utf-8")

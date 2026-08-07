@@ -187,14 +187,19 @@ def _build_parser() -> argparse.ArgumentParser:
         "--top",
         type=_positive_int,
         default=5,
-        help="pairs selected initially in each ranking mode",
+        help="pairs selected initially",
     )
     report.add_argument(
         "--limit",
         type=_positive_int,
         default=15,
         metavar="COUNT",
-        help="maximum ranked pairs shown per mode (default: 15)",
+        help="maximum ranked pairs shown (default: 15)",
+    )
+    report.add_argument(
+        "--raw",
+        action="store_true",
+        help="show raw results instead of the default EQ'd results",
     )
     _add_shelf_arguments(report)
 
@@ -377,6 +382,7 @@ def _report(args: argparse.Namespace) -> int:
         top=args.top,
         limit=args.limit,
         shelf=_shelf_options(args),
+        raw=args.raw,
     )
     print(f"Wrote self-contained report to {output.resolve()}")
     return 0

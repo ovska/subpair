@@ -302,29 +302,29 @@ drive). Raw and EQ'd modes each reference their own rank 1.
 
 ### `subpair report`
 
-Produces one HTML file containing Plotly itself, sortable raw and EQ'd tables,
-top-pair response diagnostics, CSD-style pre/post-EQ heatmaps, and copyable
-PEQ text. Each ranking table has selection checkboxes (its top five are checked
-by default); the selected pairs feed the combined overview and appear as pair
-tabs below the table for fast one-at-a-time diagnostics. The overview itself
-switches between magnitude and excess group delay. The Raw/EQ'd tabs maintain
-independent selections and switch the appropriate raw or corrected traces.
-Number keys 1–9 open the corresponding selected pair tab in the active mode.
-Metric cells use a best-to-worst colour scale. `report --top N` changes the
-initial selection count. `report --limit N` limits each ranking table and its
-selectable diagnostics to the top N results (default 15). No network connection
-or CDN is used when the report is viewed.
+Produces one HTML file containing Plotly itself, the sortable EQ'd ranking,
+top-pair response diagnostics, post-EQ CSD heatmaps, and copyable PEQ text.
+Pass `--raw` to show the raw ranking and raw diagnostics instead, omitting the
+EQ-specific plots and PEQ controls entirely. The table has selection checkboxes
+(its top five are checked by default); the selected pairs feed the combined
+overview and appear as pair tabs below the table for fast one-at-a-time
+diagnostics. The overview switches between magnitude and excess group delay.
+Number keys 1–9 open the corresponding selected pair tab. Metric cells use a
+best-to-worst colour scale. `report --top N` changes the initial selection
+count. `report --limit N` limits the table and its selectable diagnostics to
+the top N results (default 15). No network connection or CDN is used when the
+report is viewed.
 
 Each CSD heatmap includes the corresponding zero-referenced excess-group-delay
 curve and a solid 0 ms reference. A vertical overlay indicates constant delay;
 frequency-dependent bends expose excess storage without relying on visual
-estimation of the heatmap ridge. Pre- and post-EQ overlays use the same colour
-for direct shape comparison, and CSD figures are static to avoid accidental
-zooming or panning.
+estimation of the heatmap ridge. CSD figures are static to avoid accidental
+zooming or panning and appear before the separate excess-group-delay graph.
 
-Each ranking table also shows an uncoloured, informational
+The ranking table also shows a colour-rated, informational
 `low_end_extension_hz`/`post_eq_low_end_extension_hz` column (see above); it
-is diagnostic only and does not affect sorting or which pairs are recommended.
+uses lower-is-better colouring but does not affect sorting or which pairs are
+recommended.
 
 #### Low shelf
 
