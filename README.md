@@ -187,47 +187,32 @@ drift, temperature, or DSP quantization.
 
 Each pair also reports `low_end_extension_f3_hz`/`low_end_extension_f6_hz`
 (and their `post_eq_` counterparts): in-band F3/F6-style diagnostics giving
-the lowest frequency each pair's broad trend's *envelope* holds up before
-permanently falling 3 dB (F3) or 6 dB (F6) below its own peak and not
-recovering — i.e. where does this specific placement's own response start
-rolling off, relative to its own best-supported plateau, matching a classic
-F3 spec.
+the lowest frequency each pair's broad-trend *envelope* reaches 3 dB (F3)
+or 6 dB (F6) below one shared absolute reference. Raw and post-EQ results
+use separate references, each equal to the strongest candidate's mean
+broad-trend power over the analyzed range through 100 Hz (or the whole band
+if it starts above 100 Hz). The log-frequency grid weights each octave
+equally. Because the solo measurements share a common drive level, this makes
+usable acoustic output part of extension: a pair that is quieter throughout
+the low end cannot earn a better F3/F6 just because its response was
+normalized to its own lower peak.
 
-This is deliberately self-referential: the reference level is each pair's
-*own* envelope peak, not a level or curve shared across pairs. Two
-cross-pair-referenced designs were tried and reverted, because every real
-placement in a search rolls off toward the bottom of the band to *some*
-degree, so any reference built by aggregating across pairs — an elementwise
-average curve, or even the elementwise *best* (maximum) curve — inevitably
-has its own baked-in rolloff too. Comparing a pair's departure against such
-a reference hides exactly the amount of rolloff the reference itself has,
-and for whichever pair dominates the reference (typically the loudest
-candidate) it hides essentially all of it: confirmed on a real search, where
-the loudest pair visibly rolled off by a real, several-dB amount well above
-the band edge on its own magnitude plot, yet reported a trivial "fully
-extended" (25 Hz) answer under both designs, because it also defined (or
-nearly defined) whatever it was being compared against. Absolute cross-pair
-SPL is a different, legitimate question, already answered directly by the
-`relative_spl_db`/`post_eq_relative_spl_db` columns — check those alongside
-F3/F6 if you want to know how loud two placements are relative to each
-other, not just how each one's own low end holds up.
+The reference is a single level, not an average or elementwise-best response
+curve or a single modal maximum. A reference *curve* inherits the subwoofers'
+own frequency-dependent rolloff and can therefore hide it; one maximum can
+overstate the nominal passband level. The mean-power scalar has neither
+problem. The envelope — the higher of the best level attained scanning up from
+the bottom of the band and the best level still attainable scanning down
+from the top — is used instead of the raw trend for the crossing. An
+isolated, recoverable notch is a placement defect already measured by the
+null score, so it cannot masquerade as a loss of extension, while a genuine
+sustained rolloff is still found normally. If a pair never reaches the
+shared F3 or F6 level anywhere in the band, that value is blank rather than
+an invented frequency. Lower is more extended.
 
-The scan starts at the envelope's own peak, not the value at the top of the
-band: a two-subwoofer sum is routinely bandpass-shaped (it rises out of the
-bottom of the band, peaks somewhere in the middle, and rolls off again
-toward crossover), so a pair whose passband merely peaks away from the top
-of the band isn't penalised for that alone. The envelope — the higher of the
-best level attained scanning up from the bottom of the band and the best
-level still attainable scanning down from the top — is used to find both the
-peak and the corner, deliberately not the raw trend: an isolated, recoverable
-notch is a placement defect the null score already measures on its own
-terms, so a response that is flat down to 25 Hz with one unrelated -5 dB
-notch at 100 Hz still reports ~25 Hz extension, not ~100 Hz. A genuine,
-sustained rolloff is not masked this way. Lower is more extended. This is
-purely informational — it is shown in `subpair report`'s tables and printed
-by `subpair search`, but it is not a raw or EQ'd ranking key, so it never
-changes which placement wins; a placement's own null/excess-GD/tail severity
-always decides.
+F3/F6 remain informational: they are shown in `subpair report` and printed
+by `subpair search`, but they are not raw or EQ'd recommendation keys. The
+null/excess-GD/tail tuple still decides the ranking.
 
 For minimum phase, subpair uses the real-cepstrum form of the Hilbert
 transform on the *full available 0-to-Nyquist magnitude*, not a brick-wall
@@ -365,9 +350,12 @@ report is viewed.
 
 The selected overview and pair diagnostics share one magnitude Y-axis range
 and one excess-group-delay Y-axis range, recalculated whenever the selection
-changes. Excess-GD plots include zero but clamp their lower scale limit to
--20 ms so large negative measurement-noise excursions do not flatten the
-useful part of the curves.
+changes. The combined EQ response uses that same magnitude axis; when it is
+shown, small markers identify every fitted PK/LS band's configured frequency
+and gain. EQ response and band gains are included in the shared range so those
+markers remain visible. Excess-GD plots include zero but clamp their lower
+scale limit to -20 ms so large negative measurement-noise excursions do not
+flatten the useful part of the curves.
 
 Each CSD heatmap includes the corresponding zero-referenced excess-group-delay
 curve and a solid 0 ms reference. A vertical overlay indicates constant delay;
@@ -375,10 +363,10 @@ frequency-dependent bends expose excess storage without relying on visual
 estimation of the heatmap ridge. CSD figures are static to avoid accidental
 zooming or panning and appear before the separate excess-group-delay graph.
 
-The ranking table also shows colour-rated, informational F3/F6 columns (see
-above); they use lower-is-better colouring, render as an empty gray cell when
-no meaningful crossing exists, and do not affect sorting or which pairs are
-recommended.
+The ranking table also shows colour-rated, informational shared-reference
+F3/F6 columns (see above); they use lower-is-better colouring, render as an
+empty gray cell when a pair never reaches the threshold, and do not affect
+sorting or which pairs are recommended.
 
 ### `subpair verify`
 

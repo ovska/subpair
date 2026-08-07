@@ -193,8 +193,9 @@ def low_end_extension_hz(
     trend_db: np.ndarray,
     frequencies: np.ndarray,
     threshold_db: float = LOW_END_EXTENSION_F3_THRESHOLD_DB,
-) -> float:
-    """Lowest frequency the broad trend holds up before permanently falling ``threshold_db`` below its own peak.
+    reference_level_db: float | None = None,
+) -> float | None:
+    """Lowest frequency whose broad-trend envelope reaches a reference threshold.
 
     An F3/F6-style extension estimate (``threshold_db`` selects which one -
     ``LOW_END_EXTENSION_F3_THRESHOLD_DB``/``LOW_END_EXTENSION_F6_THRESHOLD_DB``),
@@ -211,65 +212,48 @@ def low_end_extension_hz(
     side has nothing left to see past), so the envelope decline still lands
     close to where the raw curve actually crosses the threshold.
 
-    This is deliberately self-referential: the reference level is the
-    envelope's own *peak* value, wherever in the band it occurs - not a
-    level or curve shared with any other pair. Cross-pair-referenced designs
-    (comparing a pair's departure against an elementwise average or best/
-    maximum curve across a search) were tried and reverted: every real
-    placement in a search rolls off toward the bottom of the band to *some*
-    degree, so any reference built by aggregating across pairs inevitably
-    has its own baked-in rolloff too, which hides exactly that much rolloff
-    in whichever pair the reference is closest to - for the pair that
-    dominates the reference (typically the loudest candidate), it hides
-    essentially all of it, regardless of how much that pair actually
-    declines in absolute terms. See ``run_search``'s settings for the
-    cross-pair-comparable answer instead (``relative_spl_db``).
+    ``reference_level_db`` controls whether the result is a within-curve
+    rolloff diagnostic or a cross-curve comparison. Leaving it as ``None``
+    uses this curve's own envelope peak, which is useful for a conventional
+    single-response F3/F6 measurement. Passing a shared absolute level uses
+    exactly the same threshold for every curve. ``run_search`` does the
+    latter: all cached measurements use a common drive level, so the shared
+    threshold makes usable acoustic output part of extension. In particular,
+    if one pair is quieter than another throughout the low end, it cannot
+    earn a lower (better) F3/F6 merely because it is normalized to its own
+    lower peak.
 
-    The scan always starts at the envelope's own peak, not the value at the
-    top of the band. A two-subwoofer sum is routinely bandpass-shaped (it
-    rises out of the bottom of the band, peaks somewhere in the middle, and
-    rolls off again toward crossover) rather than staying flat all the way
-    to the top edge; starting the scan at the top-of-band sample
-    specifically is fragile in that case - if the curve is already
-    declining well before the top edge (true for a completely ordinary,
-    well-behaved response, not a defect), that edge sample can sit more
-    than ``threshold_db`` below the response's own peak, which would make
-    the *entire* scan fail immediately and misreport a
-    permanently-collapsed low end regardless of how well-extended the
-    actual low end is. Starting at the envelope's own peak (its highest
-    sustained plateau, found via ``np.argmax`` - which lands on the
-    *lowest* frequency of that plateau when the peak is a broad flat
-    region, not a single sample) is unaffected by whatever happens to the
-    response *above* the peak, which is a high-end/crossover concern this
-    metric is not about. When the peak is already at the top of the band (a
-    monotonically-rising passband, e.g. a simple single-corner rolloff),
-    this is identical to scanning down from the top edge, so ordinary
-    single-corner responses are scored exactly as before.
+    The crossing is always taken on the low-frequency side of the envelope's
+    peak, wherever that peak occurs. A two-subwoofer sum is routinely
+    bandpass-shaped and may already be declining toward its crossover at the
+    top of the analysis band; using the top-edge sample as an anchor would
+    therefore mix high-end crossover behavior into a low-end metric. The
+    envelope's monotonic low side avoids that failure for both conventional
+    self-referenced calls and search's shared absolute reference.
 
-    Scanning downward from the peak, this returns the highest frequency at
-    which the *running minimum* of the envelope first falls ``threshold_db``
-    below the peak and does not recover, or the band's own lower edge if it
-    never does (fully extended through the analyzed range) - since the
-    reference is always the curve's own peak, that peak itself always
-    trivially satisfies the threshold, so a crossing always exists. This is
-    purely diagnostic - it is not part of the raw or EQ'd ranking key - so a
-    placement's own null/excess-GD/tail severity always decides the winner;
-    it only summarizes how far down the winning (or any) placement's
-    underlying passband shape reaches.
+    The two-sided envelope is non-decreasing from the low band edge to its
+    peak, so the first sample that reaches ``reference_level_db -
+    threshold_db`` is the low-side crossing. The lower band edge is returned
+    when the response remains above the threshold throughout the analyzed
+    range. With a shared reference, a quiet curve may never reach the
+    threshold at any frequency; that legitimately returns ``None`` instead
+    of inventing a crossing. This remains a diagnostic and is not part of
+    the raw or EQ'd recommendation sort key.
     """
     frequencies = np.asarray(frequencies, dtype=np.float64)
     trend_db = np.asarray(trend_db, dtype=np.float64)
     if frequencies.size == 0:
         return 0.0
     envelope = _two_sided_envelope_db(trend_db)
-    peak_index = int(np.argmax(envelope))
-    threshold = float(envelope[peak_index]) - threshold_db
-    segment = envelope[: peak_index + 1]
-    running_min_from_peak = np.minimum.accumulate(segment[::-1])[::-1]
-    meets_threshold = running_min_from_peak >= threshold
-    if not np.any(meets_threshold):
-        return float(frequencies[-1])
-    return float(frequencies[np.argmax(meets_threshold)])
+    reference = (
+        float(np.max(envelope))
+        if reference_level_db is None
+        else float(reference_level_db)
+    )
+    meets_threshold = np.flatnonzero(envelope >= reference - threshold_db)
+    if not meets_threshold.size:
+        return None
+    return float(frequencies[meets_threshold[0]])
 
 
 def peq_response(
@@ -1419,6 +1403,7 @@ def pair_diagnostics(
     gain_db: float,
     include_decay: bool = False,
     eq_options: EqOptions | None = None,
+    include_trends: bool = False,
 ) -> dict[str, Any]:
     eq_options = eq_options or EqOptions(correction_range=context.band)
     grid_sum = context.sum_on_grid(first, second, polarity, delay_ms, gain_db)
@@ -1544,6 +1529,12 @@ def pair_diagnostics(
             10.0 * np.log10(max(np.mean(np.abs(post_grid) ** 2), EPS))
         ),
     }
+    if include_trends:
+        # Search needs the selected raw/post-EQ broad trends only long enough
+        # to apply one shared absolute F3/F6 reference across every pair.
+        # Keeping this opt-in avoids bloating ordinary diagnostic results.
+        result["trend_db"] = trend_db
+        result["post_eq_trend_db"] = post_trend_db
     if include_decay:
         pre_f, pre_t, pre_decay, _ = csd_style_decay(
             pre_ir, context.sample_rate, context.band, ppo=12

@@ -20,16 +20,16 @@ fi
 
 SEARCH_ARGS=(
   --cache "${SUBPAIR_CACHE_DIR}"
-  --band 25 150
+  --band 20 250
   --delay-range -10 10 0.1
   --gain-range -6 0 0.1
   --ppo 64
-  --eq-range 30 150
-  --eq-range-slope 24
+  --eq-range 30 120
+  --eq-range-slope 48
   --max-boost 6
   --max-cut 18
-  --eq-bands 10
-  --tie-tolerance-db 1.5
+  --eq-bands 16
+  --tie-tolerance-db 2
   --top 8
   --low-shelf on
 )
@@ -54,9 +54,9 @@ generate_report() {
     --limit 15
 }
 
-generate_report flat
+# generate_report flat
 generate_report dsp
 
 printf '\nReports generated:\n'
-printf '  %s\n' "${REPO_ROOT}/subpair-report-flat.html"
+# printf '  %s\n' "${REPO_ROOT}/subpair-report-flat.html"
 printf '  %s\n' "${REPO_ROOT}/subpair-report-dsp.html"

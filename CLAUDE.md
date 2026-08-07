@@ -116,26 +116,18 @@ the real logic. Data flows strictly one-way through `.subpair-cache/`:
      `post_eq_` counterparts, from `low_end_extension_hz()`) are
      diagnostic-only F3/F6-style extension estimates reported in
      `search`/`report` tables. They are deliberately **not** part of either
-     ranking tuple — see "Key invariants" below. `low_end_extension_hz()`
-     is deliberately self-referential: it scores a curve against its own
-     envelope peak only, never against a level or curve shared with other
-     pairs. Two cross-pair-referenced designs were tried and reverted:
-     comparing only against a single scalar (a pair's own peak, or the
-     loudest pair's peak) breaks down for a bandpass-shaped sum, since a
-     pair whose peak sits at a different frequency than the reference can
-     read as *less* extended while actually being louder at the low end;
-     comparing against an elementwise aggregate curve across the search
-     (tried both average and best/maximum) breaks down because every real
-     placement rolls off toward the bottom of the band to *some* degree, so
-     any such aggregate curve has its own baked-in rolloff too - for
-     whichever pair dominates the aggregate (typically the loudest
-     candidate), this hides essentially all of its own rolloff, regardless
-     of how much it actually declines in absolute terms. Confirmed on a real
-     search: the loudest pair visibly rolled off by a real, several-dB
-     amount well above the band edge on its own magnitude plot, yet reported
-     a trivial "fully extended" (25 Hz) answer under both the average- and
-     best-curve designs. Cross-pair absolute SPL is a different, legitimate
-     question already answered by `relative_spl_db`/`post_eq_relative_spl_db`.
+     ranking tuple — see "Key invariants" below. Search computes separate
+     raw and post-EQ shared scalar references: the strongest candidate's
+     mean broad-trend power over the analyzed range through 100 Hz, sampled
+     on the log grid (equal weight per octave). Because the cached solo
+     measurements share a drive level, this prevents a uniformly quieter
+     pair from looking more extended merely because its F3/F6 threshold was
+     normalized to its own lower peak. Do not replace the scalar with an
+     average or elementwise-best *curve* (which inherits the real subs'
+     frequency-dependent rolloff), or one modal maximum (which overstates
+     the nominal passband). The two-sided envelope still sees past isolated
+     recoverable notches; a pair that never reaches a shared threshold
+     reports `None`.
    - `low_shelf_response` implements the RBJ LS biquad.
      `EqOptions.low_shelf` enables one automatic LS candidate by default;
      `cli.py` exposes only `--low-shelf on|off`. `fit_eq_filters` chooses the

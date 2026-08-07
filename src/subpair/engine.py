@@ -19,6 +19,7 @@ from .dsp import (
     AnalysisContext,
     EqOptions,
     inclusive_range,
+    low_end_extension_hz,
     null_scores,
     pair_diagnostics,
 )
@@ -41,6 +42,7 @@ class SearchOptions:
 
 
 PLATEAU_TOLERANCE_DB = 0.5
+LOW_END_REFERENCE_UPPER_HZ = 100.0
 
 
 def _plateau_width(scores_1d: np.ndarray, values: np.ndarray, index: int) -> float:
@@ -130,6 +132,32 @@ def _banded_sort_key(rows: list[dict], primary: str, tolerance_db: float) -> lis
     ]
 
 
+def _shared_low_end_reference_db(
+    trend_curves: list[np.ndarray], frequencies: np.ndarray
+) -> tuple[float, tuple[float, float]]:
+    """Strongest candidate's mean broad-trend power through 100 Hz.
+
+    The shared F3/F6 anchor should describe nominal low-frequency output,
+    not one modal maximum. Averaging power on the log-frequency grid through
+    100 Hz gives each octave equal sampling weight and directly uses the
+    common-drive information in the cache. If a caller deliberately analyzes
+    a band wholly above 100 Hz, fall back to its whole band.
+    """
+    frequencies = np.asarray(frequencies, dtype=np.float64)
+    mask = frequencies <= LOW_END_REFERENCE_UPPER_HZ
+    if not np.any(mask):
+        mask = np.ones(frequencies.shape, dtype=bool)
+    levels = [
+        float(10.0 * np.log10(np.mean(10.0 ** (curve[mask] / 10.0))))
+        for curve in trend_curves
+    ]
+    used_frequencies = frequencies[mask]
+    return max(levels), (
+        float(used_frequencies[0]),
+        float(used_frequencies[-1]),
+    )
+
+
 def run_search(
     cache_dir: Path,
     output_path: Path,
@@ -157,6 +185,7 @@ def run_search(
     )
     combinations = list(itertools.combinations(range(len(measurements)), 2))
     pairs: list[dict] = []
+    extension_trends: list[tuple[np.ndarray, np.ndarray]] = []
     for ordinal, (first, second) in enumerate(combinations, start=1):
         configurations = _best_configurations(
             context, first, second, delays, gains
@@ -178,6 +207,7 @@ def run_search(
                 delay_ms,
                 gain_db,
                 include_decay=False,
+                include_trends=True,
                 eq_options=eq_options,
             )
             # null_score_db (GD-weighted severity, from pair_diagnostics) now
@@ -199,6 +229,10 @@ def run_search(
                 item[2],
             ),
         )
+        trend_db = np.asarray(diagnostics.pop("trend_db"), dtype=np.float64)
+        post_eq_trend_db = np.asarray(
+            diagnostics.pop("post_eq_trend_db"), dtype=np.float64
+        )
         pair = {
             "first": first + 1,
             "second": second + 1,
@@ -210,36 +244,55 @@ def run_search(
             **diagnostics,
         }
         pairs.append(pair)
+        extension_trends.append((trend_db, post_eq_trend_db))
         if progress:
             progress(ordinal, len(combinations), f"{first + 1}+{second + 1}")
 
-    # low_end_extension_f3_hz/f6_hz (+ post_eq_ variants) are diagnostic-only
-    # (never a ranking key - see the invariant in CLAUDE.md) and deliberately
-    # self-referential: pair_diagnostics already computed them above as each
-    # pair's own broad trend measured against its own envelope peak (see
-    # low_end_extension_hz's docstring), which is what's kept here. Two
-    # cross-pair-referenced designs were tried and reverted:
-    # - comparing each pair's departure against the *average* trend curve
-    #   across the search: most real placements roll off toward the bottom
-    #   of the band to some degree, so the average curve already has a
-    #   "typical" rolloff baked into its own shape, hiding that amount of
-    #   rolloff in any pair that isn't unusually bad.
-    # - comparing against the *best* (elementwise maximum) curve instead:
-    #   this still has its own baked-in rolloff, just a shallower one - the
-    #   best curve is built from real, physically band-limited data, so it
-    #   still declines toward the bottom of the band, and whichever pair
-    #   dominates that curve (typically the loudest candidate) trivially
-    #   reads as "fully extended" regardless of how much *it itself*
-    #   declines in absolute terms, since nothing can be "below the best" if
-    #   it effectively *is* the best. Confirmed on the cache: the loudest
-    #   pair visibly rolls off by a real, several-dB amount well above the
-    #   band edge on its own magnitude plot, yet reported a trivial "fully
-    #   extended" (25 Hz) answer under both designs.
-    # Self-referential shape (this pair's own decline from its own plateau)
-    # is what actually answers "where does this specific pair's response
-    # start rolling off," matching a classic F3 spec; absolute cross-pair
-    # SPL is a different, legitimate question already answered directly by
-    # relative_spl_db/post_eq_relative_spl_db.
+    # F3/F6 use one absolute broad-trend reference per ranking, not each
+    # pair's own peak. All solo captures share a drive level, so normalizing
+    # every sum independently can make a uniformly quieter pair appear more
+    # extended merely because its threshold is also lowered. The strongest
+    # candidate's mean broad-trend power through 100 Hz is a robust scalar
+    # nominal level: unlike a modal maximum it rewards output across the low
+    # end, and unlike an average/best *curve* it has no frequency-dependent
+    # rolloff baked into the reference. Raw and post-EQ curves get separate
+    # shared references. These fields remain diagnostic-only and never enter
+    # the recommendation sort keys below.
+    (
+        raw_extension_reference_db,
+        extension_reference_range_hz,
+    ) = _shared_low_end_reference_db(
+        [trend_db for trend_db, _ in extension_trends], context.frequencies
+    )
+    post_eq_extension_reference_db, _ = _shared_low_end_reference_db(
+        [post_eq_trend_db for _, post_eq_trend_db in extension_trends],
+        context.frequencies,
+    )
+    for row, (trend_db, post_eq_trend_db) in zip(pairs, extension_trends):
+        row["low_end_extension_f3_hz"] = low_end_extension_hz(
+            trend_db,
+            context.frequencies,
+            threshold_db=LOW_END_EXTENSION_F3_THRESHOLD_DB,
+            reference_level_db=raw_extension_reference_db,
+        )
+        row["low_end_extension_f6_hz"] = low_end_extension_hz(
+            trend_db,
+            context.frequencies,
+            threshold_db=LOW_END_EXTENSION_F6_THRESHOLD_DB,
+            reference_level_db=raw_extension_reference_db,
+        )
+        row["post_eq_low_end_extension_f3_hz"] = low_end_extension_hz(
+            post_eq_trend_db,
+            context.frequencies,
+            threshold_db=LOW_END_EXTENSION_F3_THRESHOLD_DB,
+            reference_level_db=post_eq_extension_reference_db,
+        )
+        row["post_eq_low_end_extension_f6_hz"] = low_end_extension_hz(
+            post_eq_trend_db,
+            context.frequencies,
+            threshold_db=LOW_END_EXTENSION_F6_THRESHOLD_DB,
+            reference_level_db=post_eq_extension_reference_db,
+        )
 
     raw_bands = _banded_sort_key(pairs, "null_score_db", options.tie_tolerance_db)
     raw_order = sorted(
@@ -281,7 +334,7 @@ def run_search(
         )
 
     result = {
-        "format_version": 16,
+        "format_version": 17,
         "measurement_count": len(measurements),
         "sample_rate": measurements[0].sample_rate,
         "response_length": measurements[0].impulse.size,
@@ -375,6 +428,16 @@ def run_search(
                 "excess_gd_range_hz": list(eq_range),
                 "magnitude_basis": "raw, unsmoothed",
                 "tie_tolerance_db": options.tie_tolerance_db,
+                "low_end_extension_reference_db": {
+                    "raw": raw_extension_reference_db,
+                    "post_eq": post_eq_extension_reference_db,
+                    "range_hz": list(extension_reference_range_hz),
+                    "basis": (
+                        "maximum mean broad-trend power through 100 Hz among "
+                        "all pairs in the corresponding raw or post-EQ set; "
+                        "log-grid sampling gives each octave equal weight"
+                    ),
+                },
                 "null_score_gd_weighting": (
                     "null_score_db/post_eq_null_score_db scale magnitude dips up, "
                     "and score magnitude peaks that only exist alongside it, "
@@ -413,45 +476,27 @@ def run_search(
                 "low_end_extension": (
                     "low_end_extension_f3_hz/f6_hz (and their post_eq_ "
                     "counterparts) are in-band F3/F6-style diagnostics: the "
-                    "lowest frequency each pair's own broad trend holds up "
-                    "before permanently falling "
+                    "lowest frequency each pair's broad-trend envelope reaches "
                     f"{LOW_END_EXTENSION_F3_THRESHOLD_DB:g} dB (F3) or "
                     f"{LOW_END_EXTENSION_F6_THRESHOLD_DB:g} dB (F6) below "
-                    "its own envelope peak and not recovering - i.e. where "
-                    "does this specific placement's own response start "
-                    "rolling off, relative to its own best-supported "
-                    "plateau, matching a classic F3 spec. This is "
-                    "deliberately self-referential (each pair scored only "
-                    "against its own peak, not a level or curve shared "
-                    "across pairs): two cross-pair-referenced designs were "
-                    "tried and reverted, because every real placement in a "
-                    "search rolls off toward the bottom of the band to "
-                    "*some* degree, so any reference built by aggregating "
-                    "across pairs (an average curve, or even the best/"
-                    "elementwise-maximum curve) inevitably has its own "
-                    "baked-in rolloff too - comparing a pair's departure "
-                    "against such a reference hides exactly the amount of "
-                    "rolloff the reference itself has, and for whichever "
-                    "pair dominates that reference (typically the loudest "
-                    "candidate) it hides essentially all of it, regardless "
-                    "of how much that pair actually declines in absolute "
-                    "terms. Absolute cross-pair SPL is a different, "
-                    "legitimate question already answered directly by "
-                    "relative_spl_db/post_eq_relative_spl_db; check those "
-                    "alongside F3/F6 if you want to know how loud two "
-                    "placements are relative to each other, not just how "
-                    "each one's own low end holds up. The scan starts at "
-                    "each pair's own envelope peak (wherever in the band it "
-                    "occurs, not necessarily the top edge - a two-subwoofer "
-                    "sum is routinely bandpass-shaped), so a pair whose "
-                    "passband merely peaks away from the top of the band "
-                    "isn't penalised for that alone. The envelope (not the "
-                    "raw trend) is used to find both the peak and the "
-                    "corner so an isolated, recoverable notch - already "
+                    "one shared absolute reference. The raw reference is "
+                    f"{raw_extension_reference_db:.6g} dB and the post-EQ "
+                    f"reference is {post_eq_extension_reference_db:.6g} dB; "
+                    "each is the strongest candidate's mean broad-trend "
+                    f"power across {extension_reference_range_hz[0]:.6g} to "
+                    f"{extension_reference_range_hz[1]:.6g} Hz. This avoids "
+                    "letting one modal peak set the threshold. A scalar reference has no "
+                    "frequency-dependent rolloff baked into it, while the "
+                    "common drive level makes absolute output meaningful: a "
+                    "pair that is quieter throughout the low end cannot look "
+                    "more extended just because it is normalized to its own "
+                    "lower peak. The envelope (not the raw trend) finds the "
+                    "low-side crossing so an isolated, recoverable notch - already "
                     "scored on its own terms by the null score - cannot by "
                     "itself read as a loss of extension; a genuine "
-                    "sustained rolloff is still found normally. Lower is "
-                    "more extended. This is "
+                    "sustained rolloff is still found normally. If a pair "
+                    "never reaches the shared threshold, the field is null. "
+                    "Lower is more extended. This is "
                     "diagnostic only - it is not a raw or EQ'd ranking key "
                     "- a placement's null/excess-GD/tail severity always "
                     "decides the winner regardless of how extended it is"

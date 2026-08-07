@@ -10,7 +10,7 @@ import numpy as np
 
 from subpair.cache import CacheError, write_cache
 from subpair.cli import _build_parser
-from subpair.engine import SearchOptions, run_search
+from subpair.engine import SearchOptions, _shared_low_end_reference_db, run_search
 from subpair.dsp import (
     EqOptions,
     LOW_END_EXTENSION_F3_THRESHOLD_DB,
@@ -32,6 +32,7 @@ from subpair.dsp import (
     peq_response,
 )
 from subpair.html_report import (
+    _magnitude_figure,
     _overview_excess_figure,
     _overview_figure,
     _peq_text,
@@ -105,6 +106,47 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(tuple(magnitude.layout.yaxis.range), (-3.0, 4.0))
         self.assertEqual(tuple(excess.layout.yaxis.range), (-20.0, 5.0))
         self.assertEqual(excess.layout.yaxis.minallowed, -20.0)
+
+    def test_eq_response_and_band_markers_share_the_magnitude_axis(self):
+        pair = {"first_name": "A", "second_name": "B"}
+        data = {
+            "frequencies": np.array([20.0, 40.0, 80.0]),
+            "solo_first_db": np.array([-8.0, -2.0, 1.0]),
+            "solo_second_db": np.array([-5.0, 0.0, 3.0]),
+            "sum_db": np.array([-4.0, 2.0, 5.0]),
+            "post_eq_db": np.array([-3.0, 1.0, 4.0]),
+            "post_eq_excess_curve_ms": np.array([-2.0, 0.0, 1.0]),
+            "eq_target_db": np.array([-3.0, 1.0, 4.0]),
+            "filters": [{"fc_hz": 40.0, "gain_db": -10.0, "q": 0.8}],
+            "eq_shelf": {
+                "active": True,
+                "freq_hz": 30.0,
+                "gain_db": 3.0,
+                "slope": 1.0,
+            },
+        }
+        rows = [({"first": 1, "second": 2}, data)]
+        magnitude_range, _ = _selected_axis_ranges(
+            rows, raw=False, selected_keys={"1-2"}
+        )
+        self.assertEqual(magnitude_range, (-10.0, 4.0))
+
+        figure = _magnitude_figure(pair, data, y_range=magnitude_range)
+        traces = {trace.name: trace for trace in figure.data}
+        response = traces["Combined EQ response (all bands)"]
+        markers = traces["EQ band settings"]
+        self.assertIsNone(response.yaxis)
+        self.assertIsNone(markers.yaxis)
+        self.assertNotIn("yaxis2", figure.layout.to_plotly_json())
+        self.assertEqual(tuple(figure.layout.yaxis.range), (-10.0, 4.0))
+        self.assertEqual(tuple(markers.x), (40.0, 30.0))
+        self.assertEqual(tuple(markers.y), (-10.0, 3.0))
+        self.assertEqual(
+            tuple(markers.customdata),
+            ("PK band · Q 0.800", "LS band · slope 1.00"),
+        )
+        self.assertEqual(markers.marker.size, 7)
+        self.assertEqual(response.legendgroup, markers.legendgroup)
 
     def test_report_result_limit_argument(self):
         parser = _build_parser()
@@ -259,6 +301,43 @@ class PipelineTests(unittest.TestCase):
         )
         expected = corner * 2.0 ** -0.5
         self.assertLess(abs(low_end_extension_hz(trend, frequencies) - expected) / expected, 0.05)
+
+    def test_shared_low_end_reference_rewards_absolute_output(self):
+        frequencies = log_frequency_grid(25.0, 150.0, 48)
+        corner = 60.0
+        loud = np.where(
+            frequencies >= corner,
+            0.0,
+            -6.0 * np.log2(corner / frequencies),
+        )
+        quiet = loud - 4.0
+
+        loud_f6 = low_end_extension_hz(
+            loud, frequencies, threshold_db=6.0, reference_level_db=0.0
+        )
+        quiet_f6 = low_end_extension_hz(
+            quiet, frequencies, threshold_db=6.0, reference_level_db=0.0
+        )
+        self.assertIsNotNone(loud_f6)
+        self.assertIsNotNone(quiet_f6)
+        self.assertLess(loud_f6, quiet_f6)
+        # The quieter response never gets within 3 dB of the shared level,
+        # so reporting a made-up F3 frequency would be misleading.
+        self.assertIsNone(
+            low_end_extension_hz(
+                quiet, frequencies, threshold_db=3.0, reference_level_db=0.0
+            )
+        )
+
+    def test_shared_low_end_reference_uses_mean_output_through_100_hz(self):
+        frequencies = np.array([20.0, 40.0, 80.0, 160.0])
+        extended = np.zeros_like(frequencies)
+        high_frequency_peak = np.array([-4.0, -4.0, -4.0, 30.0])
+        reference, reference_range = _shared_low_end_reference_db(
+            [extended, high_frequency_peak], frequencies
+        )
+        self.assertAlmostEqual(reference, 0.0)
+        self.assertEqual(reference_range, (20.0, 80.0))
 
     def test_low_end_extension_hz_ignores_an_isolated_recoverable_notch(self):
         # A notch is a placement defect the null score already measures on
@@ -1012,6 +1091,14 @@ class PipelineTests(unittest.TestCase):
             )
             self.assertEqual(loaded["settings"]["ranking"]["tie_tolerance_db"], 0.0)
             self.assertIn("low_end_extension", loaded["settings"]["ranking"])
+            extension_reference = loaded["settings"]["ranking"][
+                "low_end_extension_reference_db"
+            ]
+            self.assertIn("raw", extension_reference)
+            self.assertIn("post_eq", extension_reference)
+            self.assertIn("range_hz", extension_reference)
+            self.assertTrue(np.isfinite(extension_reference["raw"]))
+            self.assertTrue(np.isfinite(extension_reference["post_eq"]))
             self.assertIn("native_resolution", loaded["settings"])
             # low_end_extension_f3_hz/f6_hz are diagnostic-only: they must
             # not appear in either ranking's declared sort-key field list.
@@ -1149,8 +1236,22 @@ class PipelineTests(unittest.TestCase):
             self.assertIn('"shape":"spline"', page)
             self.assertIn("EQ authority", page)
             self.assertIn("background:hsla(", page)
+            visible_eq_pairs = sorted(
+                result["pairs"], key=lambda row: row["eq_rank"]
+            )[:3]
+            expected_colored_metrics = 4 * len(visible_eq_pairs) + sum(
+                row[key] is not None
+                for row in visible_eq_pairs
+                for key in (
+                    "post_eq_low_end_extension_f3_hz",
+                    "post_eq_low_end_extension_f6_hz",
+                )
+            )
             self.assertTrue(
-                all(table.count("background:hsla(") == 18 for table in ranking_tables(page))
+                all(
+                    table.count("background:hsla(") == expected_colored_metrics
+                    for table in ranking_tables(page)
+                )
             )
             self.assertNotIn(".plotly-graph-div { width:100% !important; }", page)
             self.assertIn(".overview-panels,#pair-details { position:relative; }", page)
@@ -1161,7 +1262,7 @@ class PipelineTests(unittest.TestCase):
             self.assertNotIn("function revealPlots", page)
             self.assertNotIn("window.dispatchEvent(new Event('resize'))", page)
             self.assertIn("Extension", page)
-            self.assertIn("not part of the ranking", page)
+            self.assertIn("not part of the recommendation ranking", page)
             self.assertIn("Fitted EQ filters", page)
             self.assertIn("Post-EQ excess GD", page)
             self.assertNotIn("Pre-EQ excess GD", page)

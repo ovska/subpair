@@ -20,6 +20,9 @@ from .dsp import AnalysisContext, EqOptions, pair_diagnostics
 # numbers - explicit templates rather than Plotly's own default formatting,
 # which varies by trace and is often needlessly precise.
 _HOVER_HZ_DB = "%{x:.0f} Hz<br>%{y:.1f} dB<extra></extra>"
+_HOVER_EQ_BAND = (
+    "%{customdata}<br>Fc %{x:.1f} Hz<br>Gain %{y:+.1f} dB<extra></extra>"
+)
 _HOVER_HZ_MS = "%{x:.0f} Hz<br>%{y:.1f} ms<extra></extra>"
 _HOVER_HZ_PERCENT = "%{x:.0f} Hz<br>%{y:.0f}%<extra></extra>"
 _HOVER_MS_HZ_DB = "%{x:.1f} ms<br>%{y:.0f} Hz<br>%{z:.1f} dB<extra></extra>"
@@ -29,6 +32,26 @@ _EXCESS_GD_LOWER_LIMIT_MS = -20.0
 
 class ReportError(RuntimeError):
     pass
+
+
+def _eq_band_points(
+    data: dict[str, Any],
+) -> tuple[list[float], list[float], list[str]]:
+    """Return configured frequency/gain coordinates for fitted EQ bands."""
+
+    frequencies: list[float] = []
+    gains: list[float] = []
+    labels: list[str] = []
+    for item in data.get("filters", []):
+        frequencies.append(float(item["fc_hz"]))
+        gains.append(float(item["gain_db"]))
+        labels.append(f"PK band · Q {float(item['q']):.3f}")
+    shelf = data.get("eq_shelf")
+    if shelf and shelf.get("active"):
+        frequencies.append(float(shelf["freq_hz"]))
+        gains.append(float(shelf["gain_db"]))
+        labels.append(f"LS band · slope {float(shelf['slope']):.2f}")
+    return frequencies, gains, labels
 
 
 def _finite_axis_range(
@@ -59,15 +82,20 @@ def _finite_axis_range(
 def _diagnostic_axis_ranges(
     data: dict[str, Any], *, raw: bool
 ) -> tuple[tuple[float, float] | None, tuple[float, float] | None]:
-    """Bounds for the primary traces shown by default in one pair diagnostic."""
+    """Bounds for all traces that share an axis in one pair diagnostic."""
 
-    magnitude = _finite_axis_range(
-        [
-            data["solo_first_db"],
-            data["solo_second_db"],
-            data["sum_db" if raw else "post_eq_db"],
-        ]
-    )
+    magnitude_series = [
+        data["solo_first_db"],
+        data["solo_second_db"],
+        data["sum_db" if raw else "post_eq_db"],
+    ]
+    if not raw:
+        magnitude_series.append(
+            np.asarray(data["post_eq_db"]) - np.asarray(data["sum_db"])
+        )
+        _, band_gains, _ = _eq_band_points(data)
+        magnitude_series.append(band_gains)
+    magnitude = _finite_axis_range(magnitude_series, include_zero=not raw)
     excess = _finite_axis_range(
         [data["excess_curve_ms" if raw else "post_eq_excess_curve_ms"]],
         lower_limit=_EXCESS_GD_LOWER_LIMIT_MS,
@@ -196,10 +224,30 @@ def _magnitude_figure(
                 name="Combined EQ response (all bands)",
                 line={"color": "#c4b5fd", "width": 1.7},
                 visible="legendonly",
-                yaxis="y2",
+                legendgroup="eq-bands",
                 hovertemplate=_HOVER_HZ_DB,
             )
         )
+        band_frequencies, band_gains, band_labels = _eq_band_points(data)
+        if band_frequencies:
+            figure.add_trace(
+                go.Scatter(
+                    x=band_frequencies,
+                    y=band_gains,
+                    customdata=band_labels,
+                    name="EQ band settings",
+                    mode="markers",
+                    marker={
+                        "color": "#ddd6fe",
+                        "line": {"color": "#6d28d9", "width": 1},
+                        "size": 7,
+                    },
+                    visible="legendonly",
+                    legendgroup="eq-bands",
+                    showlegend=False,
+                    hovertemplate=_HOVER_EQ_BAND,
+                )
+            )
     yaxis: dict[str, Any] = {"title": "Level (dB; cache reference)"}
     if y_range is not None:
         yaxis["range"] = y_range
@@ -210,18 +258,14 @@ def _magnitude_figure(
         "xaxis": {"type": "log", "title": "Frequency (Hz)"},
         "yaxis": yaxis,
         "margin": {"l": 62, "r": 70, "t": 52, "b": 55},
-        "legend": {"orientation": "h", "y": -0.22},
+        "legend": {
+            "orientation": "h",
+            "y": -0.22,
+            "groupclick": "togglegroup",
+        },
         "template": "plotly_dark",
         "height": 510,
     }
-    if not raw:
-        layout["yaxis2"] = {
-            "title": "Combined EQ gain (dB)",
-            "overlaying": "y",
-            "side": "right",
-            "showgrid": False,
-            "visible": False,
-        }
     figure.update_layout(**layout)
     return figure
 
@@ -505,12 +549,10 @@ def _ranking_table(
         f6_key: "low",
         spl_key: "high",
     }
-    # F3/F6 (and any other future metric) may be None - handled generically
-    # here even though low_end_extension_hz's current self-referential
-    # design always finds a crossing in practice (its own peak trivially
-    # satisfies the threshold). Excluded from the colour-scaled range
-    # entirely rather than coerced to a number, so a single None can't skew
-    # what counts as "best"/"worst" for the pairs that did get a real value.
+    # F3/F6 (and any other future metric) may be None when a pair never
+    # reaches the shared absolute threshold. Exclude missing values from the
+    # colour-scaled range entirely rather than coercing them to a number, so
+    # one None cannot skew "best"/"worst" for real crossings.
     metric_ranges: dict[str, tuple[float, float]] = {}
     for key in metric_directions:
         numeric = [float(pair[key]) for pair in pairs if pair[key] is not None]
@@ -640,8 +682,8 @@ def build_report(
         )
     if int(results.get("format_version", 0)) < 14:
         raise ReportError(
-            "Search results predate the self-referential F3/F6 "
-            "low-end extension calculation; run 'subpair search' again"
+            "Search results predate the current F3/F6 low-end extension "
+            "fields; run 'subpair search' again"
         )
     if int(results.get("format_version", 0)) < 15:
         raise ReportError(
@@ -651,6 +693,11 @@ def build_report(
     if int(results.get("format_version", 0)) < 16:
         raise ReportError(
             "Search results predate automatic low-shelf EQ fitting; "
+            "run 'subpair search' again"
+        )
+    if int(results.get("format_version", 0)) < 17:
+        raise ReportError(
+            "Search results predate shared-reference F3/F6 extension; "
             "run 'subpair search' again"
         )
     if any(
@@ -771,17 +818,6 @@ def build_report(
     default_json = json.dumps(
         [pair_key(pair) for pair in pairs[:default_count]], separators=(",", ":")
     )
-    legend_handler = "" if raw else """
-document.querySelectorAll('.pair-detail .plotly-graph-div[id^="magnitude-"]').forEach(plot=>{
-  plot.on('plotly_legendclick',event=>{
-    const trace=plot.data[event.curveNumber];
-    if(trace && trace.name==='Combined EQ response (all bands)') {
-      const willShow=trace.visible==='legendonly';
-      Plotly.relayout(plot,{'yaxis2.visible':willShow});
-    }
-  });
-});
-""".strip()
     copy_peq_script = "" if raw else """
 function copyPeq(button) {
   navigator.clipboard.writeText(button.parentElement.querySelector('pre').innerText);
@@ -854,7 +890,7 @@ details {{ margin:22px 0; }} details pre {{ overflow:auto; color:var(--muted); }
 <p class="note">{('Raw ranking: raw-magnitude null depth, raw excess group delay, then raw tail.' if raw else 'EQ’d ranking: post-EQ raw-magnitude null depth, post-EQ excess group delay, then post-EQ tail.')}</p>
 <div class="table-wrap">{_ranking_table(pairs, mode, f'ranking-{mode}', default_keys)}</div>
 <div class="pair-tabs" data-pair-tabs role="tablist" aria-label="Selected {mode_label} pairs"></div>
-<p class="note">Click a table heading to sort. Metric cells run from green (best) to red (worst); lower is better except relative SPL, where higher is better. Relative SPL references this ranking’s rank 1. F3/F6 are informational -3/-6 dB extension estimates: the lowest frequency each pair’s own response holds up before permanently falling that far below its own best-supported plateau (lower is more extended). They are self-referential (not compared against other pairs — check Relative SPL for that) and are not part of the ranking.</p>
+<p class="note">Click a table heading to sort. Metric cells run from green (best) to red (worst); lower is better except relative SPL, where higher is better. Relative SPL references this ranking’s rank 1. F3/F6 are informational shared-reference -3/-6 dB extension estimates: the lowest frequency each pair’s broad response reaches that ranking’s common absolute threshold (lower is more extended; blank means it never reaches the threshold). They compare usable output across the same-level measurements but are not part of the recommendation ranking.</p>
 <div id="pair-details">{''.join(detail_sections)}</div>
 <details><summary>Analysis settings and minimum-phase convention</summary><pre>{settings_json}</pre></details>
 </main>
@@ -876,7 +912,6 @@ document.querySelectorAll('.ranking-table th[data-type]').forEach(th=>{{
     rows.forEach(row=>body.appendChild(row));
   }});
 }});
-{legend_handler}
 const reportMode={json.dumps(mode)};
 const excessGdLowerLimitMs={_EXCESS_GD_LOWER_LIMIT_MS:g};
 const selectedPairs=new Set({default_json});
