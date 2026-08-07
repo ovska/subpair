@@ -159,7 +159,21 @@ an explicit, opt-in *acoustic* assumption about what a benign low end looks
 like, not a measurement-reliability correction like the native-resolution
 smoothing below — it changes rankings, so validate it against real
 measurements before trusting it over the default. When active, the report's
-per-pair excess-GD plot overlays the fitted baseline curve.
+per-pair excess-GD plot overlays the fitted baseline curve, shifted to read
+0 dB at the top of the evaluated band — the fitted baseline still carries
+the arbitrary common-alignment offset (typically hundreds to thousands of
+ms) that the plotted excess-GD curve has already had removed, so plotting
+it at that absolute scale on the same axis would make the excess-GD curve
+unreadable; only the *display* is shifted, not the scored data. The fit
+itself also gets a small, targeted denoise before the isotonic regression
+runs: `np.gradient`'s boundary formula at the very first evaluated
+frequency is measurably less reliable than the centered difference used
+everywhere else, and a non-increasing fit has no mechanism to smooth away
+an edge sample that happens to be the largest value remaining in the array
+— it gets adopted into the baseline completely unfiltered otherwise. A
+small median pre-filter (robust to a single outlier, unlike a moving
+average) removes that specific artifact without smoothing away a genuine,
+broader low-frequency rise.
 
 There is no weighted blend. Each later metric only breaks an exact tie in the
 earlier metrics. `--tie-tolerance-db` (0–3 dB, default 0) widens "tie" to any
@@ -190,43 +204,55 @@ drift, temperature, or DSP quantization.
 Each pair also reports `low_end_extension_hz`/`post_eq_low_end_extension_hz`:
 an in-band, F3-style diagnostic giving the lowest frequency the broad
 trend's *envelope* holds up, scanning down from the envelope's own **peak**
-— wherever in the band it occurs — before permanently falling 3 dB below
-that peak and not recovering. The peak is not assumed to sit at the top of
-the band: a two-subwoofer sum is routinely bandpass-shaped (it rises out of
-the bottom of the band, peaks somewhere in the middle, and rolls off again
-toward crossover), and an earlier version of this metric anchored to the
-top-of-band sample specifically, which is fragile exactly in that ordinary
-case — a curve already declining well before the top edge could sit more
-than 3 dB below its own peak there, misreporting a fine low end as
-completely collapsed. Anchoring to the envelope's own peak instead is
-unaffected by whatever happens *above* the peak (a separate, high-end/
-crossover concern), and is identical to the old top-anchored behaviour for
-an ordinary monotonically-rising passband. The envelope — the higher of the
-best level attained scanning up from the bottom of the band and the best
-level still attainable scanning down from the top — is used to find both
-the peak and the corner, deliberately not the raw trend: an isolated,
-recoverable notch is a placement defect the null score already measures on
-its own terms, so a response that is flat down to 25 Hz with one unrelated
--5 dB notch at 100 Hz still reports ~25 Hz extension, not ~100 Hz. A
-genuine, sustained rolloff is not masked this way — below the corner, the
-envelope still tracks the decline — so it is still reported close to where
-the raw trend actually crosses the threshold. Lower is more extended. This
-is purely informational — it is shown in `subpair report`'s tables and
-printed by `subpair search`, but it is not a raw or EQ'd ranking key, so it
-never changes which placement wins; a placement's own null/excess-GD/tail
-severity always decides.
+— wherever in the band it occurs — before permanently falling 3 dB below a
+**reference level** and not recovering. The scan always starts at the
+envelope's own peak, never the top-of-band sample specifically: a
+two-subwoofer sum is routinely bandpass-shaped (it rises out of the bottom
+of the band, peaks somewhere in the middle, and rolls off again toward
+crossover), and starting at the top edge is fragile in that ordinary case —
+a curve already declining well before the top edge could sit more than 3 dB
+below its own peak there, making the whole scan fail immediately regardless
+of how good the actual low end is. Starting at the envelope's own peak
+instead is unaffected by whatever happens *above* the peak (a separate,
+high-end/crossover concern), and is identical to the old top-anchored
+behaviour for an ordinary monotonically-rising passband. The envelope — the
+higher of the best level attained scanning up from the bottom of the band
+and the best level still attainable scanning down from the top — is used
+to find both the peak and the corner, deliberately not the raw trend: an
+isolated, recoverable notch is a placement defect the null score already
+measures on its own terms, so a response that is flat down to 25 Hz with
+one unrelated -5 dB notch at 100 Hz still reports ~25 Hz extension, not
+~100 Hz. A genuine, sustained rolloff is not masked this way — below the
+corner, the envelope still tracks the decline — so it is still reported
+close to where the raw trend actually crosses the threshold. Lower is more
+extended. This is purely informational — it is shown in `subpair report`'s
+tables and printed by `subpair search`, but it is not a raw or EQ'd ranking
+key, so it never changes which placement wins; a placement's own
+null/excess-GD/tail severity always decides.
 
-This metric is deliberately self-referential — each pair is scored against
-its *own* peak, not a level shared across pairs. A shared cross-pair
-reference was tried and reverted: it made any pair whose own peak fell more
-than 3 dB below that shared level collapse to the same "no extension"
-answer everywhere, regardless of how good its actual low-end shape was,
-which is not useful and actively misleading for a bandpass-shaped sum.
-Cross-pair absolute output is a genuinely different question, already
-answered directly by the `relative_spl_db`/`post_eq_relative_spl_db`
-columns in `subpair report`; check those alongside Extension if you want to
-know how loud two placements are relative to each other, not just how each
-one's own low end holds up.
+The **reference level** the 3 dB drop is measured from is the *average*
+envelope peak found across every pair in the same search (raw and EQ'd use
+their own separate average, computed once per search) — not each pair's own
+peak. This makes extension genuinely cross-pair comparable: since we're
+comparing placements against the same speakers in the same room, the only
+thing that actually differs low-end capability between two candidates with
+similar rolloff shape is absolute SPL, so falling behind the group's
+typical output by more than 3 dB now costs extension even where a pair's
+own rolloff shape is perfectly fine. A pair whose own peak never gets
+within 3 dB of the average — a placement that is simply, categorically
+quieter than what a good candidate in this search can deliver — reports the
+band's own top edge (no meaningful extension by this comparison) rather
+than a shape-only number that would understate how much output it's
+actually giving up. Two earlier designs were tried and rejected: purely
+self-referential (each pair scored only against its own peak) makes
+extension numbers look nearly identical for two pairs with a genuine
+several-dB SPL difference and identical rolloff shape, which is exactly the
+comparison this metric exists to support; and anchoring to the single
+*loudest* pair's peak (rather than the average) made almost every other
+placement read as "too far below reference" purely because one placement
+happened to be exceptional. The scan position itself is unaffected by which
+reference is used — it always starts at each pair's own peak, for the same
+bandpass-shape reason described above.
 
 For minimum phase, subpair uses the real-cepstrum form of the Hilbert
 transform on the *full available 0-to-Nyquist magnitude*, not a brick-wall

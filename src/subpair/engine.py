@@ -18,9 +18,14 @@ from .dsp import (
     MIN_RELIABLE_NATIVE_BINS,
     AnalysisContext,
     EqOptions,
+    broad_trend_db,
+    db20,
+    filters_response,
     inclusive_range,
+    low_end_extension_hz,
     null_scores,
     pair_diagnostics,
+    trend_envelope_peak_db,
 )
 
 
@@ -215,6 +220,52 @@ def run_search(
         if progress:
             progress(ordinal, len(combinations), f"{first + 1}+{second + 1}")
 
+    # low_end_extension_hz/post_eq_low_end_extension_hz are diagnostic-only
+    # (never a ranking key - see the invariant in CLAUDE.md), but scored
+    # purely against each pair's own peak they only describe that pair's
+    # own rolloff shape, not how loud it is compared to the rest of this
+    # search - two placements with a real, several-dB difference in output
+    # could report almost the same extension in Hz. Recomputing here
+    # against the *average* peak level found across every pair in this same
+    # search (raw and EQ'd use their own separate average) makes a
+    # placement's absolute output part of what "extension" means: falling
+    # behind that average by more than the threshold now costs extension
+    # even where the shape itself is fine. The average (not the loudest
+    # pair) is used deliberately - anchoring to a single loudest pair made
+    # almost every other placement's own peak read as "too far below
+    # reference" purely because one placement happened to be exceptional.
+    # low_end_extension_hz still starts its scan at each pair's own peak
+    # (not a fixed frequency), so a pair whose passband merely peaks away
+    # from the top of the band is not penalised for that alone. This
+    # reuses each pair's already-fitted filters (no refitting) and only
+    # recomputes the cheap trend curve, not the full per-pair diagnostics.
+    trend_curves = []
+    for row in pairs:
+        trend_wide_sum = context.sum_on_trend_grid(
+            row["first"] - 1, row["second"] - 1, row["polarity"], row["delay_ms"], row["gain_db"]
+        )
+        trend_db = broad_trend_db(db20(trend_wide_sum), context.ppo)[context.trend_slice]
+        eq_trend_wide = filters_response(
+            context.trend_frequencies, context.sample_rate, row["filters"]
+        )
+        post_trend_db = broad_trend_db(
+            db20(trend_wide_sum * eq_trend_wide), context.ppo
+        )[context.trend_slice]
+        trend_curves.append((trend_db, post_trend_db))
+    reference_db = float(
+        np.mean([trend_envelope_peak_db(trend_db) for trend_db, _ in trend_curves])
+    )
+    post_reference_db = float(
+        np.mean([trend_envelope_peak_db(post_trend_db) for _, post_trend_db in trend_curves])
+    )
+    for row, (trend_db, post_trend_db) in zip(pairs, trend_curves):
+        row["low_end_extension_hz"] = low_end_extension_hz(
+            trend_db, context.frequencies, reference_db=reference_db
+        )
+        row["post_eq_low_end_extension_hz"] = low_end_extension_hz(
+            post_trend_db, context.frequencies, reference_db=post_reference_db
+        )
+
     raw_bands = _banded_sort_key(pairs, "null_score_db", options.tie_tolerance_db)
     raw_order = sorted(
         range(len(pairs)),
@@ -255,7 +306,7 @@ def run_search(
         )
 
     result = {
-        "format_version": 9,
+        "format_version": 10,
         "measurement_count": len(measurements),
         "sample_rate": measurements[0].sample_rate,
         "response_length": measurements[0].impulse.size,
@@ -405,23 +456,30 @@ def run_search(
                     "band it occurs, not necessarily the top edge - a "
                     "two-subwoofer sum is routinely bandpass-shaped), "
                     f"before permanently falling {LOW_END_EXTENSION_THRESHOLD_DB:g} "
-                    "dB below that peak. This is self-referential by design "
-                    "- each pair is scored against its own peak, not a "
-                    "reference shared across pairs, since anchoring to a "
-                    "shared level made any pair whose own peak fell more "
-                    "than the threshold below it collapse to a 'no "
-                    "extension' answer regardless of its actual low-end "
-                    "shape; relative_spl_db/post_eq_relative_spl_db are the "
-                    "cross-pair-comparable absolute-level metrics. The "
-                    "envelope (not the raw trend) is used to find both the "
-                    "peak and the corner so an isolated, recoverable notch "
-                    "- already scored on its own terms by the null score - "
-                    "cannot by itself read as a loss of extension; a "
-                    "genuine sustained rolloff is still found normally. "
-                    "Lower is more extended. This is diagnostic only - it "
-                    "is not a raw or EQ'd ranking key - a placement's "
-                    "null/excess-GD/tail severity always decides the "
-                    "winner regardless of how extended it is"
+                    "dB below the *average* peak level found across every "
+                    "pair in this same search (raw and EQ'd use their own "
+                    "separate average). Falling behind that average by more "
+                    "than the threshold costs extension even where the "
+                    "shape itself is fine, so this is a genuinely cross-"
+                    "pair-comparable answer to 'does this placement's low "
+                    "end extend deeper than that one' - not just a "
+                    "self-referential shape estimate. The scan still starts "
+                    "at each pair's own peak (not a fixed frequency or the "
+                    "single loudest pair's peak), so a pair whose passband "
+                    "merely peaks away from the top of the band isn't "
+                    "penalised for that alone, and a pair whose own peak "
+                    "never gets within the threshold of the average reports "
+                    "the band's own top edge (no meaningful extension by "
+                    "this comparison) rather than a misleading in-band "
+                    "number. The envelope (not the raw trend) is used to "
+                    "find both the peak and the corner so an isolated, "
+                    "recoverable notch - already scored on its own terms by "
+                    "the null score - cannot by itself read as a loss of "
+                    "extension; a genuine sustained rolloff is still found "
+                    "normally. Lower is more extended. This is diagnostic "
+                    "only - it is not a raw or EQ'd ranking key - a "
+                    "placement's null/excess-GD/tail severity always "
+                    "decides the winner regardless of how extended it is"
                 ),
             },
         },
