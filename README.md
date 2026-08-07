@@ -189,32 +189,44 @@ drift, temperature, or DSP quantization.
 
 Each pair also reports `low_end_extension_hz`/`post_eq_low_end_extension_hz`:
 an in-band, F3-style diagnostic giving the lowest frequency the broad
-trend's *envelope* reaches, scanning down from a shared reference level,
-before permanently falling 3 dB below that reference and not recovering.
-The reference is the loudest top-of-band trend level found among *every*
-pair in the same search (raw and EQ'd tables use their own separate
-reference) — not each pair's own top-of-band level — so a pair whose whole
-passband sits below that reference starts losing ground before its own
-rolloff even begins: two placements with similarly-shaped rolloffs but a
-real difference in absolute output no longer report nearly identical
-extension. The envelope — the higher of the best level attained scanning up
-from the bottom of the band and the best level still attainable scanning
-down from the top — is still used to find the corner, deliberately not the
-raw trend: an isolated, recoverable notch is a placement defect the null
-score already measures on its own terms, so a response that is flat down to
-25 Hz with one unrelated -5 dB notch at 100 Hz still reports ~25 Hz
-extension, not ~100 Hz. A genuine, sustained rolloff is not masked this way
-— below the corner, the envelope still tracks the decline — so it is still
-reported close to where the raw trend actually crosses the threshold. Lower
-is more extended. This is purely informational — it is shown in `subpair
-report`'s tables and printed by `subpair search`, but it is not a raw or
-EQ'd ranking key, so it never changes which placement wins; a placement's
-own null/excess-GD/tail severity always decides. Because the reference is
-shared across the whole search, it also means a quieter pair's reported
-extension can visibly worsen even though its own rolloff *shape* did not
-change — that is by design, not a regression, and the accompanying
-`relative_spl_db`/`post_eq_relative_spl_db` column in `subpair report`
-explains why.
+trend's *envelope* holds up, scanning down from the envelope's own **peak**
+— wherever in the band it occurs — before permanently falling 3 dB below
+that peak and not recovering. The peak is not assumed to sit at the top of
+the band: a two-subwoofer sum is routinely bandpass-shaped (it rises out of
+the bottom of the band, peaks somewhere in the middle, and rolls off again
+toward crossover), and an earlier version of this metric anchored to the
+top-of-band sample specifically, which is fragile exactly in that ordinary
+case — a curve already declining well before the top edge could sit more
+than 3 dB below its own peak there, misreporting a fine low end as
+completely collapsed. Anchoring to the envelope's own peak instead is
+unaffected by whatever happens *above* the peak (a separate, high-end/
+crossover concern), and is identical to the old top-anchored behaviour for
+an ordinary monotonically-rising passband. The envelope — the higher of the
+best level attained scanning up from the bottom of the band and the best
+level still attainable scanning down from the top — is used to find both
+the peak and the corner, deliberately not the raw trend: an isolated,
+recoverable notch is a placement defect the null score already measures on
+its own terms, so a response that is flat down to 25 Hz with one unrelated
+-5 dB notch at 100 Hz still reports ~25 Hz extension, not ~100 Hz. A
+genuine, sustained rolloff is not masked this way — below the corner, the
+envelope still tracks the decline — so it is still reported close to where
+the raw trend actually crosses the threshold. Lower is more extended. This
+is purely informational — it is shown in `subpair report`'s tables and
+printed by `subpair search`, but it is not a raw or EQ'd ranking key, so it
+never changes which placement wins; a placement's own null/excess-GD/tail
+severity always decides.
+
+This metric is deliberately self-referential — each pair is scored against
+its *own* peak, not a level shared across pairs. A shared cross-pair
+reference was tried and reverted: it made any pair whose own peak fell more
+than 3 dB below that shared level collapse to the same "no extension"
+answer everywhere, regardless of how good its actual low-end shape was,
+which is not useful and actively misleading for a bandpass-shaped sum.
+Cross-pair absolute output is a genuinely different question, already
+answered directly by the `relative_spl_db`/`post_eq_relative_spl_db`
+columns in `subpair report`; check those alongside Extension if you want to
+know how loud two placements are relative to each other, not just how each
+one's own low end holds up.
 
 For minimum phase, subpair uses the real-cepstrum form of the Hilbert
 transform on the *full available 0-to-Nyquist magnitude*, not a brick-wall

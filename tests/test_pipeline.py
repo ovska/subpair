@@ -13,6 +13,7 @@ from subpair.cli import _build_parser
 from subpair.engine import SearchOptions, run_search
 from subpair.dsp import (
     EqOptions,
+    LOW_END_EXTENSION_THRESHOLD_DB,
     ShelfOptions,
     _denoised_residual,
     _excess_gd_authority,
@@ -177,6 +178,32 @@ class PipelineTests(unittest.TestCase):
         trend = np.where(frequencies < 140.0, -10.0, 0.0)
         extension = low_end_extension_hz(trend, frequencies)
         self.assertLess(abs(extension - 140.0) / 140.0, 0.05)
+
+    def test_low_end_extension_hz_anchors_to_a_mid_band_peak_not_the_top_edge(self):
+        # A two-subwoofer sum is routinely bandpass-shaped: it peaks well
+        # below the top of the band and rolls off on both sides. Anchoring
+        # to the top-of-band sample specifically (an earlier version of this
+        # metric) would already be more than the 3 dB threshold below the
+        # real peak here, collapsing the whole scan to "no extension"
+        # (150.0) despite a perfectly good, well-extended low end. Anchoring
+        # to the envelope's own peak must find the real corner instead.
+        frequencies = log_frequency_grid(25.0, 150.0, 48)
+        peak = 60.0
+        # Rises 6 dB/octave below the peak, falls 3 dB/octave above it (a
+        # gentler upper slope, like a natural crossover rolloff) - the top
+        # edge (150 Hz) ends up ~4.4 dB below the peak, comfortably past the
+        # default 3 dB threshold.
+        trend = np.where(
+            frequencies <= peak,
+            -6.0 * np.log2(peak / frequencies),
+            -3.0 * np.log2(frequencies / peak),
+        )
+        top_edge_db = float(trend[-1])
+        peak_db = float(np.max(trend))
+        self.assertLess(top_edge_db, peak_db - LOW_END_EXTENSION_THRESHOLD_DB)
+        expected = peak * 2.0 ** -0.5
+        extension = low_end_extension_hz(trend, frequencies)
+        self.assertLess(abs(extension - expected) / expected, 0.05)
 
     def test_two_sided_envelope_db_fills_in_a_narrow_dip_but_not_a_sustained_decline(self):
         frequencies = log_frequency_grid(25.0, 150.0, 48)

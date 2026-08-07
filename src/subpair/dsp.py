@@ -192,9 +192,8 @@ def low_end_extension_hz(
     trend_db: np.ndarray,
     frequencies: np.ndarray,
     threshold_db: float = LOW_END_EXTENSION_THRESHOLD_DB,
-    reference_db: float | None = None,
 ) -> float:
-    """Lowest frequency the broad trend's envelope reaches before it permanently rolls off.
+    """Lowest frequency the broad trend holds up before permanently rolling off below its own peak.
 
     An in-band, F3-style extension estimate, deliberately measuring the
     *envelope* (``_two_sided_envelope_db``) rather than the raw trend: a
@@ -210,47 +209,67 @@ def low_end_extension_hz(
     to see past), so the envelope decline still lands close to where the
     raw trend actually crosses the threshold.
 
-    ``reference_db``, when given, is the level the ``threshold_db`` drop is
-    measured from. Leaving it ``None`` reproduces the original behaviour:
-    the envelope's own value at the very top of the band (closest to a
-    subwoofer's typical crossover, normally the best-supported and flattest
-    part of the passband) - which, by construction, always equals the raw
-    trend there, since the top index's own one-sided cummax can never
-    exceed its own value. That default makes the metric purely *shape*-based
-    and self-referential: two placements whose passbands sit several dB
-    apart in absolute level can report almost the same extension in Hz if
-    their rolloff *shapes* are similar, because each is scored only against
-    its own top-of-band level. Callers that want a placement's extension to
-    reflect how it compares to *other* placements' absolute output - not
-    just its own shape - should pass a shared ``reference_db`` (e.g. the
-    loudest candidate's own top-of-band level across a whole search); a
-    pair whose passband sits below that shared reference then starts losing
-    ground before its own rolloff even begins, exactly as a quieter but
-    otherwise identically-shaped placement should.
+    The reference level is the envelope's own *peak* value, wherever in the
+    band it occurs - not the value at the top of the band. A two-subwoofer
+    sum is routinely bandpass-shaped (it rises out of the bottom of the
+    band, peaks somewhere in the middle, and rolls off again toward
+    crossover) rather than staying flat all the way to the top edge; anchoring
+    to the top-of-band sample specifically is fragile in that case; if the
+    curve is already declining well before the top edge - true for a
+    completely ordinary, well-behaved response, not a defect - that edge
+    sample can sit more than ``threshold_db`` below the response's own peak,
+    which would make the *entire* scan fail immediately and misreport a
+    permanently-collapsed low end regardless of how well-extended the actual
+    low end is. Anchoring to the envelope's own peak (its highest sustained
+    plateau, found via ``np.argmax`` - which lands on the *lowest* frequency
+    of that plateau when the peak is a broad flat region, not a single
+    sample) is unaffected by whatever happens to the response *above* the
+    peak, which is a high-end/crossover concern this metric is not about.
+    When the peak is already at the top of the band (a monotonically-rising
+    passband, e.g. a simple single-corner rolloff), this is identical to
+    scanning down from the top edge, so ordinary single-corner responses are
+    scored exactly as before.
 
-    Scanning downward from the top of the band, this returns the highest
-    frequency at which the *running minimum* of the envelope first falls
-    ``threshold_db`` below the reference and does not recover. This is
-    purely diagnostic - it is not part of the raw or EQ'd ranking key - so a
-    placement's own null/excess-GD/tail severity always decides the winner;
-    it only summarizes how far down the winning (or any) placement's
-    underlying passband shape reaches.
+    Scanning downward from the peak, this returns the highest frequency at
+    which the *running minimum* of the envelope first falls ``threshold_db``
+    below the peak and does not recover. This is purely diagnostic - it is
+    not part of the raw or EQ'd ranking key - so a placement's own
+    null/excess-GD/tail severity always decides the winner; it only
+    summarizes how far down the winning (or any) placement's underlying
+    passband shape reaches.
+
+    This metric is deliberately self-referential (relative to each
+    placement's own peak, not compared against other placements) - it
+    answers "how far does this placement's own low end extend relative to
+    its own best-supported level," not "how loud is this placement's low
+    end in absolute terms compared to another placement." The latter is a
+    genuinely different, legitimate question (see the ``relative_spl_db``/
+    ``post_eq_relative_spl_db`` columns in ``subpair report`` for a
+    directly cross-pair-comparable absolute-level metric); folding a shared
+    cross-pair reference into this threshold check was tried and reverted,
+    since any placement whose own peak falls below that shared reference by
+    more than ``threshold_db`` anywhere collapses to the same "no
+    extension" answer regardless of how good its actual low-end shape is,
+    which discards exactly the shape information this metric exists to
+    report.
 
     Reports the band's own lower edge, rather than extrapolating past it,
-    when the envelope never drops by ``threshold_db`` below the reference
-    anywhere in the band (fully extended through the analyzed range).
+    when the envelope never drops by ``threshold_db`` below its own peak
+    anywhere at or below that peak (fully extended through the analyzed
+    range).
     """
     frequencies = np.asarray(frequencies, dtype=np.float64)
     trend_db = np.asarray(trend_db, dtype=np.float64)
     if frequencies.size == 0:
         return 0.0
     envelope = _two_sided_envelope_db(trend_db)
-    reference = float(envelope[-1]) if reference_db is None else float(reference_db)
-    threshold = reference - threshold_db
-    running_min_from_top = np.minimum.accumulate(envelope[::-1])[::-1]
-    meets_threshold = running_min_from_top >= threshold
+    peak_index = int(np.argmax(envelope))
+    threshold = float(envelope[peak_index]) - threshold_db
+    segment = envelope[: peak_index + 1]
+    running_min_from_peak = np.minimum.accumulate(segment[::-1])[::-1]
+    meets_threshold = running_min_from_peak >= threshold
     if not np.any(meets_threshold):
-        return float(frequencies[-1])
+        return float(frequencies[0])
     return float(frequencies[np.argmax(meets_threshold)])
 
 
