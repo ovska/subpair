@@ -129,6 +129,18 @@ magnitude but is smeary in phase somewhere — a case the energy-weighted
 mean and the null-score metric (which only look where magnitude itself is
 unusual) can both miss.
 
+`excess_gd_peak_ms`/`post_eq_excess_gd_peak_ms` — a fourth, final tie-break —
+is the deliberately *width-invariant* counterpart to the area-based tail
+metric above: the single worst denoised `|excess GD|` sample in the range,
+lightly pre-denoised the same way `_excess_gd_authority`'s own gate is (so
+one noisy sample cannot set it by itself), then a plain maximum. A maximum
+is unaffected by a feature's own width — a narrow spike and a wide plateau
+of the same height already score identically — so this only ever separates
+two placements whose smeared *area* ties but where one still has a single
+sharper, more severe excursion the area-based tail metric alone cannot see.
+It does not replace `excess_gd_tail_ms`; like every metric in this ranking,
+it only breaks ties the earlier ones leave exact.
+
 There is no weighted blend. Each later metric only breaks an exact tie in the
 earlier metrics. `--tie-tolerance-db` (0–3 dB, default 0) widens "tie" to any
 null-score difference within that many dB, so the fast-search's finalist

@@ -19,6 +19,7 @@ from subpair.dsp import (
     _smooth_by_variable_octaves,
     _two_sided_envelope_db,
     db20,
+    excess_gd_peak_ms,
     excess_gd_tail_ms,
     fit_eq_filters,
     excess_group_delay,
@@ -638,6 +639,64 @@ class PipelineTests(unittest.TestCase):
         self.assertGreater(full_tail, 0.0)
         self.assertEqual(limited_tail, 0.0)
 
+    def test_excess_gd_peak_ms_is_width_invariant_unlike_the_tail(self):
+        # Same total area as the tail's shape-neutrality test, but the peak
+        # metric should track peak *height*, not area: a narrow, tall spike
+        # must score far higher than a wide, shallow bump of equal area,
+        # which is exactly the opposite property from excess_gd_tail_ms.
+        frequencies = log_frequency_grid(25.0, 150.0, 48)
+        area = 40.0
+
+        def make(width_bins: int) -> np.ndarray:
+            excess_ms = np.zeros_like(frequencies)
+            excess_ms[:width_bins] = area / width_bins
+            return excess_ms
+
+        narrow_peak = excess_gd_peak_ms(make(2), frequencies)
+        wide_peak = excess_gd_peak_ms(make(32), frequencies)
+        self.assertGreater(narrow_peak, 3.0 * wide_peak)
+
+    def test_excess_gd_peak_ms_matches_equal_height_regardless_of_width(self):
+        # Unlike area, peak height alone should not depend on feature width:
+        # a narrow spike and a wide plateau of the same height score alike.
+        frequencies = log_frequency_grid(25.0, 150.0, 48)
+
+        def make(width_bins: int, height_ms: float) -> np.ndarray:
+            excess_ms = np.zeros_like(frequencies)
+            excess_ms[:width_bins] = height_ms
+            return excess_ms
+
+        narrow = excess_gd_peak_ms(make(2, 5.0), frequencies)
+        wide = excess_gd_peak_ms(make(32, 5.0), frequencies)
+        self.assertAlmostEqual(narrow, wide, delta=0.5)
+
+    def test_excess_gd_peak_ms_matches_a_uniform_band(self):
+        frequencies = log_frequency_grid(25.0, 150.0, 48)
+        excess_ms = np.full_like(frequencies, 2.0)
+        self.assertAlmostEqual(excess_gd_peak_ms(excess_ms, frequencies), 2.0, places=2)
+
+    def test_excess_gd_peak_ms_respects_integration_range(self):
+        frequencies = log_frequency_grid(25.0, 150.0, 48)
+        excess_ms = np.zeros_like(frequencies)
+        centre = int(np.argmin(np.abs(frequencies - 125.0)))
+        excess_ms[centre] = 9.0
+        full_peak = excess_gd_peak_ms(excess_ms, frequencies)
+        limited_peak = excess_gd_peak_ms(
+            excess_ms, frequencies, integration_range=(30.0, 90.0)
+        )
+        self.assertGreater(full_peak, 0.0)
+        self.assertEqual(limited_peak, 0.0)
+
+    def test_excess_gd_peak_ms_is_symmetric_in_sign(self):
+        frequencies = log_frequency_grid(25.0, 150.0, 48)
+        positive = np.zeros_like(frequencies)
+        positive[10] = 6.0
+        negative = -positive
+        self.assertAlmostEqual(
+            excess_gd_peak_ms(positive, frequencies),
+            excess_gd_peak_ms(negative, frequencies),
+        )
+
     def test_rejects_mismatched_lengths(self):
         with tempfile.TemporaryDirectory() as temporary:
             rows = []
@@ -724,6 +783,7 @@ class PipelineTests(unittest.TestCase):
                     row["null_score_db"],
                     row["excess_gd_ms"],
                     row["excess_gd_tail_ms"],
+                    row["excess_gd_peak_ms"],
                     row["raw_tail_ms"],
                 )
                 for row in result["pairs"]
@@ -734,6 +794,7 @@ class PipelineTests(unittest.TestCase):
                     row["post_eq_null_score_db"],
                     row["post_eq_excess_gd_ms"],
                     row["post_eq_excess_gd_tail_ms"],
+                    row["post_eq_excess_gd_peak_ms"],
                     row["post_eq_tail_ms"],
                 )
                 for row in sorted(result["pairs"], key=lambda row: row["eq_rank"])
@@ -767,12 +828,18 @@ class PipelineTests(unittest.TestCase):
             self.assertNotIn(
                 "post_eq_low_end_extension_hz", loaded["settings"]["ranking"]["eq"]
             )
+            self.assertIn("excess_gd_peak_ms", loaded["settings"]["ranking"]["raw"])
+            self.assertIn(
+                "post_eq_excess_gd_peak_ms", loaded["settings"]["ranking"]["eq"]
+            )
             for row in result["pairs"]:
                 self.assertIn("magnitude_only_null_score_db", row)
                 self.assertIn("post_eq_magnitude_only_null_score_db", row)
                 self.assertGreaterEqual(
                     row["null_score_db"], row["magnitude_only_null_score_db"] - 1e-9
                 )
+                self.assertGreaterEqual(row["excess_gd_peak_ms"], 0.0)
+                self.assertGreaterEqual(row["post_eq_excess_gd_peak_ms"], 0.0)
                 self.assertGreaterEqual(row["delay_plateau_ms"], 0.0)
                 self.assertGreaterEqual(row["gain_plateau_db"], 0.0)
                 self.assertIn("low_end_extension_hz", row)
@@ -846,7 +913,10 @@ class PipelineTests(unittest.TestCase):
             self.assertNotIn("Variable smoothed", page)
             self.assertNotIn("Nominal flat target", page)
             self.assertNotIn("1-oct trend", page)
-            self.assertNotIn('"dash":', page)
+            # The excess-GD plot's width-invariant peak envelope is the only
+            # dashed reference line the report draws.
+            self.assertIn('"dash":"dot"', page)
+            self.assertIn("peak ", page)
             self.assertIn("Combined PEQ response (all bands)", page)
             self.assertIn('"shape":"spline"', page)
             self.assertIn("EQ authority", page)

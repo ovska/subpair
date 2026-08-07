@@ -953,6 +953,53 @@ def excess_gd_tail_ms(
     return float((numerator / span) ** (1.0 / power))
 
 
+EXCESS_GD_PEAK_DENOISE_SIGMA_BINS = 0.35
+
+
+def excess_gd_peak_ms(
+    excess_group_delay_ms: np.ndarray,
+    frequencies: np.ndarray,
+    integration_range: tuple[float, float] | None = None,
+) -> float:
+    """Denoised worst-case |excess GD|, width-invariant unlike ``excess_gd_tail_ms``.
+
+    ``excess_gd_tail_ms`` is deliberately *area*-based: a narrow severe spike
+    and a wide shallow bump of the same area score the same (see its
+    docstring), which is the right property for an overall-smear estimate but
+    means one genuinely severe, narrow non-minimum-phase feature can be
+    diluted in that average by wide, mild variation elsewhere in the range. A
+    plain maximum is already perfectly width-invariant on its own — a spike
+    of height H and a plateau of height H both peak at H regardless of how
+    wide either one is — so, unlike ``_excess_gd_authority``'s pointwise
+    maximum-filter (needed there to build a full-curve gate), this only needs
+    the same light pre-denoise ``_excess_gd_authority`` applies before its
+    maximum filter, so a single noisy sample cannot set the reported peak by
+    itself, and then a single global maximum.
+
+    This is a lexicographic tie-break placed after ``excess_gd_tail_ms``, not
+    a replacement for it: it exists to separate two placements whose smeared
+    *area* looks equally clean but where one has a single sharp, denoised-real
+    non-minimum-phase excursion the area-based tail metric alone would not
+    weight any differently from several mild, spread-out ones.
+    """
+    frequencies = np.asarray(frequencies, dtype=np.float64)
+    values = np.abs(np.asarray(excess_group_delay_ms, dtype=np.float64))
+    if integration_range is not None:
+        low, high = integration_range
+        mask = (frequencies >= low) & (frequencies <= high)
+        if np.any(mask):
+            frequencies = frequencies[mask]
+            values = values[mask]
+    if values.size == 0:
+        return 0.0
+    if values.size < 3:
+        return float(np.max(values))
+    denoised = ndimage.gaussian_filter1d(
+        values, sigma=EXCESS_GD_PEAK_DENOISE_SIGMA_BINS, mode="nearest", truncate=3.0
+    )
+    return float(np.max(denoised))
+
+
 def _band_centres(low: float, high: float, ppo: int) -> np.ndarray:
     return log_frequency_grid(low, high, ppo)
 
@@ -1195,6 +1242,9 @@ def pair_diagnostics(
         "excess_gd_tail_ms": excess_gd_tail_ms(
             excess_curve, context.frequencies, eq_options.correction_range
         ),
+        "excess_gd_peak_ms": excess_gd_peak_ms(
+            excess_curve, context.frequencies, eq_options.correction_range
+        ),
         "raw_tail_ms": float(np.max(raw_tail_by_band)),
         "raw_tail_by_band_ms": [round(float(value), 6) for value in raw_tail_by_band],
         "low_end_extension_hz": low_end_extension_hz(trend_db, context.frequencies),
@@ -1210,6 +1260,9 @@ def pair_diagnostics(
         ),
         "post_eq_excess_gd_ms": float(post_excess_score),
         "post_eq_excess_gd_tail_ms": excess_gd_tail_ms(
+            post_excess_curve, context.frequencies, eq_options.correction_range
+        ),
+        "post_eq_excess_gd_peak_ms": excess_gd_peak_ms(
             post_excess_curve, context.frequencies, eq_options.correction_range
         ),
         "post_eq_tail_ms": float(np.max(tail_by_band)),
