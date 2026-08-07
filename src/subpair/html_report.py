@@ -521,6 +521,7 @@ def build_report(
 
     default_count = max(0, min(top, len(pairs)))
     default_keys = {pair_key(pair) for pair in pairs[:default_count]}
+    initial_active_key = pair_key(pairs[0]) if default_count else None
     detail_sections = []
     diagnostic_by_key: dict[str, dict[str, Any]] = {}
     for pair in pairs:
@@ -540,6 +541,9 @@ def build_report(
             shelf_response = shelf.response(context.frequencies, context.sample_rate)
             data["post_eq_shelf_db"] = np.asarray(data["post_eq_db"]) + db20(shelf_response)
         diagnostic_by_key[key] = data
+        detail_class = (
+            "pair-detail" if key == initial_active_key else "pair-detail is-inactive"
+        )
         metric_summary = (
             f"Raw: null {pair['null_score_db']:.3f} dB · "
             f"excess GD {pair['excess_gd_ms']:.3f} ms · "
@@ -577,10 +581,9 @@ def build_report(
             )
         detail_sections.append(
             f"""
-            <section class="pair-detail" data-pair-key="{key}"
+            <section class="{detail_class}" data-pair-key="{key}"
               data-pair-label="{pair['first']}+{pair['second']}"
-              data-rank="{pair[rank_key]}"
-              hidden>
+              data-rank="{pair[rank_key]}">
               <h2>#{pair[rank_key]} {mode_label}:
                 {html.escape(pair['first_name'])} + {html.escape(pair['second_name'])}</h2>
               <p class="configuration">Sub 2: {'normal' if pair['polarity'] > 0 else 'inverted'},
@@ -637,8 +640,9 @@ h1 {{ font-size:2.2rem; margin:0 0 4px; }} h2 {{ margin-top:0; }}
 .chart-tab.active,.pair-tab.active {{ color:#07111f; border-color:#7dd3fc; background:#7dd3fc; }}
 .pair-tabs {{ min-height:39px; margin:14px 0 2px; }}
 .empty-selection {{ align-self:center; color:var(--muted); }}
-[hidden] {{ display:none !important; }}
-.sizing-plots {{ visibility:hidden; }}
+.overview-panels,#pair-details {{ position:relative; }}
+.overview-panel,.pair-detail {{ width:100%; }}
+.overview-panel.is-inactive,.pair-detail.is-inactive {{ position:absolute; inset:0; visibility:hidden; pointer-events:none; }}
 .table-wrap {{ overflow:auto; border:1px solid var(--line); border-radius:12px; background:var(--card); }}
 table {{ width:100%; border-collapse:collapse; white-space:nowrap; }}
 th,td {{ padding:10px 13px; text-align:right; border-bottom:1px solid var(--line); }}
@@ -664,11 +668,13 @@ details {{ margin:22px 0; }} details pre {{ overflow:auto; color:var(--muted); }
   <button class="chart-tab active" data-overview-view="magnitude" role="tab" aria-selected="true" onclick="setOverviewView('magnitude')">Magnitude</button>
   <button class="chart-tab" data-overview-view="excess" role="tab" aria-selected="false" onclick="setOverviewView('excess')">Excess GD</button>
 </div>
-<div data-overview-panel data-overview-view="magnitude">
-  {_plot_html(_overview_figure(overview, mode, default_keys), f'selected-pairs-magnitude-{mode}')}
-</div>
-<div data-overview-panel data-overview-view="excess" hidden>
-  {_plot_html(_overview_excess_figure(overview, mode, default_keys), f'selected-pairs-excess-{mode}')}
+<div class="overview-panels">
+  <div class="overview-panel" data-overview-panel data-overview-view="magnitude">
+    {_plot_html(_overview_figure(overview, mode, default_keys), f'selected-pairs-magnitude-{mode}')}
+  </div>
+  <div class="overview-panel is-inactive" data-overview-panel data-overview-view="excess">
+    {_plot_html(_overview_excess_figure(overview, mode, default_keys), f'selected-pairs-excess-{mode}')}
+  </div>
 </div>
 <p class="note">{('Raw ranking: raw-magnitude null depth, raw excess group delay, then raw tail.' if raw else 'EQ’d ranking: post-EQ raw-magnitude null depth, post-EQ excess group delay, then post-EQ tail.')}</p>
 <div class="table-wrap">{_ranking_table(pairs, mode, f'ranking-{mode}', default_keys)}</div>
@@ -719,24 +725,10 @@ function updateOverview() {{
     }});
   }});
 }}
-function revealPlots(container) {{
-  container.classList.add('sizing-plots');
-  container.hidden=false;
-  const plots=Array.from(container.querySelectorAll('.plotly-graph-div')).filter(
-    plot=>plot.data
-  );
-  if(!plots.length) {{
-    container.classList.remove('sizing-plots');
-    return;
-  }}
-  Promise.all(plots.map(plot=>Plotly.relayout(plot,{{autosize:true}})))
-    .catch(()=>{{}})
-    .finally(()=>container.classList.remove('sizing-plots'));
-}}
 function setOverviewView(view) {{
-  document.querySelectorAll('[data-overview-panel]').forEach(panel=>panel.hidden=true);
-  const panel=document.querySelector('[data-overview-panel][data-overview-view="'+view+'"]');
-  if(panel) revealPlots(panel);
+  document.querySelectorAll('[data-overview-panel]').forEach(panel=>{{
+    panel.classList.toggle('is-inactive',panel.dataset.overviewView!==view);
+  }});
   document.querySelectorAll('.chart-tab').forEach(button=>{{
     const active=button.dataset.overviewView===view;
     button.classList.toggle('active',active);
@@ -744,11 +736,9 @@ function setOverviewView(view) {{
   }});
 }}
 function renderActiveDetail() {{
-  document.querySelectorAll('.pair-detail').forEach(section=>section.hidden=true);
-  if(!activePair) return;
-  const section=sectionForKey(activePair);
-  if(!section) return;
-  revealPlots(section);
+  document.querySelectorAll('.pair-detail').forEach(section=>{{
+    section.classList.toggle('is-inactive',section.dataset.pairKey!==activePair);
+  }});
 }}
 function activatePair(key) {{
   if(!selectedPairs.has(key)) return;

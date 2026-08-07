@@ -998,7 +998,10 @@ class PipelineTests(unittest.TestCase):
                 )
             )
             detail_pair_keys = set(
-                re.findall(r'class="pair-detail" data-pair-key="([^"]+)"', page)
+                re.findall(
+                    r'class="pair-detail(?: is-inactive)?" data-pair-key="([^"]+)"',
+                    page,
+                )
             )
             self.assertEqual(detail_pair_keys, table_pair_keys)
             self.assertIn('"visible":"legendonly"', page)
@@ -1017,8 +1020,12 @@ class PipelineTests(unittest.TestCase):
                 all(table.count("background:hsla(") == 15 for table in ranking_tables(page))
             )
             self.assertNotIn(".plotly-graph-div { width:100% !important; }", page)
-            self.assertIn(".sizing-plots { visibility:hidden; }", page)
-            self.assertIn("Plotly.relayout(plot,{autosize:true})", page)
+            self.assertIn(".overview-panels,#pair-details { position:relative; }", page)
+            self.assertIn(
+                ".overview-panel.is-inactive,.pair-detail.is-inactive ", page
+            )
+            self.assertNotIn("Plotly.relayout(plot,{autosize:true})", page)
+            self.assertNotIn("function revealPlots", page)
             self.assertNotIn("window.dispatchEvent(new Event('resize'))", page)
             self.assertIn("Extension", page)
             self.assertIn("not part of the ranking", page)
