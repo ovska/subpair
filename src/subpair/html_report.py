@@ -225,32 +225,6 @@ def _excess_figure(data: dict[str, Any], *, raw: bool = False) -> go.Figure:
             name=f"{label} excess GD",
         )
     )
-    baseline_ms = np.asarray(data[f"{prefix}excess_baseline_ms"])
-    # A "flat" baseline is a single constant (already implied by the y=0
-    # reference line below); only draw it when it actually varies, i.e. the
-    # 'monotonic' --gd-baseline mode.
-    if baseline_ms.size and float(np.ptp(baseline_ms)) > 1e-9:
-        # baseline_ms is the *raw*, pre-removal group delay's baseline, which
-        # still carries the arbitrary common-alignment offset (curve_ms +
-        # baseline_ms reconstructs that raw curve) - typically hundreds to
-        # thousands of ms, versus a curve_ms that's usually single-digit ms.
-        # Plotted on the same axis at that absolute scale, the baseline
-        # dwarfs the excess-GD curve it's meant to contextualize and the
-        # chart becomes unreadable. _isotonic_non_increasing constrains
-        # |baseline_ms| to be non-increasing as frequency rises, so its
-        # value at the top of the evaluated range is always its own
-        # smallest-magnitude ("settled") point; subtracting that shifts the
-        # display (not the scored data) onto the same near-zero-referenced
-        # scale as the excess curve while preserving the baseline's shape.
-        baseline_ms = baseline_ms - baseline_ms[-1]
-        figure.add_trace(
-            go.Scatter(
-                x=data["frequencies"],
-                y=baseline_ms,
-                line={"color": "#fb923c", "width": 1.5, "dash": "dash"},
-                name="Monotonic baseline (shifted to 0 at top of band)",
-            )
-        )
     if not raw:
         figure.add_trace(
             go.Scatter(
@@ -484,7 +458,6 @@ def build_report(
         raise ReportError("Cache measurement count does not match the search results")
     settings = results["settings"]
     band = tuple(float(value) for value in settings["band_hz"])
-    gd_baseline = str(settings.get("gd_baseline", {}).get("mode", "flat"))
     eq_settings = settings.get("eq", {})
     eq_range = tuple(float(value) for value in eq_settings.get("correction_range_hz", band))
     shelf_settings = eq_settings.get("shelf", {})
@@ -526,6 +499,11 @@ def build_report(
             "Search results predate the self-referential F3/F6 "
             "low-end extension calculation; run 'subpair search' again"
         )
+    if int(results.get("format_version", 0)) < 15:
+        raise ReportError(
+            "Search results predate removal of the monotonic GD baseline "
+            "mode; run 'subpair search' again"
+        )
     if any(
         not required_ranking_fields.issubset(pair)
         for pair in results["pairs"]
@@ -557,7 +535,6 @@ def build_report(
             float(pair["gain_db"]),
             include_decay=True,
             eq_options=eq_options,
-            gd_baseline=gd_baseline,
         )
         key = pair_key(pair)
         diagnostic_by_key[key] = data
@@ -684,7 +661,7 @@ details {{ margin:22px 0; }} details pre {{ overflow:auto; color:var(--muted); }
 </head>
 <body><main>
 <h1>subpair ranking</h1>
-<p class="lede">{results['measurement_count']} positions · {band[0]:g}–{band[1]:g} Hz · {settings['ppo']} points/octave · {mode_label} lexicographic ranking · showing up to {limit} pairs{' · monotonic GD baseline' if gd_baseline == 'monotonic' else ''}</p>
+<p class="lede">{results['measurement_count']} positions · {band[0]:g}–{band[1]:g} Hz · {settings['ppo']} points/octave · {mode_label} lexicographic ranking · showing up to {limit} pairs</p>
 <p class="note">Check table rows to choose comparison pairs. The top {default_count} start selected; the pair tabs below the table open one full diagnostic at a time. Hotkeys 1–9 open the first nine selected tabs.</p>
 <div class="chart-tabs" role="tablist" aria-label="{mode_label} overview chart">
   <button class="chart-tab active" data-overview-view="magnitude" role="tab" aria-selected="true" onclick="setOverviewView('magnitude')">Magnitude</button>

@@ -161,21 +161,6 @@ def _build_parser() -> argparse.ArgumentParser:
             "back to excess-GD/tail, 0..3 dB (default: 0, strict lexicographic)"
         ),
     )
-    search.add_argument(
-        "--gd-baseline",
-        choices=("flat", "monotonic"),
-        default="flat",
-        help=(
-            "excess-GD reference: 'flat' (default) treats any frequency-"
-            "dependent group delay as excess; 'monotonic' fits a per-point "
-            "baseline constrained to be non-increasing in magnitude as "
-            "frequency rises, so a genuine group-delay rise confined to the "
-            "bottom of the band is treated as normal rather than excess, "
-            "while a bump anywhere the fit cannot explain still counts in "
-            "full. Changes ranking; validate against real measurements "
-            "before trusting it over the default"
-        ),
-    )
     _add_shelf_arguments(search)
     search.add_argument("--top", type=_positive_int, default=10, help="rows to print")
 
@@ -361,7 +346,6 @@ def _search(args: argparse.Namespace) -> int:
         max_cut_db=args.max_cut,
         eq_bands=args.eq_bands,
         tie_tolerance_db=args.tie_tolerance_db,
-        gd_baseline=args.gd_baseline,
         low_shelf_freq_hz=args.low_shelf_freq,
         low_shelf_gain_db=args.low_shelf_gain,
         low_shelf_slope=args.low_shelf_slope,
