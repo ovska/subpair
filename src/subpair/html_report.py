@@ -222,6 +222,19 @@ def _excess_figure(data: dict[str, Any]) -> go.Figure:
             name="Excess GD",
         )
     )
+    baseline_ms = np.asarray(data["excess_baseline_ms"])
+    # A "flat" baseline is a single constant (already implied by the y=0
+    # reference line below); only draw it when it actually varies, i.e. the
+    # 'monotonic' --gd-baseline mode.
+    if baseline_ms.size and float(np.ptp(baseline_ms)) > 1e-9:
+        figure.add_trace(
+            go.Scatter(
+                x=data["frequencies"],
+                y=baseline_ms,
+                line={"color": "#fb923c", "width": 1.5, "dash": "dash"},
+                name="Monotonic baseline",
+            )
+        )
     figure.add_trace(
         go.Scatter(
             x=data["frequencies"],
@@ -465,6 +478,7 @@ def build_report(
         raise ReportError("Cache measurement count does not match the search results")
     settings = results["settings"]
     band = tuple(float(value) for value in settings["band_hz"])
+    gd_baseline = str(settings.get("gd_baseline", {}).get("mode", "flat"))
     eq_settings = settings.get("eq", {})
     eq_range = tuple(float(value) for value in eq_settings.get("correction_range_hz", band))
     eq_options = EqOptions(
@@ -530,6 +544,7 @@ def build_report(
             float(pair["gain_db"]),
             include_decay=True,
             eq_options=eq_options,
+            gd_baseline=gd_baseline,
         )
         key = pair_key(pair)
         if shelf.active:
@@ -620,7 +635,7 @@ details {{ margin:22px 0; }} details pre {{ overflow:auto; color:var(--muted); }
 </head>
 <body><main>
 <h1>subpair ranking</h1>
-<p class="lede">{results['measurement_count']} positions · {band[0]:g}–{band[1]:g} Hz · {settings['ppo']} points/octave · dual lexicographic ranking · showing up to {limit} pairs per mode</p>
+<p class="lede">{results['measurement_count']} positions · {band[0]:g}–{band[1]:g} Hz · {settings['ppo']} points/octave · dual lexicographic ranking · showing up to {limit} pairs per mode{' · monotonic GD baseline' if gd_baseline == 'monotonic' else ''}</p>
 <div class="mode-tabs" role="tablist" aria-label="Ranking response mode">
   <button class="mode-tab active" id="raw-mode-tab" role="tab" aria-selected="true" onclick="setReportMode('raw')">Raw</button>
   <button class="mode-tab" id="eq-mode-tab" role="tab" aria-selected="false" onclick="setReportMode('eq')">EQ’d</button>

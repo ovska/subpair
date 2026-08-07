@@ -13,6 +13,7 @@ import numpy as np
 from .cache import load_cache, write_json
 from .dsp import (
     EXCESS_GD_TAIL_POWER,
+    GD_BASELINE_MODES,
     LOW_END_EXTENSION_THRESHOLD_DB,
     MIN_RELIABLE_NATIVE_BINS,
     AnalysisContext,
@@ -36,6 +37,7 @@ class SearchOptions:
     max_cut_db: float = 18.0
     eq_bands: int = 7
     tie_tolerance_db: float = 0.0
+    gd_baseline: str = "flat"
 
 
 PLATEAU_TOLERANCE_DB = 0.5
@@ -134,6 +136,8 @@ def run_search(
     options: SearchOptions,
     progress: Callable[[int, int, str], None] | None = None,
 ) -> dict:
+    if options.gd_baseline not in GD_BASELINE_MODES:
+        raise ValueError(f"gd_baseline must be one of {GD_BASELINE_MODES}")
     measurements, manifest = load_cache(cache_dir)
     delays = inclusive_range(*options.delay_range_ms)
     gains = inclusive_range(*options.gain_range_db)
@@ -176,6 +180,7 @@ def run_search(
                 gain_db,
                 include_decay=False,
                 eq_options=eq_options,
+                gd_baseline=options.gd_baseline,
             )
             # null_score_db (GD-weighted severity, from pair_diagnostics) now
             # decides finalist ties, not the fast search's plain-magnitude
@@ -250,7 +255,7 @@ def run_search(
         )
 
     result = {
-        "format_version": 6,
+        "format_version": 7,
         "measurement_count": len(measurements),
         "sample_rate": measurements[0].sample_rate,
         "response_length": measurements[0].impulse.size,
@@ -259,6 +264,26 @@ def run_search(
             "ppo": options.ppo,
             "delay_range_ms": list(options.delay_range_ms),
             "gain_range_db": list(options.gain_range_db),
+            "gd_baseline": {
+                "mode": options.gd_baseline,
+                "note": (
+                    "'flat' (default) removes a single constant - this "
+                    "curve's weighted median - so any frequency-dependent "
+                    "group delay at all is excess. 'monotonic' instead fits "
+                    "a per-point baseline constrained to be non-increasing "
+                    "in magnitude as frequency rises, over the full analysis "
+                    "band; a genuine group-delay rise confined to the bottom "
+                    "of the band is then treated as normal rather than "
+                    "excess, while a bump anywhere the non-increasing "
+                    "constraint cannot explain - regardless of width - still "
+                    "counts in full. 'monotonic' is an explicit, opt-in "
+                    "acoustic assumption, not a measurement-reliability "
+                    "correction; it changes null_score_db, excess_gd_ms, "
+                    "excess_gd_tail_ms, and excess_gd_peak_ms (and their "
+                    "post_eq_ counterparts) versus the same search with "
+                    "'flat'."
+                ),
+            },
             "eq": {
                 "target": eq_options.target,
                 "correction_range_hz": list(eq_range),
@@ -289,7 +314,12 @@ def run_search(
                 "fft_zero_pad_factor": context.minphase_pad_factor,
                 "log_magnitude_floor_db": -160.0,
                 "bandwidth": "full cached response, DC to Nyquist",
-                "common_delay": "energy-weighted median removed from excess GD",
+                "common_delay": (
+                    "energy-weighted median removed from excess GD"
+                    if options.gd_baseline == "flat"
+                    else "non-increasing monotonic baseline removed from "
+                    "excess GD; see settings.gd_baseline"
+                ),
             },
             "native_resolution": {
                 "hz": context.native_resolution_hz,

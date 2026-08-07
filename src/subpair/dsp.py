@@ -839,6 +839,72 @@ def _weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
     return float(ordered_values[np.searchsorted(np.cumsum(ordered_weights), midpoint)])
 
 
+GD_BASELINE_MODES = ("flat", "monotonic")
+
+
+def _isotonic_non_increasing(values: np.ndarray, weights: np.ndarray) -> np.ndarray:
+    """Weighted least-squares fit that is non-increasing in index order (PAVA).
+
+    The pool-adjacent-violators algorithm: walk the array left to right,
+    keeping a stack of pools (weighted mean, weight, size). Whenever the new
+    point's pool would score *higher* than the pool immediately to its left
+    - a violation of "non-increasing" - merge the two pools into one at
+    their combined weighted mean and re-check the pool now to their left,
+    since merging can itself create a new violation further back. This is
+    the standard exact solution to weighted isotonic regression, not a
+    smoothing heuristic: for any non-increasing sequence it reproduces that
+    sequence exactly, and it flattens (weighted-averages) any run that
+    isn't, using no more merging than the data forces.
+    """
+    values = np.asarray(values, dtype=np.float64)
+    weights = np.asarray(weights, dtype=np.float64)
+    block_sums: list[float] = []
+    block_weights: list[float] = []
+    block_sizes: list[int] = []
+    for value, weight in zip(values, weights):
+        block_sums.append(value * weight)
+        block_weights.append(weight)
+        block_sizes.append(1)
+        while (
+            len(block_sums) >= 2
+            and block_sums[-2] / block_weights[-2] < block_sums[-1] / block_weights[-1]
+        ):
+            sum_b, weight_b, size_b = (
+                block_sums.pop(),
+                block_weights.pop(),
+                block_sizes.pop(),
+            )
+            block_sums[-1] += sum_b
+            block_weights[-1] += weight_b
+            block_sizes[-1] += size_b
+    result = np.empty(values.size, dtype=np.float64)
+    index = 0
+    for total, weight, size in zip(block_sums, block_weights, block_sizes):
+        result[index : index + size] = total / weight
+        index += size
+    return result
+
+
+def _monotonic_gd_baseline(group_delay: np.ndarray, weights: np.ndarray) -> np.ndarray:
+    """Signed group-delay baseline whose magnitude is non-increasing with frequency.
+
+    Models the physically-expected case of a real, benign group-delay rise
+    toward the bottom of the band (room/port/driver behaviour smoothly
+    declining as frequency rises) as the *baseline* rather than as excess,
+    while still catching a bump anywhere else: the non-increasing constraint
+    on ``|group_delay|`` means the fit can only be elevated at a given
+    frequency if it was already at least that elevated everywhere below it,
+    so a rise that appears after a lower value earlier in the band cannot be
+    absorbed into the baseline - it is structurally excess, regardless of
+    how wide or gentle it is. Fit on magnitude (not the signed curve) so a
+    genuine low-end rise is captured symmetrically whichever sign it has,
+    matching every other excess-GD consumer's ``abs()`` treatment.
+    """
+    magnitude_envelope = _isotonic_non_increasing(np.abs(group_delay), weights)
+    sign = np.where(group_delay >= 0.0, 1.0, -1.0)
+    return sign * magnitude_envelope
+
+
 def excess_group_delay(
     spectrum: np.ndarray,
     fft_frequencies: np.ndarray,
@@ -846,13 +912,34 @@ def excess_group_delay(
     integration_range: tuple[float, float] | None = None,
     native_resolution_hz: float | None = None,
     ppo: int = 48,
-) -> tuple[float, np.ndarray]:
-    """Return energy-weighted mean absolute excess GD and its de-offset curve.
+    gd_baseline: str = "flat",
+) -> tuple[float, np.ndarray, np.ndarray]:
+    """Return energy-weighted mean absolute excess GD, its de-offset curve, and the baseline removed.
 
     The minimum-phase transform and group-delay derivative use the complete
     supplied spectra and evaluation grid. When ``integration_range`` is set,
     only that frequency interval contributes to common-delay removal and the
     scalar score used for ranking.
+
+    ``gd_baseline`` selects what is treated as the arbitrary reference that
+    "excess" is measured from, over ``evaluation_frequencies`` in full
+    (regardless of ``integration_range``, so a real sub-bass rise is judged
+    against the actual sub-bass data even when the correction/score range is
+    narrower):
+
+    - ``"flat"`` (default): a single constant, this curve's weighted median
+      within ``integration_range``. Removing it leaves frequency-dependent
+      (excess) storage/decay relative to the arbitrary common time origin.
+    - ``"monotonic"``: a per-point baseline via ``_monotonic_gd_baseline``,
+      constrained to be non-increasing in magnitude as frequency rises. This
+      treats a genuine, physically-expected group-delay rise toward the
+      bottom of the band as normal rather than as excess, while still
+      flagging a bump anywhere the non-increasing constraint cannot explain
+      - by construction, not via a separate width heuristic. This is an
+      explicit, opt-in acoustic assumption (real low-frequency non-minimum-
+      phase structure looks like this), not a measurement-reliability
+      correction; ``"flat"`` remains the default because it makes no such
+      assumption.
 
     When ``native_resolution_hz`` is given (the cache's unpadded frequency
     resolution; see ``AnalysisContext.native_resolution_hz``), the returned
@@ -863,8 +950,18 @@ def excess_group_delay(
     otherwise shows up as large, sign-flipping group-delay swings around
     zero. Leaving this ``None`` (the default) reproduces the original,
     unsmoothed curve, e.g. for callers that supply hand-built curves rather
-    than a real cache's resolution.
+    than a real cache's resolution. This applies after baseline removal in
+    either mode.
+
+    Returns ``(score, curve_ms, baseline_ms)``: the scalar score, the
+    de-offset (baseline-removed, optionally smoothed) curve in ms, and the
+    baseline itself in ms - a full-length array in both modes (a constant
+    broadcast in ``"flat"`` mode) so a caller can display or diff it the
+    same way regardless of which mode produced it. ``curve_ms + baseline_ms``
+    reconstructs the raw (pre-removal) group-delay curve.
     """
+    if gd_baseline not in GD_BASELINE_MODES:
+        raise ValueError(f"gd_baseline must be one of {GD_BASELINE_MODES}")
     log_minimum = minimum_phase_log_spectrum(spectrum)
     minimum_phase = np.imag(log_minimum)
     excess_phase_full = np.unwrap(np.angle(spectrum) - minimum_phase)
@@ -886,11 +983,19 @@ def excess_group_delay(
         )
         if np.count_nonzero(score_mask) < 3:
             raise ValueError("Excess-GD integration range contains fewer than three points")
-    # A constant group delay is the arbitrary common time origin. Removing its
-    # weighted median (computed from the raw, unsmoothed curve, so the
-    # smoothing below cannot bias the common-delay estimate itself) leaves
-    # frequency-dependent (excess) storage/decay.
-    group_delay -= _weighted_median(group_delay[score_mask], weights[score_mask])
+    if gd_baseline == "monotonic":
+        # Fit over the full curve (see docstring), computed from the raw,
+        # unsmoothed curve so the smoothing below cannot bias the baseline.
+        baseline = _monotonic_gd_baseline(group_delay, weights)
+    else:
+        # A constant group delay is the arbitrary common time origin. Removing
+        # its weighted median (computed from the raw, unsmoothed curve, so the
+        # smoothing below cannot bias the common-delay estimate itself) leaves
+        # frequency-dependent (excess) storage/decay.
+        baseline = np.full_like(
+            group_delay, _weighted_median(group_delay[score_mask], weights[score_mask])
+        )
+    group_delay = group_delay - baseline
     if native_resolution_hz is not None:
         sigma_octaves = gd_smoothing_octaves(evaluation_frequencies, native_resolution_hz)
         group_delay = _smooth_by_variable_octaves(group_delay, ppo, sigma_octaves)
@@ -900,7 +1005,11 @@ def excess_group_delay(
     log_frequency = np.log(score_frequencies)
     numerator = np.trapezoid(score_weights * np.abs(score_delays), x=log_frequency)
     denominator = max(np.trapezoid(score_weights, x=log_frequency), EPS)
-    return float(1000.0 * numerator / denominator), 1000.0 * group_delay
+    return (
+        float(1000.0 * numerator / denominator),
+        1000.0 * group_delay,
+        1000.0 * baseline,
+    )
 
 
 EXCESS_GD_TAIL_POWER = 1.0
@@ -1176,6 +1285,7 @@ def pair_diagnostics(
     gain_db: float,
     include_decay: bool = False,
     eq_options: EqOptions | None = None,
+    gd_baseline: str = "flat",
 ) -> dict[str, Any]:
     eq_options = eq_options or EqOptions(correction_range=context.band)
     grid_sum = context.sum_on_grid(first, second, polarity, delay_ms, gain_db)
@@ -1188,13 +1298,14 @@ def pair_diagnostics(
     full_sum, full_frequencies = context.sum_full(
         first, second, polarity, delay_ms, gain_db
     )
-    excess_score, excess_curve = excess_group_delay(
+    excess_score, excess_curve, excess_baseline_curve = excess_group_delay(
         full_sum,
         full_frequencies,
         context.frequencies,
         integration_range=eq_options.correction_range,
         native_resolution_hz=context.native_resolution_hz,
         ppo=context.ppo,
+        gd_baseline=gd_baseline,
     )
     filters, eq_grid, eq_metadata = fit_eq_filters(
         grid_sum,
@@ -1222,13 +1333,14 @@ def pair_diagnostics(
     eq_trend_wide = filters_response(context.trend_frequencies, context.sample_rate, filters)
     post_trend_wide_sum = trend_wide_sum * eq_trend_wide
     post_trend_db = broad_trend_db(db20(post_trend_wide_sum), context.ppo)[context.trend_slice]
-    post_excess_score, post_excess_curve = excess_group_delay(
+    post_excess_score, post_excess_curve, post_excess_baseline_curve = excess_group_delay(
         post_full,
         full_frequencies,
         context.frequencies,
         integration_range=eq_options.correction_range,
         native_resolution_hz=context.native_resolution_hz,
         ppo=context.ppo,
+        gd_baseline=gd_baseline,
     )
     dsp_target = eq_options.target == "dsp"
     result: dict[str, Any] = {
@@ -1292,9 +1404,11 @@ def pair_diagnostics(
                 "solo_first_db": db20(context.spectra[first]),
                 "solo_second_db": db20(context.spectra[second]),
                 "excess_curve_ms": excess_curve,
+                "excess_baseline_ms": excess_baseline_curve,
                 "post_eq_db": post_magnitude_db,
                 "post_eq_trend_db": post_trend_db,
                 "post_eq_excess_curve_ms": post_excess_curve,
+                "post_eq_excess_baseline_ms": post_excess_baseline_curve,
                 "eq_target_db": eq_metadata["effective_target_db"],
                 "eq_nominal_target_db": eq_metadata["nominal_target_db"],
                 "eq_authority": eq_metadata["eq_authority"],

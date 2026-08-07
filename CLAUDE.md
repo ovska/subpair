@@ -98,6 +98,19 @@ the real logic. Data flows strictly one-way through `.subpair-cache/`:
      excess group delay. This feeds every downstream consumer of the curve
      (`excess_gd_ms`/`excess_gd_tail_ms`, `_excess_gd_authority`,
      `gd_weighted_null_score`, the report's excess-GD plot) from one place.
+   - `excess_group_delay`'s `gd_baseline` argument (`SearchOptions.gd_baseline`,
+     CLI `--gd-baseline`, default `"flat"`) selects what "excess" is measured
+     from: `"flat"` removes a single weighted-median constant (the existing,
+     unchanged behaviour); `"monotonic"` instead removes a per-point baseline
+     from `_monotonic_gd_baseline` (weighted isotonic regression via PAVA,
+     `_isotonic_non_increasing`), constrained non-increasing in magnitude as
+     frequency rises, over the full band regardless of `integration_range`.
+     This is a deliberate, opt-in *acoustic* assumption (a genuine low-end GD
+     rise is normal; a bump anywhere the non-increasing fit can't explain
+     still counts in full, by construction) — unlike the resolution-based
+     smoothing above, it is not a measurement-reliability correction, changes
+     rankings, and is not the default. `excess_group_delay` returns
+     `(score, curve_ms, baseline_ms)`; every caller unpacks three values now.
    - `low_end_extension_hz`/`post_eq_low_end_extension_hz` (from
      `low_end_extension_hz()`) are a diagnostic-only, F3-style extension
      estimate reported in `search`/`report` tables. They are deliberately
