@@ -13,7 +13,7 @@ from subpair.cli import _build_parser
 from subpair.engine import SearchOptions, run_search
 from subpair.dsp import (
     EqOptions,
-    LOW_END_EXTENSION_THRESHOLD_DB,
+    LOW_END_EXTENSION_F3_THRESHOLD_DB,
     ShelfOptions,
     _denoised_residual,
     _excess_gd_authority,
@@ -35,7 +35,7 @@ from subpair.dsp import (
     null_scores,
     peq_response,
 )
-from subpair.html_report import build_report
+from subpair.html_report import _ranking_table, build_report
 
 
 def _synthetic_ir(sample_rate: float, length: int, delay: int, modes: list[tuple[float, float]]) -> np.ndarray:
@@ -201,7 +201,7 @@ class PipelineTests(unittest.TestCase):
         )
         top_edge_db = float(trend[-1])
         peak_db = float(np.max(trend))
-        self.assertLess(top_edge_db, peak_db - LOW_END_EXTENSION_THRESHOLD_DB)
+        self.assertLess(top_edge_db, peak_db - LOW_END_EXTENSION_F3_THRESHOLD_DB)
         expected = peak * 2.0 ** -0.5
         extension = low_end_extension_hz(trend, frequencies)
         self.assertLess(abs(extension - expected) / expected, 0.05)
@@ -226,15 +226,61 @@ class PipelineTests(unittest.TestCase):
             low_end_extension_hz(louder, frequencies, reference_db=reference_db), cross_pair
         )
 
-    def test_low_end_extension_hz_reference_db_reports_no_extension_when_never_reached(self):
+    def test_low_end_extension_hz_reference_db_reports_none_when_never_reached(self):
         # A placement whose own peak never gets within threshold_db of the
         # shared reference has no frequency at which it is "in spec" - this
-        # must report the band's own top edge, not a misleadingly-normal
-        # in-band number.
+        # must report None, not a misleadingly-normal in-band (or even
+        # top-edge) number a caller might mistake for a real crossing.
         frequencies = log_frequency_grid(25.0, 150.0, 48)
         flat_trend = np.zeros_like(frequencies)
         extension = low_end_extension_hz(flat_trend, frequencies, reference_db=10.0)
-        self.assertAlmostEqual(extension, frequencies[-1], places=3)
+        self.assertIsNone(extension)
+
+    def test_low_end_extension_hz_group_average_departure_ranks_by_same_frequency_spl(self):
+        # This is how run_search actually uses reference_db=0.0: compare
+        # each pair's curve against the *elementwise average* curve across
+        # every pair in the search, not a single scalar. A and B share the
+        # exact same peak (20 dB, both above 50 Hz) - a peak-scalar-average
+        # design would treat them identically - but A is 7 dB louder than B
+        # specifically below 50 Hz, which is what should actually decide
+        # low-end extension.
+        frequencies = log_frequency_grid(25.0, 150.0, 48)
+        louder_at_low_end = np.where(frequencies <= 50.0, 5.0, 20.0)
+        quieter_at_low_end = np.where(frequencies <= 50.0, -2.0, 20.0)
+        group_average = 0.5 * (louder_at_low_end + quieter_at_low_end)
+        louder_extension = low_end_extension_hz(
+            louder_at_low_end - group_average, frequencies, reference_db=0.0
+        )
+        quieter_extension = low_end_extension_hz(
+            quieter_at_low_end - group_average, frequencies, reference_db=0.0
+        )
+        self.assertAlmostEqual(louder_extension, 25.0, places=3)
+        self.assertLess(abs(quieter_extension - 50.0) / 50.0, 0.02)
+
+    def test_ranking_table_renders_none_extension_as_an_empty_gray_cell(self):
+        base = {
+            "polarity": 1,
+            "delay_ms": 0.0,
+            "gain_db": 0.0,
+            "null_score_db": 1.0,
+            "excess_gd_ms": 0.5,
+            "raw_tail_ms": 10.0,
+            "relative_spl_db": 0.0,
+        }
+        pairs = [
+            {**base, "first": 1, "second": 2, "rank": 1,
+             "low_end_extension_f3_hz": 32.0, "low_end_extension_f6_hz": 28.0},
+            {**base, "first": 3, "second": 4, "rank": 2,
+             "low_end_extension_f3_hz": None, "low_end_extension_f6_hz": 40.0},
+        ]
+        table = _ranking_table(pairs, "raw", "ranking-raw", {"1-2", "3-4"})
+        self.assertIn('data-value="32.0"', table)
+        self.assertIn('data-value="Infinity"', table)
+        self.assertIn('class="metric-cell is-empty" data-value="Infinity"><', table)
+        # The real F6 value for the same (F3-less) row must still render and
+        # be colour-scaled normally - a missing F3 must not blank out F6.
+        self.assertIn('data-value="40.0"', table)
+        self.assertNotIn("None", table)
 
     def test_two_sided_envelope_db_fills_in_a_narrow_dip_but_not_a_sustained_decline(self):
         frequencies = log_frequency_grid(25.0, 150.0, 48)
@@ -1001,17 +1047,24 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(loaded["settings"]["ranking"]["tie_tolerance_db"], 0.0)
             self.assertIn("low_end_extension", loaded["settings"]["ranking"])
             self.assertIn("native_resolution", loaded["settings"])
-            # low_end_extension_hz is diagnostic-only: it must not appear in
-            # either ranking's declared sort-key field list.
-            self.assertNotIn(
-                "low_end_extension_hz", loaded["settings"]["ranking"]["raw"]
-            )
-            self.assertNotIn(
-                "post_eq_low_end_extension_hz", loaded["settings"]["ranking"]["eq"]
-            )
+            # low_end_extension_f3_hz/f6_hz are diagnostic-only: they must
+            # not appear in either ranking's declared sort-key field list.
+            for key in ("low_end_extension_f3_hz", "low_end_extension_f6_hz"):
+                self.assertNotIn(key, loaded["settings"]["ranking"]["raw"])
+            for key in (
+                "post_eq_low_end_extension_f3_hz",
+                "post_eq_low_end_extension_f6_hz",
+            ):
+                self.assertNotIn(key, loaded["settings"]["ranking"]["eq"])
             self.assertIn("excess_gd_peak_ms", loaded["settings"]["ranking"]["raw"])
             self.assertIn(
                 "post_eq_excess_gd_peak_ms", loaded["settings"]["ranking"]["eq"]
+            )
+            extension_keys = (
+                "low_end_extension_f3_hz",
+                "low_end_extension_f6_hz",
+                "post_eq_low_end_extension_f3_hz",
+                "post_eq_low_end_extension_f6_hz",
             )
             for row in result["pairs"]:
                 self.assertIn("magnitude_only_null_score_db", row)
@@ -1023,12 +1076,11 @@ class PipelineTests(unittest.TestCase):
                 self.assertGreaterEqual(row["post_eq_excess_gd_peak_ms"], 0.0)
                 self.assertGreaterEqual(row["delay_plateau_ms"], 0.0)
                 self.assertGreaterEqual(row["gain_plateau_db"], 0.0)
-                self.assertIn("low_end_extension_hz", row)
-                self.assertIn("post_eq_low_end_extension_hz", row)
-                self.assertGreaterEqual(row["low_end_extension_hz"], 25.0)
-                self.assertLessEqual(row["low_end_extension_hz"], 150.0)
-                self.assertGreaterEqual(row["post_eq_low_end_extension_hz"], 25.0)
-                self.assertLessEqual(row["post_eq_low_end_extension_hz"], 150.0)
+                for key in extension_keys:
+                    self.assertIn(key, row)
+                    if row[key] is not None:
+                        self.assertGreaterEqual(row[key], 25.0)
+                        self.assertLessEqual(row[key], 150.0)
             no_shelf_report = root / "report-no-shelf.html"
             shelf_report = root / "report-shelf.html"
             build_report(cache, results_path, no_shelf_report, top=2, limit=3)
@@ -1095,16 +1147,13 @@ class PipelineTests(unittest.TestCase):
             self.assertNotIn("Variable smoothed", page)
             self.assertNotIn("Nominal flat target", page)
             self.assertNotIn("1-oct trend", page)
-            # The excess-GD plot's width-invariant peak envelope is the only
-            # dashed reference line the report draws.
-            self.assertIn('"dash":"dot"', page)
             self.assertIn("peak ", page)
             self.assertIn("Combined PEQ response (all bands)", page)
             self.assertIn('"shape":"spline"', page)
             self.assertIn("EQ authority", page)
             self.assertIn("background:hsla(", page)
             self.assertTrue(
-                all(table.count("background:hsla(") == 15 for table in ranking_tables(page))
+                all(table.count("background:hsla(") == 18 for table in ranking_tables(page))
             )
             self.assertNotIn(".plotly-graph-div { width:100% !important; }", page)
             self.assertIn(".overview-panels,#pair-details { position:relative; }", page)

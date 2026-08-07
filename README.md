@@ -201,58 +201,59 @@ stays within 0.5 dB of its optimum. A wide plateau is a forgiving setting;
 a narrow one is a razor's-edge optimum easily upset by real-world delay
 drift, temperature, or DSP quantization.
 
-Each pair also reports `low_end_extension_hz`/`post_eq_low_end_extension_hz`:
-an in-band, F3-style diagnostic giving the lowest frequency the broad
-trend's *envelope* holds up, scanning down from the envelope's own **peak**
-— wherever in the band it occurs — before permanently falling 3 dB below a
-**reference level** and not recovering. The scan always starts at the
-envelope's own peak, never the top-of-band sample specifically: a
-two-subwoofer sum is routinely bandpass-shaped (it rises out of the bottom
-of the band, peaks somewhere in the middle, and rolls off again toward
-crossover), and starting at the top edge is fragile in that ordinary case —
-a curve already declining well before the top edge could sit more than 3 dB
-below its own peak there, making the whole scan fail immediately regardless
-of how good the actual low end is. Starting at the envelope's own peak
-instead is unaffected by whatever happens *above* the peak (a separate,
-high-end/crossover concern), and is identical to the old top-anchored
-behaviour for an ordinary monotonically-rising passband. The envelope — the
-higher of the best level attained scanning up from the bottom of the band
-and the best level still attainable scanning down from the top — is used
-to find both the peak and the corner, deliberately not the raw trend: an
-isolated, recoverable notch is a placement defect the null score already
-measures on its own terms, so a response that is flat down to 25 Hz with
-one unrelated -5 dB notch at 100 Hz still reports ~25 Hz extension, not
-~100 Hz. A genuine, sustained rolloff is not masked this way — below the
-corner, the envelope still tracks the decline — so it is still reported
-close to where the raw trend actually crosses the threshold. Lower is more
+Each pair also reports `low_end_extension_f3_hz`/`low_end_extension_f6_hz`
+(and their `post_eq_` counterparts): in-band F3/F6-style diagnostics giving
+the lowest frequency each pair's broad trend's *envelope* holds up before
+permanently falling 3 dB (F3) or 6 dB (F6) below a **reference curve** and
+not recovering.
+
+The reference is the *elementwise average trend curve* across every pair in
+the same search — literally the mean of every candidate's trend, frequency
+by frequency (raw and EQ'd use their own separate average, computed once per
+search) — not a single scalar taken from any one pair. Each pair's curve is
+first expressed as its *departure* from that average (`this pair's trend
+minus the average trend`, one value per frequency), and the F3/F6 scan then
+looks for where that departure permanently falls below `-3`/`-6` dB. This
+makes the comparison genuinely apples-to-apples at every frequency, not just
+at one pair-specific reference point: since every candidate here was
+measured with the same speakers in the same room, absolute SPL relative to
+the search's own average is what should distinguish two pairs' low-end
+capability once rolloff shape is accounted for. The scan itself still starts
+at each pair's own best-relative-to-the-average point (found from the
+departure curve's own two-sided envelope peak, wherever it occurs) rather
+than a fixed frequency: a two-subwoofer sum is routinely bandpass-shaped (it
+rises out of the bottom of the band, peaks somewhere in the middle, and
+rolls off again toward crossover), so a pair whose passband merely peaks
+away from the top of the band isn't penalised for that alone. The envelope —
+the higher of the best level attained scanning up from the bottom of the
+band and the best level still attainable scanning down from the top — is
+used to find both that anchor point and the corner, deliberately not the raw
+trend: an isolated, recoverable notch is a placement defect the null score
+already measures on its own terms, so a response that is flat down to 25 Hz
+with one unrelated -5 dB notch at 100 Hz still reports ~25 Hz extension, not
+~100 Hz. A genuine, sustained rolloff is not masked this way. Lower is more
 extended. This is purely informational — it is shown in `subpair report`'s
 tables and printed by `subpair search`, but it is not a raw or EQ'd ranking
 key, so it never changes which placement wins; a placement's own
 null/excess-GD/tail severity always decides.
 
-The **reference level** the 3 dB drop is measured from is the *average*
-envelope peak found across every pair in the same search (raw and EQ'd use
-their own separate average, computed once per search) — not each pair's own
-peak. This makes extension genuinely cross-pair comparable: since we're
-comparing placements against the same speakers in the same room, the only
-thing that actually differs low-end capability between two candidates with
-similar rolloff shape is absolute SPL, so falling behind the group's
-typical output by more than 3 dB now costs extension even where a pair's
-own rolloff shape is perfectly fine. A pair whose own peak never gets
-within 3 dB of the average — a placement that is simply, categorically
-quieter than what a good candidate in this search can deliver — reports the
-band's own top edge (no meaningful extension by this comparison) rather
-than a shape-only number that would understate how much output it's
-actually giving up. Two earlier designs were tried and rejected: purely
-self-referential (each pair scored only against its own peak) makes
-extension numbers look nearly identical for two pairs with a genuine
-several-dB SPL difference and identical rolloff shape, which is exactly the
-comparison this metric exists to support; and anchoring to the single
-*loudest* pair's peak (rather than the average) made almost every other
-placement read as "too far below reference" purely because one placement
-happened to be exceptional. The scan position itself is unaffected by which
-reference is used — it always starts at each pair's own peak, for the same
-bandpass-shape reason described above.
+A pair whose departure from the average never gets within the threshold even
+at its own best point — a placement that is simply, categorically quieter
+than what a typical candidate in this search delivers, or one where
+measurement noise makes a real corner impossible to place with any
+confidence — reports **`null`** (rendered as an empty, gray cell in
+`subpair report` and `--` in `subpair search`'s printed table), not a
+misleading in-band or top-of-band number. Two earlier designs were tried and
+rejected: purely self-referential (each pair scored only against its own
+peak) makes extension numbers look nearly identical for two pairs with a
+genuine several-dB SPL difference and identical rolloff shape, which is
+exactly the comparison this metric exists to support; and comparing each
+pair only to a single scalar reference (either its own peak or the single
+loudest pair's peak) breaks down for a bandpass-shaped sum, since a pair
+whose *own* peak sits at a very different frequency than the reference
+pair's can be — and, on real placement searches, has been — louder at the
+low end while reading as *less* extended, purely because the comparison
+point wasn't at a matching frequency.
 
 For minimum phase, subpair uses the real-cepstrum form of the Hilbert
 transform on the *full available 0-to-Nyquist magnitude*, not a brick-wall
@@ -377,9 +378,9 @@ frequency-dependent bends expose excess storage without relying on visual
 estimation of the heatmap ridge. CSD figures are static to avoid accidental
 zooming or panning and appear before the separate excess-group-delay graph.
 
-The ranking table also shows a colour-rated, informational
-`low_end_extension_hz`/`post_eq_low_end_extension_hz` column (see above); it
-uses lower-is-better colouring but does not affect sorting or which pairs are
+The ranking table also shows colour-rated, informational F3/F6 columns (see
+above); they use lower-is-better colouring, render as an empty gray cell when
+no meaningful crossing exists, and do not affect sorting or which pairs are
 recommended.
 
 #### Low shelf

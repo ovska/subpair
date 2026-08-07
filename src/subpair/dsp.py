@@ -163,7 +163,8 @@ def null_scores(
     return np.max(dip, axis=-1)
 
 
-LOW_END_EXTENSION_THRESHOLD_DB = 3.0
+LOW_END_EXTENSION_F3_THRESHOLD_DB = 3.0
+LOW_END_EXTENSION_F6_THRESHOLD_DB = 6.0
 
 
 def _two_sided_envelope_db(trend_db: np.ndarray) -> np.ndarray:
@@ -188,39 +189,28 @@ def _two_sided_envelope_db(trend_db: np.ndarray) -> np.ndarray:
     return np.minimum(ascending, descending)
 
 
-def trend_envelope_peak_db(trend_db: np.ndarray) -> float:
-    """The two-sided envelope's own peak value - what ``low_end_extension_hz`` anchors to by default.
-
-    Exposed so callers that need to build a cross-pair reference for
-    ``low_end_extension_hz``'s ``reference_db`` (e.g. the average peak level
-    across every candidate in a search) can compute each candidate's own
-    peak the same way ``low_end_extension_hz`` would, without duplicating
-    ``_two_sided_envelope_db``'s logic.
-    """
-    return float(np.max(_two_sided_envelope_db(np.asarray(trend_db, dtype=np.float64))))
-
-
 def low_end_extension_hz(
     trend_db: np.ndarray,
     frequencies: np.ndarray,
-    threshold_db: float = LOW_END_EXTENSION_THRESHOLD_DB,
+    threshold_db: float = LOW_END_EXTENSION_F3_THRESHOLD_DB,
     reference_db: float | None = None,
-) -> float:
+) -> float | None:
     """Lowest frequency the broad trend holds up before permanently falling ``threshold_db`` below a reference.
 
-    An in-band, F3-style extension estimate, deliberately measuring the
-    *envelope* (``_two_sided_envelope_db``) rather than the raw trend: a
-    narrow, recoverable dip or null is a placement defect the null-score
-    metric already scores on its own terms, not a low-end-extension defect,
-    so it must not be able to drag the reported extension up to its own
-    frequency by itself the way scanning the raw trend would. A response
-    that is flat down to 25 Hz but has one isolated -5 dB notch at 100 Hz
-    still reports ~25 Hz extension, not ~100 Hz, because the envelope's
-    two-sided cummax sees past the notch on both sides. A *sustained*
-    rolloff is not treated this way: below the corner, only the low side of
-    the envelope keeps tracking the decline (the high side has nothing left
-    to see past), so the envelope decline still lands close to where the
-    raw trend actually crosses the threshold.
+    An F3/F6-style extension estimate (``threshold_db`` selects which one -
+    ``LOW_END_EXTENSION_F3_THRESHOLD_DB``/``LOW_END_EXTENSION_F6_THRESHOLD_DB``),
+    deliberately measuring the *envelope* (``_two_sided_envelope_db``) rather
+    than the raw trend: a narrow, recoverable dip or null is a placement
+    defect the null-score metric already scores on its own terms, not a
+    low-end-extension defect, so it must not be able to drag the reported
+    extension up to its own frequency by itself the way scanning the raw
+    trend would. A curve that is flat down to 25 Hz but has one isolated
+    -5 dB notch at 100 Hz still reports ~25 Hz extension, not ~100 Hz,
+    because the envelope's two-sided cummax sees past the notch on both
+    sides. A *sustained* rolloff is not treated this way: below the corner,
+    only the low side of the envelope keeps tracking the decline (the high
+    side has nothing left to see past), so the envelope decline still lands
+    close to where the raw curve actually crosses the threshold.
 
     The scan always starts at the envelope's own *peak*, wherever in the
     band it occurs - not the value at the top of the band. A two-subwoofer
@@ -243,44 +233,47 @@ def low_end_extension_hz(
     this is identical to scanning down from the top edge, so ordinary
     single-corner responses are scored exactly as before.
 
-    ``reference_db`` sets what level the ``threshold_db`` drop is measured
-    from. Leaving it ``None`` (the default) uses the envelope's own peak
-    value, making the metric fully self-referential: it answers "how far
-    does this placement's own low end extend relative to its own
-    best-supported level," regardless of how that level compares to any
-    other placement. Passing a shared value - e.g. the *average* peak level
-    across every candidate in the same search - instead answers "how far
-    does this placement's low end extend before falling behind what a
-    typical good placement here can deliver," which is genuinely comparable
-    placement to placement, because it is now anchored to one external,
-    shared level rather than each curve's own peak. The scan position itself
-    still starts at this placement's *own* peak regardless of which
-    reference is used (see above for why); only the level the threshold is
-    measured from changes. A placement whose own peak already falls more
-    than ``threshold_db`` below a shared reference legitimately has no
-    frequency at which it is within spec of that reference, so it reports
-    the band's own upper edge (its low end effectively "does not extend" by
-    this comparison) rather than a number that would misleadingly suggest
-    otherwise. Using the *average* rather than the single loudest candidate
-    as the shared reference was a deliberate choice: anchoring to the
-    loudest candidate specifically made almost every other placement's own
-    peak read as "too far below reference" purely because one placement
-    happened to be exceptional, which is a much less informative comparison
-    than "better or worse than typical."
+    ``trend_db`` need not be an absolute level. ``reference_db`` sets what
+    level the ``threshold_db`` drop is measured from:
+
+    - Leaving ``reference_db`` ``None`` uses the envelope's own peak value,
+      making the metric fully self-referential: "how far does this
+      placement's own low end extend relative to its own best-supported
+      level," regardless of how that level compares to any other placement.
+    - Passing ``trend_db - group_average_curve`` (an elementwise difference
+      against the average curve across every candidate in a search, one
+      value per frequency, i.e. compute the subtraction *before* calling
+      this function) together with ``reference_db=0.0`` answers a genuinely
+      cross-pair-comparable question instead: "how far does this
+      placement's low end extend before falling behind what a *typical*
+      placement here delivers at that same frequency." The scan position
+      still starts at this placement's own best-relative-to-the-group point
+      (found from the departure curve's own envelope, for the bandpass-shape
+      reason above), but the threshold itself no longer depends on where
+      that point is or how high it is - it is fixed at "0 dB departure from
+      the group," so a placement that is uniformly quieter than the group
+      everywhere, not just at one frequency, cannot hide that by
+      construction. This is deliberately not anchored to the single
+      *loudest* candidate: that made almost every other placement read as
+      "too far below reference" purely because one placement happened to be
+      exceptional, which is a much less informative comparison than "better
+      or worse than typical."
+
+    A placement whose own peak (of whatever curve was passed) already falls
+    more than ``threshold_db`` below the reference legitimately has no
+    frequency at which it is within spec, so this returns ``None`` - not a
+    number, since any Hz value would misleadingly suggest a real crossing
+    point exists. Report/CLI consumers should render that as an empty/blank
+    cell, not a number.
 
     Scanning downward from the peak, this returns the highest frequency at
     which the *running minimum* of the envelope first falls ``threshold_db``
-    below the reference and does not recover. This is purely diagnostic -
-    it is not part of the raw or EQ'd ranking key - so a placement's own
-    null/excess-GD/tail severity always decides the winner; it only
-    summarizes how far down the winning (or any) placement's underlying
-    passband shape reaches.
-
-    Reports the band's own lower edge when the envelope never drops by
-    ``threshold_db`` below the reference anywhere at or below the peak
-    (fully extended through the analyzed range), and the band's own upper
-    edge when it never gets *within* ``threshold_db`` of the reference even
-    at the peak (no meaningful extension by this comparison).
+    below the reference and does not recover, or the band's own lower edge
+    if it never does (fully extended through the analyzed range). This is
+    purely diagnostic - it is not part of the raw or EQ'd ranking key - so a
+    placement's own null/excess-GD/tail severity always decides the winner;
+    it only summarizes how far down the winning (or any) placement's
+    underlying passband shape reaches.
     """
     frequencies = np.asarray(frequencies, dtype=np.float64)
     trend_db = np.asarray(trend_db, dtype=np.float64)
@@ -294,7 +287,7 @@ def low_end_extension_hz(
     running_min_from_peak = np.minimum.accumulate(segment[::-1])[::-1]
     meets_threshold = running_min_from_peak >= threshold
     if not np.any(meets_threshold):
-        return float(frequencies[-1])
+        return None
     return float(frequencies[np.argmax(meets_threshold)])
 
 
@@ -1462,7 +1455,19 @@ def pair_diagnostics(
         ),
         "raw_tail_ms": float(np.max(raw_tail_by_band)),
         "raw_tail_by_band_ms": [round(float(value), 6) for value in raw_tail_by_band],
-        "low_end_extension_hz": low_end_extension_hz(trend_db, context.frequencies),
+        # Self-referential (own-peak) defaults, overwritten by run_search's
+        # search-wide second pass with the group-average-referenced version
+        # actually used in reports; kept here so pair_diagnostics() alone
+        # still returns complete, sensible diagnostics for callers that
+        # don't go through run_search (a self-referential value is always a
+        # real number - see low_end_extension_hz's docstring - so these are
+        # never None).
+        "low_end_extension_f3_hz": low_end_extension_hz(
+            trend_db, context.frequencies, threshold_db=LOW_END_EXTENSION_F3_THRESHOLD_DB
+        ),
+        "low_end_extension_f6_hz": low_end_extension_hz(
+            trend_db, context.frequencies, threshold_db=LOW_END_EXTENSION_F6_THRESHOLD_DB
+        ),
         "post_eq_null_score_db": gd_weighted_null_score(
             post_magnitude_db,
             post_trend_db,
@@ -1482,7 +1487,12 @@ def pair_diagnostics(
         ),
         "post_eq_tail_ms": float(np.max(tail_by_band)),
         "tail_by_band_ms": [round(float(value), 6) for value in tail_by_band],
-        "post_eq_low_end_extension_hz": low_end_extension_hz(post_trend_db, context.frequencies),
+        "post_eq_low_end_extension_f3_hz": low_end_extension_hz(
+            post_trend_db, context.frequencies, threshold_db=LOW_END_EXTENSION_F3_THRESHOLD_DB
+        ),
+        "post_eq_low_end_extension_f6_hz": low_end_extension_hz(
+            post_trend_db, context.frequencies, threshold_db=LOW_END_EXTENSION_F6_THRESHOLD_DB
+        ),
         "filters": filters,
         "eq_target": eq_metadata["target"],
         "eq_target_level_db": float(eq_metadata["target_level_db"]),
