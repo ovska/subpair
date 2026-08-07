@@ -10,14 +10,13 @@ import numpy as np
 
 from subpair.cache import CacheError, write_cache
 from subpair.cli import _build_parser
-from subpair.engine import SearchOptions, _shared_low_end_reference_db, run_search
+from subpair.engine import SearchOptions, run_search
 from subpair.dsp import (
     EqOptions,
-    LOW_END_EXTENSION_F3_THRESHOLD_DB,
+    EXCURSION_POWER_DB_PER_OCTAVE,
     _denoised_residual,
     _excess_gd_authority,
     _smooth_by_variable_octaves,
-    _two_sided_envelope_db,
     db20,
     excess_gd_peak_ms,
     excess_gd_tail_ms,
@@ -26,7 +25,7 @@ from subpair.dsp import (
     gd_smoothing_octaves,
     gd_weighted_null_score,
     log_frequency_grid,
-    low_end_extension_hz,
+    low_end_power_db,
     low_shelf_response,
     null_scores,
     peq_response,
@@ -286,130 +285,66 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("automatically fitted EQ band", text)
         self.assertNotIn("No filters fitted", text)
 
-    def test_low_end_extension_hz_reports_band_edge_when_fully_extended(self):
-        frequencies = log_frequency_grid(25.0, 150.0, 48)
-        flat_trend = np.zeros_like(frequencies)
-        self.assertAlmostEqual(low_end_extension_hz(flat_trend, frequencies), 25.0, places=3)
+    def test_low_end_power_keeps_a_flat_response_at_its_level(self):
+        frequencies = log_frequency_grid(20.0, 150.0, 48)
+        trend = np.full_like(frequencies, 7.5)
+        self.assertAlmostEqual(low_end_power_db(trend, frequencies), 7.5)
 
-    def test_low_end_extension_hz_matches_a_known_rolloff_corner(self):
-        frequencies = log_frequency_grid(25.0, 150.0, 48)
-        corner = 60.0
-        # Flat above the corner, -6 dB/octave below it: the -3 dB point is
-        # exactly half an octave below the corner.
-        trend = np.where(
-            frequencies >= corner, 0.0, -6.0 * np.log2(corner / frequencies)
+    def test_low_end_power_weights_lower_output_more_than_higher_output(self):
+        frequencies = log_frequency_grid(20.0, 100.0, 48)
+        flat = np.zeros_like(frequencies)
+        low_boost = flat + np.where(frequencies <= 40.0, 3.0, 0.0)
+        high_boost = flat + np.where(frequencies >= 60.0, 3.0, 0.0)
+        self.assertGreater(
+            low_end_power_db(low_boost, frequencies),
+            low_end_power_db(high_boost, frequencies),
         )
-        expected = corner * 2.0 ** -0.5
-        self.assertLess(abs(low_end_extension_hz(trend, frequencies) - expected) / expected, 0.05)
+        self.assertAlmostEqual(EXCURSION_POWER_DB_PER_OCTAVE, 12.0412, places=3)
 
-    def test_shared_low_end_reference_rewards_absolute_output(self):
-        frequencies = log_frequency_grid(25.0, 150.0, 48)
-        corner = 60.0
-        loud = np.where(
-            frequencies >= corner,
+    def test_low_end_power_is_continuous_in_response_level(self):
+        frequencies = log_frequency_grid(20.0, 150.0, 48)
+        rolloff = np.where(
+            frequencies >= 45.0,
             0.0,
-            -6.0 * np.log2(corner / frequencies),
+            -12.0 * np.log2(45.0 / frequencies),
         )
-        quiet = loud - 4.0
-
-        loud_f6 = low_end_extension_hz(
-            loud, frequencies, threshold_db=6.0, reference_level_db=0.0
-        )
-        quiet_f6 = low_end_extension_hz(
-            quiet, frequencies, threshold_db=6.0, reference_level_db=0.0
-        )
-        self.assertIsNotNone(loud_f6)
-        self.assertIsNotNone(quiet_f6)
-        self.assertLess(loud_f6, quiet_f6)
-        # The quieter response never gets within 3 dB of the shared level,
-        # so reporting a made-up F3 frequency would be misleading.
-        self.assertIsNone(
-            low_end_extension_hz(
-                quiet, frequencies, threshold_db=3.0, reference_level_db=0.0
-            )
+        louder = rolloff + 0.35
+        self.assertAlmostEqual(
+            low_end_power_db(louder, frequencies)
+            - low_end_power_db(rolloff, frequencies),
+            0.35,
+            places=6,
         )
 
-    def test_shared_low_end_reference_uses_mean_output_through_100_hz(self):
-        frequencies = np.array([20.0, 40.0, 80.0, 160.0])
-        extended = np.zeros_like(frequencies)
-        high_frequency_peak = np.array([-4.0, -4.0, -4.0, 30.0])
-        reference, reference_range = _shared_low_end_reference_db(
-            [extended, high_frequency_peak], frequencies
+    def test_low_end_power_removes_positive_relative_gain_headroom(self):
+        frequencies = log_frequency_grid(20.0, 150.0, 48)
+        baseline = np.zeros_like(frequencies)
+        # +6 dB in the whole summed response bought with +6 dB on the hotter
+        # driver has no equal-maximum-drive advantage.
+        self.assertAlmostEqual(
+            low_end_power_db(baseline + 6.0, frequencies, max_drive_gain_db=6.0),
+            low_end_power_db(baseline, frequencies),
+            places=6,
         )
-        self.assertAlmostEqual(reference, 0.0)
-        self.assertEqual(reference_range, (20.0, 80.0))
-
-    def test_low_end_extension_hz_ignores_an_isolated_recoverable_notch(self):
-        # A notch is a placement defect the null score already measures on
-        # its own terms; it must not by itself read as a loss of low-end
-        # extension when the response is otherwise flat well past it.
-        frequencies = log_frequency_grid(25.0, 150.0, 48)
-        trend = np.zeros_like(frequencies)
-        dip_index = int(np.argmin(np.abs(frequencies - 100.0)))
-        trend[dip_index - 1 : dip_index + 2] = -5.0  # isolated notch, recovers to 0 on both sides
-        self.assertAlmostEqual(low_end_extension_hz(trend, frequencies), 25.0, places=3)
-
-    def test_low_end_extension_hz_flat_to_25hz_with_a_100hz_notch_is_not_100hz(self):
-        # The motivating case: flat response down to the band edge with one
-        # unrelated notch well above it must report full extension, not the
-        # notch's own frequency.
-        frequencies = log_frequency_grid(25.0, 150.0, 48)
-        trend = np.zeros_like(frequencies)
-        notch_index = int(np.argmin(np.abs(frequencies - 100.0)))
-        trend[notch_index - 1 : notch_index + 2] = -5.0
-        extension = low_end_extension_hz(trend, frequencies)
-        self.assertLess(extension, 30.0)
-        self.assertLess(extension, frequencies[notch_index] - 20.0)
-
-    def test_low_end_extension_hz_still_finds_a_sustained_rolloff_past_a_notch(self):
-        # A genuine, sustained rolloff below a notch must still be found:
-        # the envelope must not blind the scan to a real corner just
-        # because an unrelated notch sits above it.
-        frequencies = log_frequency_grid(25.0, 150.0, 48)
-        corner = 60.0
-        trend = np.where(frequencies >= corner, 0.0, -6.0 * np.log2(corner / frequencies))
-        notch_index = int(np.argmin(np.abs(frequencies - 120.0)))
-        trend[notch_index - 1 : notch_index + 2] -= 5.0
-        expected = corner * 2.0 ** -0.5
-        extension = low_end_extension_hz(trend, frequencies)
-        self.assertLess(abs(extension - expected) / expected, 0.05)
-
-    def test_low_end_extension_hz_still_finds_a_permanent_rolloff(self):
-        # Unlike a notch, a sustained drop that never recovers is the
-        # genuine extension limit and must still be reported close to where
-        # it happens, not smoothed away by the envelope.
-        frequencies = log_frequency_grid(25.0, 150.0, 48)
-        trend = np.where(frequencies < 140.0, -10.0, 0.0)
-        extension = low_end_extension_hz(trend, frequencies)
-        self.assertLess(abs(extension - 140.0) / 140.0, 0.05)
-
-    def test_low_end_extension_hz_anchors_to_a_mid_band_peak_not_the_top_edge(self):
-        # A two-subwoofer sum is routinely bandpass-shaped: it peaks well
-        # below the top of the band and rolls off on both sides. Anchoring
-        # to the top-of-band sample specifically (an earlier version of this
-        # metric) would already be more than the 3 dB threshold below the
-        # real peak here, collapsing the whole scan to "no extension"
-        # (150.0) despite a perfectly good, well-extended low end. Anchoring
-        # to the envelope's own peak must find the real corner instead.
-        frequencies = log_frequency_grid(25.0, 150.0, 48)
-        peak = 60.0
-        # Rises 6 dB/octave below the peak, falls 3 dB/octave above it (a
-        # gentler upper slope, like a natural crossover rolloff) - the top
-        # edge (150 Hz) ends up ~4.4 dB below the peak, comfortably past the
-        # default 3 dB threshold.
-        trend = np.where(
-            frequencies <= peak,
-            -6.0 * np.log2(peak / frequencies),
-            -3.0 * np.log2(frequencies / peak),
+        # Attenuating the second driver leaves the first driver as the 0 dB
+        # constraint and therefore needs no additional headroom deduction.
+        self.assertAlmostEqual(
+            low_end_power_db(baseline, frequencies, max_drive_gain_db=-6.0),
+            low_end_power_db(baseline, frequencies),
+            places=6,
         )
-        top_edge_db = float(trend[-1])
-        peak_db = float(np.max(trend))
-        self.assertLess(top_edge_db, peak_db - LOW_END_EXTENSION_F3_THRESHOLD_DB)
-        expected = peak * 2.0 ** -0.5
-        extension = low_end_extension_hz(trend, frequencies)
-        self.assertLess(abs(extension - expected) / expected, 0.05)
 
-    def test_ranking_table_renders_none_extension_as_an_empty_gray_cell(self):
+    def test_low_end_power_ignores_response_above_100_hz(self):
+        frequencies = log_frequency_grid(20.0, 200.0, 48)
+        baseline = np.zeros_like(frequencies)
+        high_peak = np.where(frequencies > 100.0, 30.0, 0.0)
+        self.assertAlmostEqual(
+            low_end_power_db(high_peak, frequencies),
+            low_end_power_db(baseline, frequencies),
+            places=6,
+        )
+
+    def test_ranking_table_renders_relative_low_end_power(self):
         base = {
             "polarity": 1,
             "delay_ms": 0.0,
@@ -421,30 +356,15 @@ class PipelineTests(unittest.TestCase):
         }
         pairs = [
             {**base, "first": 1, "second": 2, "rank": 1,
-             "low_end_extension_f3_hz": 32.0, "low_end_extension_f6_hz": 28.0},
+             "relative_low_end_power_db": 1.25},
             {**base, "first": 3, "second": 4, "rank": 2,
-             "low_end_extension_f3_hz": None, "low_end_extension_f6_hz": 40.0},
+             "relative_low_end_power_db": -2.5},
         ]
         table = _ranking_table(pairs, "raw", "ranking-raw", {"1-2", "3-4"})
-        self.assertIn('data-value="32.0"', table)
-        self.assertIn('data-value="Infinity"', table)
-        self.assertIn('class="metric-cell is-empty" data-value="Infinity"><', table)
-        # The real F6 value for the same (F3-less) row must still render and
-        # be colour-scaled normally - a missing F3 must not blank out F6.
-        self.assertIn('data-value="40.0"', table)
-        self.assertNotIn("None", table)
-
-    def test_two_sided_envelope_db_fills_in_a_narrow_dip_but_not_a_sustained_decline(self):
-        frequencies = log_frequency_grid(25.0, 150.0, 48)
-        notch = np.zeros_like(frequencies)
-        notch_index = int(np.argmin(np.abs(frequencies - 100.0)))
-        notch[notch_index - 1 : notch_index + 2] = -5.0
-        envelope = _two_sided_envelope_db(notch)
-        self.assertAlmostEqual(float(envelope[notch_index]), 0.0, places=6)
-
-        decline = np.where(frequencies < 60.0, -10.0, 0.0)
-        envelope = _two_sided_envelope_db(decline)
-        np.testing.assert_allclose(envelope, decline)
+        self.assertIn("Low-end power (dB)", table)
+        self.assertIn('data-value="1.25"', table)
+        self.assertIn(">+1.25</td>", table)
+        self.assertIn('data-value="-2.5"', table)
 
     def test_banded_sort_key_is_identity_when_tolerance_is_zero(self):
         from subpair.engine import _banded_sort_key
@@ -1090,34 +1010,32 @@ class PipelineTests(unittest.TestCase):
                 "raw, unsmoothed",
             )
             self.assertEqual(loaded["settings"]["ranking"]["tie_tolerance_db"], 0.0)
-            self.assertIn("low_end_extension", loaded["settings"]["ranking"])
-            extension_reference = loaded["settings"]["ranking"][
-                "low_end_extension_reference_db"
-            ]
-            self.assertIn("raw", extension_reference)
-            self.assertIn("post_eq", extension_reference)
-            self.assertIn("range_hz", extension_reference)
-            self.assertTrue(np.isfinite(extension_reference["raw"]))
-            self.assertTrue(np.isfinite(extension_reference["post_eq"]))
+            low_end_settings = loaded["settings"]["ranking"]["low_end_power"]
+            self.assertIn("fields", low_end_settings)
+            self.assertEqual(low_end_settings["range_hz"][0], 25.0)
+            self.assertLessEqual(low_end_settings["range_hz"][1], 100.0)
+            self.assertAlmostEqual(
+                low_end_settings["amplifier_power_weight_db_per_octave"],
+                EXCURSION_POWER_DB_PER_OCTAVE,
+            )
             self.assertIn("native_resolution", loaded["settings"])
-            # low_end_extension_f3_hz/f6_hz are diagnostic-only: they must
-            # not appear in either ranking's declared sort-key field list.
-            for key in ("low_end_extension_f3_hz", "low_end_extension_f6_hz"):
-                self.assertNotIn(key, loaded["settings"]["ranking"]["raw"])
-            for key in (
-                "post_eq_low_end_extension_f3_hz",
-                "post_eq_low_end_extension_f6_hz",
-            ):
-                self.assertNotIn(key, loaded["settings"]["ranking"]["eq"])
+            # Low-end power is diagnostic-only: it must not appear in either
+            # ranking's declared sort-key field list.
+            self.assertNotIn(
+                "low_end_power_db", loaded["settings"]["ranking"]["raw"]
+            )
+            self.assertNotIn(
+                "post_eq_low_end_power_db", loaded["settings"]["ranking"]["eq"]
+            )
             self.assertIn("excess_gd_peak_ms", loaded["settings"]["ranking"]["raw"])
             self.assertIn(
                 "post_eq_excess_gd_peak_ms", loaded["settings"]["ranking"]["eq"]
             )
-            extension_keys = (
-                "low_end_extension_f3_hz",
-                "low_end_extension_f6_hz",
-                "post_eq_low_end_extension_f3_hz",
-                "post_eq_low_end_extension_f6_hz",
+            low_end_power_keys = (
+                "low_end_power_db",
+                "relative_low_end_power_db",
+                "post_eq_low_end_power_db",
+                "post_eq_relative_low_end_power_db",
             )
             for row in result["pairs"]:
                 self.assertIn("magnitude_only_null_score_db", row)
@@ -1129,11 +1047,18 @@ class PipelineTests(unittest.TestCase):
                 self.assertGreaterEqual(row["post_eq_excess_gd_peak_ms"], 0.0)
                 self.assertGreaterEqual(row["delay_plateau_ms"], 0.0)
                 self.assertGreaterEqual(row["gain_plateau_db"], 0.0)
-                for key in extension_keys:
+                for key in low_end_power_keys:
                     self.assertIn(key, row)
-                    if row[key] is not None:
-                        self.assertGreaterEqual(row[key], 25.0)
-                        self.assertLessEqual(row[key], 150.0)
+                    self.assertTrue(np.isfinite(row[key]))
+                self.assertAlmostEqual(
+                    row["drive_headroom_db"], max(0.0, row["gain_db"])
+                )
+                self.assertGreaterEqual(
+                    row["post_eq_drive_headroom_db"], row["drive_headroom_db"]
+                )
+            self.assertAlmostEqual(result["pairs"][0]["relative_low_end_power_db"], 0.0)
+            eq_first = min(result["pairs"], key=lambda row: row["eq_rank"])
+            self.assertAlmostEqual(eq_first["post_eq_relative_low_end_power_db"], 0.0)
             self.assertEqual(
                 result["settings"]["eq"]["shelf"],
                 {
@@ -1239,14 +1164,7 @@ class PipelineTests(unittest.TestCase):
             visible_eq_pairs = sorted(
                 result["pairs"], key=lambda row: row["eq_rank"]
             )[:3]
-            expected_colored_metrics = 4 * len(visible_eq_pairs) + sum(
-                row[key] is not None
-                for row in visible_eq_pairs
-                for key in (
-                    "post_eq_low_end_extension_f3_hz",
-                    "post_eq_low_end_extension_f6_hz",
-                )
-            )
+            expected_colored_metrics = 5 * len(visible_eq_pairs)
             self.assertTrue(
                 all(
                     table.count("background:hsla(") == expected_colored_metrics
@@ -1261,7 +1179,7 @@ class PipelineTests(unittest.TestCase):
             self.assertNotIn("Plotly.relayout(plot,{autosize:true})", page)
             self.assertNotIn("function revealPlots", page)
             self.assertNotIn("window.dispatchEvent(new Event('resize'))", page)
-            self.assertIn("Extension", page)
+            self.assertIn("Low-end power", page)
             self.assertIn("not part of the recommendation ranking", page)
             self.assertIn("Fitted EQ filters", page)
             self.assertIn("Post-EQ excess GD", page)

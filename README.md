@@ -185,34 +185,38 @@ stays within 0.5 dB of its optimum. A wide plateau is a forgiving setting;
 a narrow one is a razor's-edge optimum easily upset by real-world delay
 drift, temperature, or DSP quantization.
 
-Each pair also reports `low_end_extension_f3_hz`/`low_end_extension_f6_hz`
-(and their `post_eq_` counterparts): in-band F3/F6-style diagnostics giving
-the lowest frequency each pair's broad-trend *envelope* reaches 3 dB (F3)
-or 6 dB (F6) below one shared absolute reference. Raw and post-EQ results
-use separate references, each equal to the strongest candidate's mean
-broad-trend power over the analyzed range through 100 Hz (or the whole band
-if it starts above 100 Hz). The log-frequency grid weights each octave
-equally. Because the solo measurements share a common drive level, this makes
-usable acoustic output part of extension: a pair that is quieter throughout
-the low end cannot earn a better F3/F6 just because its response was
-normalized to its own lower peak.
+Each pair also reports `low_end_power_db`/`relative_low_end_power_db` (and
+their `post_eq_` counterparts). This continuous diagnostic replaces F3/F6.
+It energy-averages the one-octave broad response over the analyzed range
+through 100 Hz, but weights every frequency by the approximate amplifier and
+excursion cost of producing pressure there.
 
-The reference is a single level, not an average or elementwise-best response
-curve or a single modal maximum. A reference *curve* inherits the subwoofers'
-own frequency-dependent rolloff and can therefore hide it; one maximum can
-overstate the nominal passband level. The mean-power scalar has neither
-problem. The envelope — the higher of the best level attained scanning up from
-the bottom of the band and the best level still attainable scanning down
-from the top — is used instead of the raw trend for the crossing. An
-isolated, recoverable notch is a placement defect already measured by the
-null score, so it cannot masquerade as a loss of extension, while a genuine
-sustained rolloff is still found normally. If a pair never reaches the
-shared F3 or F6 level anywhere in the band, that value is blank rather than
-an invented frequency. Lower is more extended.
+In the pistonic region, acoustic pressure is proportional to frequency
+squared times cone displacement. Holding pressure constant one octave lower
+therefore takes four times the displacement and, with the simple
+voltage-proportional-to-displacement model available without driver data,
+about sixteen times the amplifier power. Low-end power applies that `f^-4`
+weight (+12.04 dB per octave downward) on the log-frequency grid. A response
+that stays loud deep into its roll-off earns more than one which has the same
+ordinary mean SPL only higher in the band, without the discontinuities of a
+single -3 or -6 dB threshold crossing.
 
-F3/F6 remain informational: they are shown in `subpair report` and printed
-by `subpair search`, but they are not raw or EQ'd recommendation keys. The
-null/excess-GD/tail tuple still decides the ranking.
+The searched gain is also included in the equal-drive comparison. The first
+sub is at 0 dB and the second receives the reported relative gain; if that
+gain is positive, it is subtracted from the complete sum's low-end score.
+For the post-EQ score, the fitted EQ response's largest boost is subtracted as
+well. The hottest driver is consequently at 0 dB for every pair, swapping
+which sub is called first cannot create output headroom, and EQ boost cannot
+manufacture equal-drive capability. Exact electrical watts or cone excursion
+would require driver impedance, motor, enclosure, limiter, and built-in DSP
+transfer data which an acoustic REW impulse response does not contain, so
+this is deliberately an excursion-cost proxy rather than a claim of absolute
+output capability.
+
+The relative raw and post-EQ values each reference rank 1 in their own
+ranking; higher is better. Low-end power remains informational: it is shown
+in `subpair report` and printed by `subpair search`, but is not a raw or EQ'd
+recommendation key. The null/excess-GD/tail tuple still decides the ranking.
 
 For minimum phase, subpair uses the real-cepstrum form of the Hilbert
 transform on the *full available 0-to-Nyquist magnitude*, not a brick-wall
@@ -331,7 +335,10 @@ Slope ...` line and is included in every post-EQ plot and score.
 
 Relative SPL is reported, not ranked. It is the energy-mean in-band SPL at the
 searched gain settings (gains are referenced to an equal 1 kHz electrical
-drive). Raw and EQ'd modes each reference their own rank 1.
+drive). Raw and EQ'd modes each reference their own rank 1. Unlike low-end
+power, it intentionally does not remove positive relative gain: the two
+columns respectively show ordinary level at the searched settings and
+low-frequency capability at equal maximum driver drive.
 
 ### `subpair report`
 
@@ -363,10 +370,9 @@ frequency-dependent bends expose excess storage without relying on visual
 estimation of the heatmap ridge. CSD figures are static to avoid accidental
 zooming or panning and appear before the separate excess-group-delay graph.
 
-The ranking table also shows colour-rated, informational shared-reference
-F3/F6 columns (see above); they use lower-is-better colouring, render as an
-empty gray cell when a pair never reaches the threshold, and do not affect
-sorting or which pairs are recommended.
+The ranking table also shows the colour-rated, informational low-end-power
+column described above. It uses higher-is-better colouring and does not
+affect the recommendation order.
 
 ### `subpair verify`
 

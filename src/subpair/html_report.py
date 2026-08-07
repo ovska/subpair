@@ -520,8 +520,9 @@ def _ranking_table(
     null_key = "post_eq_null_score_db" if eq else "null_score_db"
     excess_key = "post_eq_excess_gd_ms" if eq else "excess_gd_ms"
     tail_key = "post_eq_tail_ms" if eq else "raw_tail_ms"
-    f3_key = "post_eq_low_end_extension_f3_hz" if eq else "low_end_extension_f3_hz"
-    f6_key = "post_eq_low_end_extension_f6_hz" if eq else "low_end_extension_f6_hz"
+    low_end_power_key = (
+        "post_eq_relative_low_end_power_db" if eq else "relative_low_end_power_db"
+    )
     spl_key = "post_eq_relative_spl_db" if eq else "relative_spl_db"
     columns = [
         (rank_key, "Rank", "number"),
@@ -532,8 +533,7 @@ def _ranking_table(
         (null_key, "Worst null (dB)", "number"),
         (excess_key, "Excess GD (ms)", "number"),
         (tail_key, "Tail (ms)", "number"),
-        (f3_key, "F3 (Hz)", "number"),
-        (f6_key, "F6 (Hz)", "number"),
+        (low_end_power_key, "Low-end power (dB)", "number"),
         (spl_key, "Relative SPL (dB)", "number"),
     ]
     heading = '<th class="selection-heading">Show</th>' + "".join(
@@ -545,14 +545,11 @@ def _ranking_table(
         null_key: "low",
         excess_key: "low",
         tail_key: "low",
-        f3_key: "low",
-        f6_key: "low",
+        low_end_power_key: "high",
         spl_key: "high",
     }
-    # F3/F6 (and any other future metric) may be None when a pair never
-    # reaches the shared absolute threshold. Exclude missing values from the
-    # colour-scaled range entirely rather than coercing them to a number, so
-    # one None cannot skew "best"/"worst" for real crossings.
+    # Keep missing future metrics out of the colour-scaled range rather than
+    # coercing them to numbers that could skew the best/worst endpoints.
     metric_ranges: dict[str, tuple[float, float]] = {}
     for key in metric_directions:
         numeric = [float(pair[key]) for pair in pairs if pair[key] is not None]
@@ -577,16 +574,6 @@ def _ranking_table(
     for pair in pairs:
         key_value = f"{int(pair['first'])}-{int(pair['second'])}"
 
-        def format_optional_hz(key: str) -> tuple[str, str]:
-            value = pair[key]
-            # "Infinity" sorts a missing value to the worst end of the
-            # column regardless of sort direction (JS's Number("Infinity")
-            # parses cleanly); the empty display string renders as a blank,
-            # visually gray cell via the "is-empty" class below.
-            if value is None:
-                return "", "Infinity"
-            return f"{value:.1f}", str(value)
-
         values: dict[str, tuple[str, str]] = {
             rank_key: (str(pair[rank_key]), str(pair[rank_key])),
             "pair": (
@@ -599,8 +586,10 @@ def _ranking_table(
             null_key: (f"{pair[null_key]:.3f}", str(pair[null_key])),
             excess_key: (f"{pair[excess_key]:.3f}", str(pair[excess_key])),
             tail_key: (f"{pair[tail_key]:.1f}", str(pair[tail_key])),
-            f3_key: format_optional_hz(f3_key),
-            f6_key: format_optional_hz(f6_key),
+            low_end_power_key: (
+                f"{pair[low_end_power_key]:+.2f}",
+                str(pair[low_end_power_key]),
+            ),
             spl_key: (f"{pair[spl_key]:+.2f}", str(pair[spl_key])),
         }
         cells = []
@@ -670,10 +659,10 @@ def build_report(
         "post_eq_relative_spl_db",
         "eq_filter_count",
         "eq_shelf",
-        "low_end_extension_f3_hz",
-        "low_end_extension_f6_hz",
-        "post_eq_low_end_extension_f3_hz",
-        "post_eq_low_end_extension_f6_hz",
+        "low_end_power_db",
+        "relative_low_end_power_db",
+        "post_eq_low_end_power_db",
+        "post_eq_relative_low_end_power_db",
     }
     if int(results.get("format_version", 0)) < 6:
         raise ReportError(
@@ -698,6 +687,11 @@ def build_report(
     if int(results.get("format_version", 0)) < 17:
         raise ReportError(
             "Search results predate shared-reference F3/F6 extension; "
+            "run 'subpair search' again"
+        )
+    if int(results.get("format_version", 0)) < 18:
+        raise ReportError(
+            "Search results predate excursion-weighted low-end power; "
             "run 'subpair search' again"
         )
     if any(
@@ -890,7 +884,7 @@ details {{ margin:22px 0; }} details pre {{ overflow:auto; color:var(--muted); }
 <p class="note">{('Raw ranking: raw-magnitude null depth, raw excess group delay, then raw tail.' if raw else 'EQ’d ranking: post-EQ raw-magnitude null depth, post-EQ excess group delay, then post-EQ tail.')}</p>
 <div class="table-wrap">{_ranking_table(pairs, mode, f'ranking-{mode}', default_keys)}</div>
 <div class="pair-tabs" data-pair-tabs role="tablist" aria-label="Selected {mode_label} pairs"></div>
-<p class="note">Click a table heading to sort. Metric cells run from green (best) to red (worst); lower is better except relative SPL, where higher is better. Relative SPL references this ranking’s rank 1. F3/F6 are informational shared-reference -3/-6 dB extension estimates: the lowest frequency each pair’s broad response reaches that ranking’s common absolute threshold (lower is more extended; blank means it never reaches the threshold). They compare usable output across the same-level measurements but are not part of the recommendation ranking.</p>
+<p class="note">Click a table heading to sort. Metric cells run from green (best) to red (worst); lower is better for null, excess GD, and tail; higher is better for low-end power and relative SPL. Both relative level metrics reference this ranking’s rank 1. Low-end power is the broad response through 100 Hz weighted by the amplifier/excursion cost of producing pressure at each frequency (+12.04 dB per octave downward), with positive pair gain—and, post-EQ, the fitted response’s maximum boost—removed so every pair uses the same maximum driver drive. It is informational and is not part of the recommendation ranking.</p>
 <div id="pair-details">{''.join(detail_sections)}</div>
 <details><summary>Analysis settings and minimum-phase convention</summary><pre>{settings_json}</pre></details>
 </main>

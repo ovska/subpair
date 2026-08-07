@@ -163,97 +163,92 @@ def null_scores(
     return np.max(dip, axis=-1)
 
 
-LOW_END_EXTENSION_F3_THRESHOLD_DB = 3.0
-LOW_END_EXTENSION_F6_THRESHOLD_DB = 6.0
+LOW_END_POWER_UPPER_HZ = 100.0
+EXCURSION_PRESSURE_FREQUENCY_EXPONENT = 2.0
+EXCURSION_POWER_FREQUENCY_EXPONENT = (
+    2.0 * EXCURSION_PRESSURE_FREQUENCY_EXPONENT
+)
+EXCURSION_POWER_DB_PER_OCTAVE = float(
+    10.0 * np.log10(2.0**EXCURSION_POWER_FREQUENCY_EXPONENT)
+)
 
 
-def _two_sided_envelope_db(trend_db: np.ndarray) -> np.ndarray:
-    """Two-sided envelope: at each point, the higher of what's attainable from either side.
-
-    ``envelope[i] = min(max(trend_db[:i+1]), max(trend_db[i:]))``. A narrow
-    dip/null that fully recovers on both sides cannot pull this down - both
-    directions "see past" it to the higher level beyond - but a genuine,
-    sustained decline *does* pull it down, since the declining side's own
-    running max keeps tracking the decline while the other (undeclined) side
-    stays pinned at the higher passband level, and the envelope takes
-    whichever side is lower. This is the same idea as
-    ``_two_sided_wide_dip_db``'s two-sided reference, without that function's
-    inter-metric margin: there is nothing else here it needs to avoid
-    double-counting against, and no margin means every index - including
-    both array edges - gets a well-defined value from a plain two-sided
-    cummax rather than needing edge-case fallbacks.
-    """
-    trend_db = np.asarray(trend_db, dtype=np.float64)
-    ascending = np.maximum.accumulate(trend_db)
-    descending = np.maximum.accumulate(trend_db[::-1])[::-1]
-    return np.minimum(ascending, descending)
-
-
-def low_end_extension_hz(
+def low_end_power_db(
     trend_db: np.ndarray,
     frequencies: np.ndarray,
-    threshold_db: float = LOW_END_EXTENSION_F3_THRESHOLD_DB,
-    reference_level_db: float | None = None,
-) -> float | None:
-    """Lowest frequency whose broad-trend envelope reaches a reference threshold.
+    max_drive_gain_db: float = 0.0,
+    upper_hz: float = LOW_END_POWER_UPPER_HZ,
+) -> float:
+    """Excursion-cost-weighted mean low-frequency pressure power.
 
-    An F3/F6-style extension estimate (``threshold_db`` selects which one -
-    ``LOW_END_EXTENSION_F3_THRESHOLD_DB``/``LOW_END_EXTENSION_F6_THRESHOLD_DB``),
-    deliberately measuring the *envelope* (``_two_sided_envelope_db``) rather
-    than the raw trend: a narrow, recoverable dip or null is a placement
-    defect the null-score metric already scores on its own terms, not a
-    low-end-extension defect, so it must not be able to drag the reported
-    extension up to its own frequency by itself the way scanning the raw
-    trend would. A curve that is flat down to 25 Hz but has one isolated
-    -5 dB notch at 100 Hz still reports ~25 Hz extension, not ~100 Hz,
-    because the envelope's two-sided cummax sees past the notch on both
-    sides. A *sustained* rolloff is not treated this way: below the corner,
-    only the low side of the envelope keeps tracking the decline (the high
-    side has nothing left to see past), so the envelope decline still lands
-    close to where the raw curve actually crosses the threshold.
+    In the pistonic region, acoustic pressure is proportional to ``f**2``
+    times cone displacement. Producing the same pressure one octave lower
+    therefore needs four times the displacement and, under the deliberately
+    simple voltage-proportional-to-displacement model available without
+    driver impedance/T-S data, sixteen times the amplifier power. The score
+    weights pressure power by ``f**-4`` (+12.04 dB/octave toward lower
+    frequencies) before integrating over log frequency. A normalized
+    weighted mean keeps a perfectly flat curve's score equal to its level.
 
-    ``reference_level_db`` controls whether the result is a within-curve
-    rolloff diagnostic or a cross-curve comparison. Leaving it as ``None``
-    uses this curve's own envelope peak, which is useful for a conventional
-    single-response F3/F6 measurement. Passing a shared absolute level uses
-    exactly the same threshold for every curve. ``run_search`` does the
-    latter: all cached measurements use a common drive level, so the shared
-    threshold makes usable acoustic output part of extension. In particular,
-    if one pair is quieter than another throughout the low end, it cannot
-    earn a lower (better) F3/F6 merely because it is normalized to its own
-    lower peak.
+    Only the analyzed range through ``upper_hz`` contributes. If an analysis
+    band lies wholly above that limit, its complete range is used rather than
+    returning an undefined diagnostic. ``trend_db`` is expected to be the
+    one-octave broad response, so narrow placement nulls do not dominate this
+    extension-oriented metric.
 
-    The crossing is always taken on the low-frequency side of the envelope's
-    peak, wherever that peak occurs. A two-subwoofer sum is routinely
-    bandpass-shaped and may already be declining toward its crossover at the
-    top of the analysis band; using the top-edge sample as an anchor would
-    therefore mix high-end crossover behavior into a low-end metric. The
-    envelope's monotonic low side avoids that failure for both conventional
-    self-referenced calls and search's shared absolute reference.
-
-    The two-sided envelope is non-decreasing from the low band edge to its
-    peak, so the first sample that reaches ``reference_level_db -
-    threshold_db`` is the low-side crossing. The lower band edge is returned
-    when the response remains above the threshold throughout the analyzed
-    range. With a shared reference, a quiet curve may never reach the
-    threshold at any frequency; that legitimately returns ``None`` instead
-    of inventing a crossing. This remains a diagnostic and is not part of
-    the raw or EQ'd recommendation sort key.
+    ``max_drive_gain_db`` is the largest gain applied anywhere in the path
+    relative to the common measurement drive. Scaling the complete response
+    back by that amount puts its hottest driver at 0 dB. ``run_search`` uses
+    positive pair gain for raw results and positive pair gain plus the fitted
+    EQ response's maximum boost for post-EQ results. This makes the raw score
+    invariant to which subwoofer happens to be listed first and prevents EQ
+    boost from manufacturing equal-drive output headroom. It is the best
+    frequency-only proxy for equal maximum excursion available from cached
+    acoustic measurements. Exact watts or excursion would additionally
+    require the driver's impedance, motor, enclosure, and protection/DSP
+    transfer functions, none of which REW impulse responses contain.
     """
     frequencies = np.asarray(frequencies, dtype=np.float64)
     trend_db = np.asarray(trend_db, dtype=np.float64)
-    if frequencies.size == 0:
-        return 0.0
-    envelope = _two_sided_envelope_db(trend_db)
-    reference = (
-        float(np.max(envelope))
-        if reference_level_db is None
-        else float(reference_level_db)
+    if frequencies.ndim != 1 or trend_db.ndim != 1:
+        raise ValueError("Low-end power inputs must be one-dimensional")
+    if frequencies.shape != trend_db.shape or frequencies.size == 0:
+        raise ValueError(
+            "Low-end power frequencies and trend must have equal non-zero length"
+        )
+    if np.any(frequencies <= 0.0) or np.any(np.diff(frequencies) <= 0.0):
+        raise ValueError("Low-end power frequencies must be positive and increasing")
+    if not np.all(np.isfinite(trend_db)):
+        raise ValueError("Low-end power trend must contain only finite values")
+    if not math.isfinite(max_drive_gain_db):
+        raise ValueError("Low-end power maximum drive gain must be finite")
+    if not math.isfinite(upper_hz) or upper_hz <= 0.0:
+        raise ValueError("Low-end power upper frequency must be positive and finite")
+
+    mask = frequencies <= upper_hz
+    if not np.any(mask):
+        mask = np.ones(frequencies.shape, dtype=bool)
+    used_frequencies = frequencies[mask]
+    used_trend_db = trend_db[mask]
+    drive_headroom_db = max(0.0, float(max_drive_gain_db))
+    if used_frequencies.size == 1:
+        return float(used_trend_db[0] - drive_headroom_db)
+
+    # The reference frequency cancels between numerator and denominator; the
+    # highest included frequency keeps the intermediate weights near unity.
+    weights = (
+        used_frequencies[-1] / used_frequencies
+    ) ** EXCURSION_POWER_FREQUENCY_EXPONENT
+    peak_db = float(np.max(used_trend_db))
+    relative_pressure_power = 10.0 ** ((used_trend_db - peak_db) / 10.0)
+    log_frequencies = np.log(used_frequencies)
+    weighted_power = float(
+        np.trapezoid(relative_pressure_power * weights, x=log_frequencies)
+        / np.trapezoid(weights, x=log_frequencies)
     )
-    meets_threshold = np.flatnonzero(envelope >= reference - threshold_db)
-    if not meets_threshold.size:
-        return None
-    return float(frequencies[meets_threshold[0]])
+    return float(
+        peak_db + 10.0 * np.log10(max(weighted_power, EPS)) - drive_headroom_db
+    )
 
 
 def peq_response(
@@ -1470,6 +1465,9 @@ def pair_diagnostics(
         native_resolution_hz=context.native_resolution_hz,
         ppo=context.ppo,
     )
+    raw_drive_headroom_db = max(0.0, float(gain_db))
+    eq_drive_boost_db = max(0.0, float(np.max(db20(eq_grid))))
+    post_eq_drive_headroom_db = raw_drive_headroom_db + eq_drive_boost_db
     dsp_target = eq_options.target == "dsp"
     result: dict[str, Any] = {
         "null_score_db": gd_weighted_null_score(
@@ -1487,12 +1485,12 @@ def pair_diagnostics(
         ),
         "raw_tail_ms": float(np.max(raw_tail_by_band)),
         "raw_tail_by_band_ms": [round(float(value), 6) for value in raw_tail_by_band],
-        "low_end_extension_f3_hz": low_end_extension_hz(
-            trend_db, context.frequencies, threshold_db=LOW_END_EXTENSION_F3_THRESHOLD_DB
+        "low_end_power_db": low_end_power_db(
+            trend_db,
+            context.frequencies,
+            max_drive_gain_db=raw_drive_headroom_db,
         ),
-        "low_end_extension_f6_hz": low_end_extension_hz(
-            trend_db, context.frequencies, threshold_db=LOW_END_EXTENSION_F6_THRESHOLD_DB
-        ),
+        "drive_headroom_db": raw_drive_headroom_db,
         "post_eq_null_score_db": gd_weighted_null_score(
             post_magnitude_db,
             post_trend_db,
@@ -1512,12 +1510,12 @@ def pair_diagnostics(
         ),
         "post_eq_tail_ms": float(np.max(tail_by_band)),
         "tail_by_band_ms": [round(float(value), 6) for value in tail_by_band],
-        "post_eq_low_end_extension_f3_hz": low_end_extension_hz(
-            post_trend_db, context.frequencies, threshold_db=LOW_END_EXTENSION_F3_THRESHOLD_DB
+        "post_eq_low_end_power_db": low_end_power_db(
+            post_trend_db,
+            context.frequencies,
+            max_drive_gain_db=post_eq_drive_headroom_db,
         ),
-        "post_eq_low_end_extension_f6_hz": low_end_extension_hz(
-            post_trend_db, context.frequencies, threshold_db=LOW_END_EXTENSION_F6_THRESHOLD_DB
-        ),
+        "post_eq_drive_headroom_db": post_eq_drive_headroom_db,
         "filters": filters,
         "eq_target": eq_metadata["target"],
         "eq_target_level_db": float(eq_metadata["target_level_db"]),
@@ -1530,9 +1528,7 @@ def pair_diagnostics(
         ),
     }
     if include_trends:
-        # Search needs the selected raw/post-EQ broad trends only long enough
-        # to apply one shared absolute F3/F6 reference across every pair.
-        # Keeping this opt-in avoids bloating ordinary diagnostic results.
+        # Keep broad trends opt-in so ordinary diagnostic results stay small.
         result["trend_db"] = trend_db
         result["post_eq_trend_db"] = post_trend_db
     if include_decay:
