@@ -240,12 +240,25 @@ def _excess_figure(data: dict[str, Any], *, raw: bool = False) -> go.Figure:
     # reference line below); only draw it when it actually varies, i.e. the
     # 'monotonic' --gd-baseline mode.
     if baseline_ms.size and float(np.ptp(baseline_ms)) > 1e-9:
+        # baseline_ms is the *raw*, pre-removal group delay's baseline, which
+        # still carries the arbitrary common-alignment offset (curve_ms +
+        # baseline_ms reconstructs that raw curve) - typically hundreds to
+        # thousands of ms, versus a curve_ms that's usually single-digit ms.
+        # Plotted on the same axis at that absolute scale, the baseline
+        # dwarfs the excess-GD curve it's meant to contextualize and the
+        # chart becomes unreadable. _isotonic_non_increasing constrains
+        # |baseline_ms| to be non-increasing as frequency rises, so its
+        # value at the top of the evaluated range is always its own
+        # smallest-magnitude ("settled") point; subtracting that shifts the
+        # display (not the scored data) onto the same near-zero-referenced
+        # scale as the excess curve while preserving the baseline's shape.
+        baseline_ms = baseline_ms - baseline_ms[-1]
         figure.add_trace(
             go.Scatter(
                 x=data["frequencies"],
                 y=baseline_ms,
                 line={"color": "#fb923c", "width": 1.5, "dash": "dash"},
-                name="Monotonic baseline",
+                name="Monotonic baseline (shifted to 0 at top of band)",
             )
         )
     if not raw:
@@ -503,10 +516,10 @@ def build_report(
             "Search results predate the width-invariant excess-GD peak "
             "tie-break; run 'subpair search' again"
         )
-    if int(results.get("format_version", 0)) < 8:
+    if int(results.get("format_version", 0)) < 9:
         raise ReportError(
-            "Search results predate the level-matched low-end extension "
-            "reference; run 'subpair search' again"
+            "Search results predate the peak-anchored low-end extension "
+            "calculation; run 'subpair search' again"
         )
     if any(
         not required_ranking_fields.issubset(pair)
