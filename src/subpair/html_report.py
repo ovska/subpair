@@ -12,7 +12,7 @@ import plotly.graph_objects as go
 from plotly.offline import get_plotlyjs
 
 from .cache import load_cache
-from .dsp import AnalysisContext, EqOptions, ShelfOptions, db20, pair_diagnostics
+from .dsp import AnalysisContext, EqOptions, ShelfOptions, pair_diagnostics
 
 
 class ReportError(RuntimeError):
@@ -101,16 +101,6 @@ def _magnitude_figure(
                 yaxis="y2",
             )
         )
-        if "post_eq_shelf_db" in data:
-            figure.add_trace(
-                go.Scatter(
-                    x=f,
-                    y=data["post_eq_shelf_db"],
-                    name="Post-EQ + low shelf (tonal, not scored)",
-                    line={"color": "#fdba74", "width": 1.7},
-                    visible="legendonly",
-                )
-            )
     layout: dict[str, Any] = {
         "title": (
             "Magnitude: solos and raw sum" if raw else "Magnitude: solos and EQ’d sum"
@@ -338,18 +328,18 @@ def _decay_figure(data: dict[str, Any], *, raw: bool = False) -> go.Figure:
     return figure
 
 
-def _peq_text(filters: list[dict[str, float]], shelf: ShelfOptions | None = None) -> str:
+def _peq_text(filters: list[dict[str, float]], shelf: dict[str, Any] | None = None) -> str:
     lines = [
         f"PK Fc {item['fc_hz']:.1f} Hz  Gain {item['gain_db']:.1f} dB  Q {item['q']:.3f}"
         for item in filters
     ]
     if not lines:
         lines.append("No filters fitted")
-    if shelf is not None and shelf.active:
+    if shelf is not None and shelf.get("active"):
         lines.append("")
         lines.append(
-            f"LS Fc {shelf.freq_hz:.1f} Hz  Gain {shelf.gain_db:+.1f} dB  "
-            f"Slope {shelf.slope:.2f}  (tonal, not scored)"
+            f"LS Fc {shelf['freq_hz']:.1f} Hz  Gain {shelf['gain_db']:+.1f} dB  "
+            f"Slope {shelf['slope']:.2f}  (fixed tonal control, part of the score)"
         )
     return "\n".join(lines)
 
@@ -484,14 +474,10 @@ def build_report(
     output_path: Path,
     top: int = 5,
     limit: int = 15,
-    shelf: ShelfOptions | None = None,
     raw: bool = False,
 ) -> Path:
     if limit < 1:
         raise ReportError("Report result limit must be at least 1")
-    shelf = shelf or ShelfOptions()
-    if raw and shelf.active:
-        raise ReportError("--raw cannot be combined with post-EQ low-shelf settings")
     results = load_results(results_path)
     measurements, _ = load_cache(cache_dir)
     if len(measurements) != int(results.get("measurement_count", -1)):
@@ -501,6 +487,12 @@ def build_report(
     gd_baseline = str(settings.get("gd_baseline", {}).get("mode", "flat"))
     eq_settings = settings.get("eq", {})
     eq_range = tuple(float(value) for value in eq_settings.get("correction_range_hz", band))
+    shelf_settings = eq_settings.get("shelf", {})
+    shelf = ShelfOptions(
+        freq_hz=shelf_settings.get("freq_hz"),
+        gain_db=float(shelf_settings.get("gain_db", 0.0)),
+        slope=float(shelf_settings.get("slope", 1.0)),
+    )
     eq_options = EqOptions(
         target=str(eq_settings.get("target", "trend")),
         correction_range=eq_range,
@@ -510,6 +502,7 @@ def build_report(
         max_boost_db=float(eq_settings.get("max_boost_db", 0.0)),
         max_cut_db=float(eq_settings.get("max_cut_db", 18.0)),
         max_filters=int(eq_settings.get("max_filters", 7)),
+        shelf=shelf,
     )
     required_ranking_fields = {
         "rank",
@@ -567,9 +560,6 @@ def build_report(
             gd_baseline=gd_baseline,
         )
         key = pair_key(pair)
-        if shelf.active and not raw:
-            shelf_response = shelf.response(context.frequencies, context.sample_rate)
-            data["post_eq_shelf_db"] = np.asarray(data["post_eq_db"]) + db20(shelf_response)
         diagnostic_by_key[key] = data
         detail_class = (
             "pair-detail" if key == initial_active_key else "pair-detail is-inactive"
@@ -600,10 +590,11 @@ def build_report(
             if shelf.active:
                 eq_description += (
                     f"Low shelf: {shelf.gain_db:+.1f} dB at {shelf.freq_hz:g} Hz, "
-                    f"slope {shelf.slope:.2f} — a fixed tonal control, not reflected "
-                    "in the ranking metrics above.<br>"
+                    f"slope {shelf.slope:.2f} — a fixed tonal control, fitted "
+                    "unaware of the PEQ bank above but folded into every "
+                    "post-EQ metric here, exactly like max boost/PEQ bands.<br>"
                 )
-            peq = _peq_text(data["filters"], shelf)
+            peq = _peq_text(data["filters"], data.get("eq_shelf"))
             peq_html = (
                 '<div class="peq"><h3>Fitted PEQ filters</h3>'
                 '<button onclick="copyPeq(this)">Copy</button>'

@@ -65,11 +65,18 @@ def run_verification(
     measurement_id: str | None = None,
     keep_level: bool = False,
     band_override: tuple[float, float] | None = None,
-    shelf: ShelfOptions | None = None,
 ) -> dict[str, Any]:
-    shelf = shelf or ShelfOptions()
     cached, _ = load_cache(cache_dir)
     results = load_results(results_path)
+    # The shelf is a search-time EQ setting (see EqOptions.shelf), not a
+    # verify-time override: whatever search-results.json was generated with
+    # is what's being verified, exactly like max_boost_db/max_filters.
+    shelf_settings = results["settings"].get("eq", {}).get("shelf", {})
+    shelf = ShelfOptions(
+        freq_hz=shelf_settings.get("freq_hz"),
+        gain_db=float(shelf_settings.get("gain_db", 0.0)),
+        slope=float(shelf_settings.get("slope", 1.0)),
+    )
     matches = [row for row in results["pairs"] if int(row["rank"]) == rank]
     if len(matches) != 1:
         raise VerificationError(f"Rank {rank} is not present in {results_path}")

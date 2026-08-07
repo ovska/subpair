@@ -353,6 +353,37 @@ The post-EQ tail score is a deterministic, one-third-octave CSD-style
 analytic-envelope estimate and should be treated as a comparative metric, not
 a room RT60 measurement.
 
+#### Low shelf
+
+`--low-shelf-freq HZ --low-shelf-gain DB [--low-shelf-slope S]` adds a fixed,
+broad RBJ low-shelf boost or cut, for people who want a general tonality
+control (more or less sub-bass) alongside — or instead of relying entirely
+on — corrective EQ. `--low-shelf-gain` is required to be nonzero for the
+shelf to take effect (-15..15 dB); `--low-shelf-freq` alone is inert.
+`--low-shelf-slope` is the RBJ "S" shelf-slope parameter (0.1..1, default 1,
+the steepest transition without gain overshoot).
+
+This is a `search`-time EQ setting, exactly like `--max-boost`/`--eq-bands`:
+it is folded into every post-EQ score (`post_eq_null_score_db`,
+`post_eq_spl_db`, ranking, everything), so a deliberate tonal choice *can*
+change which placement wins — changing it means re-running `search`, not a
+report-time toggle. `report`/`verify` no longer take their own
+`--low-shelf-*` flags; they display and predict whatever shelf the loaded
+`search-results.json` was generated with.
+
+The shelf is still deliberately independent of `fit_eq_filters`'s bounded
+bell fitter in one specific sense: the greedy PK-bell loop is fitted
+completely unaware of it, targeting the raw, unshelved response exactly as
+if the shelf were inactive, so a deliberate tonal tilt is never fought or
+cancelled by the corrective fitter the way a genuine response defect at the
+same frequencies would be. It is applied once, multiplicatively, after the
+bell bank is chosen — not counted against `--eq-bands`/`--max-boost`/
+`--max-cut`/`--eq-range` — closer to how a fixed hardware shelf ahead of an
+adaptive room-correction DSP behaves than to another corrective filter
+competing for the same budget. In the report it appears in the fitted-PEQ
+text block as a separate `LS Fc ... Gain ... Slope ...` line, clearly marked
+apart from the `PK` bell lines above it.
+
 Relative SPL is reported, not ranked. It is the energy-mean in-band SPL at the
 searched gain settings (gains are referenced to an equal 1 kHz electrical
 drive). Raw and EQ'd modes each reference their own rank 1.
@@ -383,25 +414,6 @@ above); they use lower-is-better colouring, render as an empty gray cell when
 no meaningful crossing exists, and do not affect sorting or which pairs are
 recommended.
 
-#### Low shelf
-
-`--low-shelf-freq HZ --low-shelf-gain DB [--low-shelf-slope S]` adds a fixed,
-broad RBJ low-shelf boost or cut on top of the fitted PEQ bank, for people who
-want a general tonality control (more or less sub-bass) rather than — or in
-addition to — corrective EQ. `--low-shelf-gain` is required to be nonzero for
-the shelf to take effect (-15..15 dB); `--low-shelf-freq` alone is inert.
-`--low-shelf-slope` is the RBJ "S" shelf-slope parameter (0.1..1, default 1,
-the steepest transition without gain overshoot).
-
-The shelf is deliberately independent of `fit_eq_filters`'s bounded bell
-fitter: it is never counted against `--eq-bands`/`--max-boost`/`--max-cut`/
-`--eq-range`, and it never reaches `subpair search` or any ranking key —
-placement selection stays purely about acoustic correctness, and a tonal
-preference can never change which pair wins. In the report it appears as a
-separate, clearly labelled trace ("Post-EQ + low shelf (tonal, not scored)")
-and PEQ-text block (`LS Fc ... Gain ... Slope ...`), left out of every scored
-metric and out of the ranking tables entirely.
-
 ### `subpair verify`
 
 After physically measuring one selected sum, leave that new measurement in
@@ -418,11 +430,12 @@ and prints the maximum in-band deviation. The comparison removes only one
 constant level offset by default (`--keep-level` disables that); it does not
 hide frequency-dependent mutual-coupling error.
 
-`verify` accepts the same `--low-shelf-freq`/`--low-shelf-gain`/
-`--low-shelf-slope` flags as `report`. Unlike `report`, `verify` applies the
-shelf to the *predicted* curve before computing the deviation — pass it when
-the physical measurement being checked already has that shelf applied
-(e.g. on an external DSP), so the comparison stays meaningful.
+If the loaded `search-results.json` was generated with a low shelf active
+(see `subpair search`'s Low shelf section above), `verify` automatically
+applies it to the *predicted* curve before computing the deviation, since
+verification is about checking one fully-specified, already-scored
+configuration — no separate `--low-shelf-*` flags are needed or accepted
+here.
 
 ## Important assumptions
 

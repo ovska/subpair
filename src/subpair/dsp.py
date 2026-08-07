@@ -360,12 +360,19 @@ def low_shelf_response(
 class ShelfOptions:
     """A fixed, user-specified low-shelf tonal control.
 
-    Deliberately separate from ``EqOptions``/``fit_eq_filters``: this is a
-    broad tonality preference set directly by the user (more/less sub-bass),
-    not a correction fitted against a measured target. It is applied only
-    when generating a report or running verification (see ``cli.py``'s
-    ``report``/``verify`` subcommands) and never reaches ``search`` or any
-    ranking key, so a tonal choice can never change which placement wins.
+    Set via ``EqOptions.shelf`` and ``cli.py``'s ``search`` subcommand's
+    ``--low-shelf-*`` flags, exactly like ``max_boost_db``/``max_filters``:
+    a search-time EQ configuration choice, fitted into the post-EQ response
+    every ranking-relevant score is computed from (see ``fit_eq_filters``).
+    Changing it means re-running ``search``, the same as changing any other
+    ``EqOptions`` field - ``report``/``verify`` read whichever shelf a given
+    ``search-results.json`` was generated with and cannot override it.
+    Unlike the bounded, corrective bell bank ``fit_eq_filters`` greedily
+    fits, this is a broad tonality preference set directly by the user
+    (more/less sub-bass): the bells are fitted completely unaware of it (see
+    ``fit_eq_filters``'s docstring), so a deliberate tonal tilt is not
+    fought/cancelled by the corrective fitter the way a genuine response
+    defect at the same frequencies would be.
     """
 
     freq_hz: float | None = None
@@ -400,6 +407,7 @@ class EqOptions:
     max_boost_db: float = 0.0
     max_cut_db: float = 18.0
     max_filters: int = 7
+    shelf: ShelfOptions = ShelfOptions()
 
     def __post_init__(self) -> None:
         if self.target not in {"trend", "flat", "dsp"}:
@@ -729,6 +737,17 @@ def fit_eq_filters(
             break
         _, total, current = best
         filters.append(current)
+    # The shelf is deliberately applied *after* the bell-fitting loop above,
+    # not folded into `desired`/`residual`: the bells there still target the
+    # raw, unshelved response exactly as if the shelf were inactive, so a
+    # deliberate tonal tilt is never fought/cancelled by the corrective
+    # fitter as if it were a defect at the same frequencies. `filters`
+    # itself stays a pure PK-bell list (the shelf isn't a peaking biquad and
+    # has no fc/gain/q representation in that schema); callers reconstructing
+    # a full EQ'd response from `filters` via `filters_response()` must also
+    # multiply in `options.shelf.response(...)` at their own frequency grid
+    # to stay consistent with the `total` returned here.
+    total = total * options.shelf.response(frequencies, sample_rate)
     metadata: dict[str, Any] = {
         "target": options.target,
         "target_level_db": target_level,
@@ -738,6 +757,7 @@ def fit_eq_filters(
         "effective_target_db": effective_target,
         "nominal_target_db": nominal_target,
         "eq_authority": authority,
+        "shelf": options.shelf,
     }
     return filters, total, metadata
 
@@ -1413,7 +1433,14 @@ def pair_diagnostics(
         margin_spectrum=trend_wide_sum,
         margin_slice=context.trend_slice,
     )
-    eq_full = filters_response(full_frequencies, context.sample_rate, filters)
+    # filters_response() only reconstructs the fitted PK bells; the shelf
+    # (already folded into eq_grid by fit_eq_filters) must be multiplied in
+    # again here to stay consistent, since eq_full/eq_trend_wide are
+    # reconstructed from `filters` on different frequency grids, not derived
+    # from eq_grid itself.
+    eq_full = filters_response(
+        full_frequencies, context.sample_rate, filters
+    ) * eq_options.shelf.response(full_frequencies, context.sample_rate)
     n_fft = 2 * (full_sum.size - 1)
     pre_ir = np.fft.irfft(full_sum, n=n_fft)
     post_full = full_sum * eq_full
@@ -1426,7 +1453,9 @@ def pair_diagnostics(
     )
     post_grid = grid_sum * eq_grid
     post_magnitude_db = db20(post_grid)
-    eq_trend_wide = filters_response(context.trend_frequencies, context.sample_rate, filters)
+    eq_trend_wide = filters_response(
+        context.trend_frequencies, context.sample_rate, filters
+    ) * eq_options.shelf.response(context.trend_frequencies, context.sample_rate)
     post_trend_wide_sum = trend_wide_sum * eq_trend_wide
     post_trend_db = broad_trend_db(db20(post_trend_wide_sum), context.ppo)[context.trend_slice]
     post_excess_score, post_excess_curve, post_excess_baseline_curve = excess_group_delay(
@@ -1497,6 +1526,12 @@ def pair_diagnostics(
         "eq_target": eq_metadata["target"],
         "eq_target_level_db": float(eq_metadata["target_level_db"]),
         "eq_mean_authority": float(np.mean(eq_metadata["eq_authority"])),
+        "eq_shelf": {
+            "freq_hz": eq_options.shelf.freq_hz,
+            "gain_db": eq_options.shelf.gain_db,
+            "slope": eq_options.shelf.slope,
+            "active": eq_options.shelf.active,
+        },
         "spl_db": float(10.0 * np.log10(max(np.mean(np.abs(grid_sum) ** 2), EPS))),
         "post_eq_spl_db": float(
             10.0 * np.log10(max(np.mean(np.abs(post_grid) ** 2), EPS))

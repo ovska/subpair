@@ -19,6 +19,7 @@ from .dsp import (
     MIN_RELIABLE_NATIVE_BINS,
     AnalysisContext,
     EqOptions,
+    ShelfOptions,
     broad_trend_db,
     db20,
     filters_response,
@@ -43,6 +44,9 @@ class SearchOptions:
     eq_bands: int = 7
     tie_tolerance_db: float = 0.0
     gd_baseline: str = "flat"
+    low_shelf_freq_hz: float | None = None
+    low_shelf_gain_db: float = 0.0
+    low_shelf_slope: float = 1.0
 
 
 PLATEAU_TOLERANCE_DB = 0.5
@@ -153,6 +157,11 @@ def run_search(
             f"EQ range {eq_range[0]:g}..{eq_range[1]:g} Hz must lie within "
             f"analysis band {options.band[0]:g}..{options.band[1]:g} Hz"
         )
+    shelf = ShelfOptions(
+        freq_hz=options.low_shelf_freq_hz,
+        gain_db=options.low_shelf_gain_db,
+        slope=options.low_shelf_slope,
+    )
     eq_options = EqOptions(
         target=options.eq_target,
         correction_range=eq_range,
@@ -160,6 +169,7 @@ def run_search(
         max_boost_db=options.max_boost_db,
         max_cut_db=options.max_cut_db,
         max_filters=options.eq_bands,
+        shelf=shelf,
     )
     combinations = list(itertools.combinations(range(len(measurements)), 2))
     pairs: list[dict] = []
@@ -324,7 +334,7 @@ def run_search(
         )
 
     result = {
-        "format_version": 11,
+        "format_version": 12,
         "measurement_count": len(measurements),
         "sample_rate": measurements[0].sample_rate,
         "response_length": measurements[0].impulse.size,
@@ -360,6 +370,22 @@ def run_search(
                 "max_boost_db": eq_options.max_boost_db,
                 "max_cut_db": eq_options.max_cut_db,
                 "max_filters": eq_options.max_filters,
+                "shelf": {
+                    "active": shelf.active,
+                    "freq_hz": shelf.freq_hz,
+                    "gain_db": shelf.gain_db,
+                    "slope": shelf.slope,
+                    "note": (
+                        "a fixed, broad RBJ low-shelf tonal control folded "
+                        "into every post-EQ score in this file, exactly "
+                        "like max_boost_db/max_filters above - the greedy "
+                        "PK bell bank is fitted completely unaware of it "
+                        "(see fit_eq_filters), so it is never fought or "
+                        "cancelled by the corrective fitter; changing it "
+                        "requires re-running search, the same as any other "
+                        "EQ setting on this page"
+                    ),
+                },
                 "excess_gd_guard": (
                     "denoised excess-GD peaks are expanded into a gate at "
                     "least one-third octave wide via a maximum (not "
