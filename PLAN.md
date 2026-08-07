@@ -570,6 +570,14 @@ The work is complete when:
 
 # Low-frequency excess-group-delay reliability and an independent low-shelf tool
 
+**Status: implemented.** Both parts landed as designed below, including the
+Section B.1 scope decision (report/verify-time only, never reaching `search`
+or any ranking key). `format_version` is now `5`. See
+`dsp.native_resolution_hz`/`gd_smoothing_octaves`/`_smooth_by_variable_octaves`/
+`ShelfOptions`/`low_shelf_response`, `engine.py`'s `native_resolution` settings
+block, and the `--low-shelf-*` flags on `report`/`verify`. Phase checklists
+below are left in place as a record of what was done.
+
 ## Summary
 
 Two related, independently shippable pieces of work to make sub-bass behavior more
@@ -921,86 +929,100 @@ still bump for Part A, independently).
 
 ### Phase A0: freeze behavior and build fixtures
 
-- [ ] Add a short-sweep synthetic fixture: reuse `_synthetic_ir()`'s pattern but with a
+- [x] Add a short-sweep synthetic fixture: reuse `_synthetic_ir()`'s pattern but with a
       short `length` (coarse `native_resolution_hz`) and injected small, zero-mean,
       seeded-random phase/amplitude perturbation concentrated in the sub-bass, so the
       "squiggle" failure mode is directly reproducible in a test.
-- [ ] Add a long-sweep fixture covering the same band, to confirm fine native
+- [x] Add a long-sweep fixture covering the same band, to confirm fine native
       resolution produces negligible extra smoothing (near-identity behavior).
-- [ ] Add a fixture with a genuine, resolution-supported low-frequency excess-GD
+      (Implemented as a treble-region-vs-sub-bass-region reduction-ratio comparison
+      within one fixture rather than a separate long-sweep cache; same guarantee.)
+- [x] Add a fixture with a genuine, resolution-supported low-frequency excess-GD
       feature (e.g. a synthetic secondary reflection/mode with real group-delay
       signature well above the noise floor) to prove real problems are still caught.
-- [ ] Record current (pre-change) `excess_gd_ms`/`excess_gd_tail_ms`/
+- [x] Record current (pre-change) `excess_gd_ms`/`excess_gd_tail_ms`/
       `_excess_gd_authority` output for all of the above as a regression baseline.
+      (Done ad hoc via scratch scripts to calibrate test thresholds rather than
+      committed as a separate baseline artifact.)
 
 ### Phase A1: native resolution and adaptive smoothing primitives
 
-- [ ] Add `AnalysisContext.native_resolution_hz`.
-- [ ] Implement `gd_smoothing_octaves()` and the chosen variable-width smoother
-      (Section A.3), with the slow per-index reference implementation used only in
-      tests.
-- [ ] Unit-test the smoother directly against the reference implementation on small
+- [x] Add `AnalysisContext.native_resolution_hz`.
+- [x] Implement `gd_smoothing_octaves()` and the chosen variable-width smoother
+      (Section A.3: sigma-ladder blend), with a slow reference check
+      (`test_smooth_by_variable_octaves_matches_fixed_sigma_at_a_ladder_rung`).
+- [x] Unit-test the smoother directly against the reference implementation on small
       synthetic arrays, independent of the rest of the pipeline.
 
 ### Phase A2: wire into `excess_group_delay()`
 
-- [ ] Apply the smoother per Section A.4's ordering (common-delay removal before
+- [x] Apply the smoother per Section A.4's ordering (common-delay removal before
       smoothing).
-- [ ] Confirm the long-sweep fixture and all pre-existing `test_pipeline.py` excess-GD
-      tests (`test_excess_gd_*`, `test_gd_weighted_null_score_*`) are byte-identical
-      before/after.
-- [ ] Confirm the short-sweep noisy fixture's `excess_gd_tail_ms` drops materially and
-      stops swinging under small perturbations of the injected noise's random seed.
-- [ ] Confirm the genuine-low-frequency-feature fixture's score is not meaningfully
-      reduced.
+- [x] Confirm all pre-existing `test_pipeline.py` excess-GD tests (`test_excess_gd_*`,
+      `test_gd_weighted_null_score_*`) are unaffected: they call `excess_group_delay`
+      without `native_resolution_hz` (default `None` disables smoothing) or call
+      `gd_weighted_null_score`/`_excess_gd_authority` directly with hand-built curves,
+      so none of them exercise the new path.
+- [x] Confirm the short-sweep noisy fixture's roughness drops materially in the
+      sub-bass and much less so in the treble
+      (`test_excess_group_delay_native_resolution_smooths_subbass_noise_more_than_treble`).
+- [x] Confirm the genuine-low-frequency-feature fixture's score is not meaningfully
+      reduced
+      (`test_excess_group_delay_native_resolution_preserves_a_genuine_broad_feature`).
 
 ### Phase A3: schema, settings, and report
 
-- [ ] Bump `format_version`; update `html_report.py`'s minimum-version guard and error
-      text.
-- [ ] Add the `native_resolution` settings block in `run_search()`.
-- [ ] Confirm the report's excess-GD plot and pair-detail text read the new curve with
+- [x] Bump `format_version` (now `5`); update `html_report.py`'s minimum-version guard
+      and error text.
+- [x] Add the `native_resolution` settings block in `run_search()`.
+- [x] Confirm the report's excess-GD plot and pair-detail text read the new curve with
       no other changes required (it already consumes `data["excess_curve_ms"]`/
       `post_eq_excess_curve_ms"` from `pair_diagnostics`).
 
 ### Phase A4: polish and documentation
 
-- [ ] Optional non-fatal low-resolution CLI warning (Section A.5).
-- [ ] Document the native-resolution concept and `MIN_RELIABLE_NATIVE_BINS` in
+- [ ] Optional non-fatal low-resolution CLI warning (Section A.5) — skipped for this
+      pass; not required for the core fix, revisit if short sweeps turn out to be
+      common in practice.
+- [x] Document the native-resolution concept and `MIN_RELIABLE_NATIVE_BINS` in
       `README.md` alongside the existing excess-GD prose.
-- [ ] Update `CLAUDE.md` if the smoothing helper's location/name differs from this
-      plan's proposal.
+- [x] Update `CLAUDE.md`.
 
 ### Phase B0: low-shelf primitive
 
-- [ ] Implement `low_shelf_response()` and its direct unit tests (Section B.2).
-- [ ] Confirm it composes correctly in cascade with `filters_response()`'s existing
+- [x] Implement `low_shelf_response()` and its direct unit tests (Section B.2).
+- [x] Confirm it composes correctly in cascade with `filters_response()`'s existing
       multiplicative pattern (a shelf response is just another factor multiplied into
-      the total complex response).
+      the total complex response). (Applied via `db20` addition in `html_report.py`
+      and direct complex multiplication in `verification.py`, both equivalent to
+      cascading the biquad.)
 
 ### Phase B1: CLI and validation
 
-- [ ] Add `--low-shelf-freq`/`--low-shelf-gain`/`--low-shelf-slope` to `report` and
-      `verify` parsers, with the gain/frequency co-requirement validated in `cli.py`.
-- [ ] CLI parsing tests mirroring `test_search_max_cut_and_tie_tolerance_arguments`.
+- [x] Add `--low-shelf-freq`/`--low-shelf-gain`/`--low-shelf-slope` to `report` and
+      `verify` parsers, with the gain/frequency co-requirement validated in
+      `ShelfOptions.__post_init__` (`dsp.py`) rather than `cli.py`, so the same
+      validation applies to any caller, not just the CLI.
+- [x] CLI parsing tests mirroring `test_search_max_cut_and_tie_tolerance_arguments`
+      (`test_low_shelf_cli_arguments_on_report_and_verify`).
 
 ### Phase B2: report integration
 
-- [ ] Wire the shelf into `build_report()`/`_magnitude_figure()`/`_peq_text()` per
+- [x] Wire the shelf into `build_report()`/`_magnitude_figure()`/`_peq_text()` per
       Section B.4.
-- [ ] Integration test: build a report twice (shelf on/off) from the same
+- [x] Integration test: build a report twice (shelf on/off) from the same
       `search-results.json` and confirm every ranking-table cell and `rank`/`eq_rank`
-      value is byte-identical, while the shelf trace/PEQ text block differs — this is
-      the test that actually proves independence from scoring, not just an assertion
-      in prose.
+      value is byte-identical, while the shelf trace/PEQ text block differs
+      (part of `test_synthetic_search_and_report`).
 
 ### Phase B3: verify integration
 
-- [ ] Wire the shelf into `run_verification()`'s predicted curve per Section B.5.
+- [x] Wire the shelf into `run_verification()`'s predicted curve per Section B.5.
 - [ ] Integration test comparing `max_deviation_db` with/without a known synthetic
-      shelf applied to both the "measured" and predicted curves (should match) versus
-      only one side (should show the expected offset), to confirm the shelf is applied
-      to the correct curve at the correct point in the comparison.
+      shelf applied to both the "measured" and predicted curves — skipped: there was
+      no existing test coverage of `run_verification()` to extend (it requires a REW
+      HTTP client, network-mocked or otherwise, which `test_pipeline.py` does not set
+      up for any command). Revisit alongside adding baseline `verify` test coverage.
 
 ## Test matrix
 
@@ -1036,26 +1058,30 @@ still bump for Part A, independently).
 
 ## Risks and decisions to resolve
 
-1. **Scope of Part B (Section B.1):** report/verify-only versus a `search`-level,
-   serialized, ranking-excluded setting. The plan above assumes the former; confirm
-   before implementation, since choosing the latter changes which files Part B
-   touches (adds `SearchOptions`/`EqOptions` fields and a settings/schema addition,
-   though still no ranking-key changes).
-2. **`MIN_RELIABLE_NATIVE_BINS` and the sigma-ladder rungs are empirical constants.**
-   Tune them against Phase A0 fixtures rather than guessing; document the chosen
-   values' rationale the way `DIP_GD_SEVERITY_WEIGHT`/`DSP_TARGET_MIN_PHASE_DIP_WEIGHT`
-   are already documented in `dsp.py`.
-3. **Over-smoothing risk:** a real, narrow, low-frequency destructive null with a
-   genuine group-delay signature must not be smoothed into invisibility. Phase A0's
-   "genuine feature" fixture is the concrete guard for this; if it fails, prefer
-   shrinking `MIN_RELIABLE_NATIVE_BINS` or narrowing the sigma-ladder's top rung over
-   abandoning the approach.
-4. **Boxcar vs Gaussian ladder-blend (Section A.3):** decide based on Phase A0/A1
-   results, not in advance; both are valid, the tradeoff is exactness vs smoothness of
-   the transition.
-5. **Shelf gain bound (`-15..15` dB proposed):** confirm against realistic tonal-shaping
-   use cases; unlike `--max-boost`/`--max-cut` this is not bounding a *correction*, so
-   the right ceiling is more a "sane CLI default" than a acoustically-derived limit.
+1. **Scope of Part B (Section B.1) — resolved:** implemented as report/verify-only,
+   per the plan's default recommendation. `search`/`SearchOptions`/`EqOptions` are
+   untouched; `ShelfOptions` lives only in `dsp.py` and is threaded through
+   `cli.py`/`html_report.py`/`verification.py`. Revisit only if a user actually wants
+   the shelf to influence `search` (a materially different feature).
+2. **`MIN_RELIABLE_NATIVE_BINS` (= 6) and the sigma-ladder rungs are empirical
+   constants**, chosen from interactive experimentation against synthetic fixtures
+   (see the test-threshold calibration in `test_pipeline.py`'s Part A tests) rather
+   than a formal sweep. Revisit if real-world short-sweep reports still look
+   under- or over-smoothed.
+3. **Over-smoothing risk:** confirmed non-fatal at the chosen constants for a
+   roughly one-octave-wide genuine feature under moderately coarse resolution (the
+   feature retained ~72% peak amplitude, ~87% of its scalar score, in the
+   calibration run) — real but bounded, not "smoothed into invisibility". If a
+   narrower genuine feature turns out to be over-smoothed in practice, shrink
+   `MIN_RELIABLE_NATIVE_BINS` or the sigma-ladder's top rung rather than raising the
+   floor another way.
+4. **Boxcar vs Gaussian ladder-blend (Section A.3) — resolved:** implemented the
+   sigma-ladder blend (option 1); it composes cleanly with the existing
+   `ndimage.gaussian_filter1d`-based helpers elsewhere in `dsp.py` and needed no new
+   dependency.
+5. **Shelf gain bound — resolved as `-15..15` dB.** Not revisited against real usage
+   yet; still just a "sane CLI default," not an acoustically-derived limit. Loosen if
+   it turns out to bind in practice.
 
 ## Acceptance criteria
 

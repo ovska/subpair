@@ -13,6 +13,8 @@ import numpy as np
 from .cache import load_cache, write_json
 from .dsp import (
     EXCESS_GD_TAIL_POWER,
+    LOW_END_EXTENSION_THRESHOLD_DB,
+    MIN_RELIABLE_NATIVE_BINS,
     AnalysisContext,
     EqOptions,
     inclusive_range,
@@ -245,7 +247,7 @@ def run_search(
         )
 
     result = {
-        "format_version": 4,
+        "format_version": 5,
         "measurement_count": len(measurements),
         "sample_rate": measurements[0].sample_rate,
         "response_length": measurements[0].impulse.size,
@@ -285,6 +287,24 @@ def run_search(
                 "log_magnitude_floor_db": -160.0,
                 "bandwidth": "full cached response, DC to Nyquist",
                 "common_delay": "energy-weighted median removed from excess GD",
+            },
+            "native_resolution": {
+                "hz": context.native_resolution_hz,
+                "min_reliable_native_bins": MIN_RELIABLE_NATIVE_BINS,
+                "note": (
+                    "the cache's unpadded capture length sets a native "
+                    f"frequency resolution of {context.native_resolution_hz:g} Hz; "
+                    "zero-padding for minimum-phase/CSD work interpolates "
+                    "that spectrum smoothly but adds no new information. "
+                    "excess_gd_ms/excess_gd_tail_ms and their post-EQ "
+                    "counterparts are progressively smoothed below roughly "
+                    f"{MIN_RELIABLE_NATIVE_BINS:g}x this value per octave so "
+                    "measurement noise in the sub-bass, where a sweep this "
+                    "long resolves only a few independent samples per "
+                    "octave, does not read as excess group delay; a real, "
+                    "resolution-supported low-frequency GD feature is "
+                    "unaffected"
+                ),
             },
             "ranking": {
                 "raw": [
@@ -327,6 +347,17 @@ def run_search(
                     f"can drift from the chosen value while the raw magnitude "
                     f"null score stays within {PLATEAU_TOLERANCE_DB:g} dB of its "
                     "optimum; wider is more robust to real-world drift"
+                ),
+                "low_end_extension": (
+                    "low_end_extension_hz/post_eq_low_end_extension_hz are an "
+                    "in-band, F3-style diagnostic: the lowest frequency the "
+                    "broad trend reaches, scanning down from its own value "
+                    "at the top of the band, before permanently falling "
+                    f"{LOW_END_EXTENSION_THRESHOLD_DB:g} dB below that "
+                    "reference. Lower is more extended. This is diagnostic "
+                    "only - it is not a raw or EQ'd ranking key - a "
+                    "placement's null/excess-GD/tail severity always "
+                    "decides the winner regardless of how extended it is"
                 ),
             },
         },

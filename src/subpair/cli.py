@@ -9,6 +9,7 @@ from typing import Sequence
 
 from .api import RewApiError, RewClient
 from .cache import CacheError, write_cache
+from .dsp import ShelfOptions
 from .engine import SearchOptions, run_search
 from .html_report import ReportError, build_report
 from .verification import VerificationError, run_verification
@@ -180,6 +181,7 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="COUNT",
         help="maximum ranked pairs shown per mode (default: 15)",
     )
+    _add_shelf_arguments(report)
 
     verify = commands.add_parser("verify", help="compare one physical sum with a prediction")
     verify.add_argument("--url", default=DEFAULT_REW_URL, help="REW API root URL")
@@ -190,7 +192,37 @@ def _build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--band", nargs=2, type=float, metavar=("LOW_HZ", "HIGH_HZ"))
     verify.add_argument("--keep-level", action="store_true", help="do not remove a constant level offset")
     verify.add_argument("--output", type=Path, default=Path("subpair-verification.html"))
+    _add_shelf_arguments(verify)
     return parser
+
+
+def _add_shelf_arguments(subparser: argparse.ArgumentParser) -> None:
+    """A fixed, broad low-shelf tonal control, independent of the fitted PEQ bank.
+
+    Shared by ``report``/``verify`` only: it never reaches ``search`` or any
+    ranking key, so it cannot change which placement wins (see
+    ``dsp.ShelfOptions``).
+    """
+    subparser.add_argument(
+        "--low-shelf-freq",
+        type=_bounded_float(1.0, 20000.0),
+        default=None,
+        metavar="HZ",
+        help="low-shelf corner frequency; required if --low-shelf-gain is nonzero",
+    )
+    subparser.add_argument(
+        "--low-shelf-gain",
+        type=_bounded_float(-15.0, 15.0),
+        default=0.0,
+        metavar="DB",
+        help="low-shelf boost/cut, -15..15 dB (default: 0, disabled)",
+    )
+    subparser.add_argument(
+        "--low-shelf-slope",
+        type=_bounded_float(0.1, 1.0),
+        default=1.0,
+        help=argparse.SUPPRESS,
+    )
 
 
 def _fetch(args: argparse.Namespace) -> int:
@@ -265,7 +297,7 @@ def _print_ranking(result: dict, top: int) -> None:
         print(f"\n{label} ranking")
         print(
             "Rank  Pair     Pol   Delay ms  Gain dB  Null dB  Excess ms  "
-            "Excess95 ms  Tail ms  Rel SPL"
+            "Excess95 ms  Tail ms  Ext Hz  Rel SPL"
         )
         for row in rows[:top]:
             pair = f"{row['first']}+{row['second']}"
@@ -277,6 +309,7 @@ def _print_ranking(result: dict, top: int) -> None:
                 f"{row['post_eq_excess_gd_ms' if eq else 'excess_gd_ms']:>9.3f}  "
                 f"{row['post_eq_excess_gd_tail_ms' if eq else 'excess_gd_tail_ms']:>11.3f}  "
                 f"{row['post_eq_tail_ms' if eq else 'raw_tail_ms']:>7.1f}  "
+                f"{row['post_eq_low_end_extension_hz' if eq else 'low_end_extension_hz']:>6.1f}  "
                 f"{row['post_eq_relative_spl_db' if eq else 'relative_spl_db']:>+7.2f}"
             )
 
@@ -310,6 +343,14 @@ def _search(args: argparse.Namespace) -> int:
     return 0
 
 
+def _shelf_options(args: argparse.Namespace) -> ShelfOptions:
+    return ShelfOptions(
+        freq_hz=args.low_shelf_freq,
+        gain_db=args.low_shelf_gain,
+        slope=args.low_shelf_slope,
+    )
+
+
 def _report(args: argparse.Namespace) -> int:
     results = _results_path(args.cache, args.results)
     output = build_report(
@@ -318,6 +359,7 @@ def _report(args: argparse.Namespace) -> int:
         args.output,
         top=args.top,
         limit=args.limit,
+        shelf=_shelf_options(args),
     )
     print(f"Wrote self-contained report to {output.resolve()}")
     return 0
@@ -334,6 +376,7 @@ def _verify(args: argparse.Namespace) -> int:
         measurement_id=args.measurement,
         keep_level=args.keep_level,
         band_override=tuple(args.band) if args.band else None,
+        shelf=_shelf_options(args),
     )
     print(
         f"Measurement #{value['measurement_index']} {value['measurement_name']}: "

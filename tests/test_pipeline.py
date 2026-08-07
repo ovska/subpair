@@ -13,14 +13,19 @@ from subpair.cli import _build_parser
 from subpair.engine import SearchOptions, run_search
 from subpair.dsp import (
     EqOptions,
+    ShelfOptions,
     _denoised_residual,
     _excess_gd_authority,
+    _smooth_by_variable_octaves,
     db20,
     excess_gd_tail_ms,
     fit_eq_filters,
     excess_group_delay,
+    gd_smoothing_octaves,
     gd_weighted_null_score,
     log_frequency_grid,
+    low_end_extension_hz,
+    low_shelf_response,
     null_scores,
     peq_response,
 )
@@ -52,6 +57,75 @@ class PipelineTests(unittest.TestCase):
         )
         self.assertEqual(overridden.max_cut, 24.0)
         self.assertEqual(overridden.tie_tolerance_db, 0.5)
+
+    def test_low_shelf_cli_arguments_on_report_and_verify(self):
+        parser = _build_parser()
+        for command in ("report", "verify"):
+            defaults = parser.parse_args([command])
+            self.assertIsNone(defaults.low_shelf_freq)
+            self.assertEqual(defaults.low_shelf_gain, 0.0)
+            self.assertEqual(defaults.low_shelf_slope, 1.0)
+            overridden = parser.parse_args(
+                [command, "--low-shelf-freq", "40", "--low-shelf-gain", "-4.5"]
+            )
+            self.assertEqual(overridden.low_shelf_freq, 40.0)
+            self.assertEqual(overridden.low_shelf_gain, -4.5)
+            with self.assertRaises(SystemExit):
+                parser.parse_args([command, "--low-shelf-gain", "20"])
+
+    def test_shelf_options_requires_frequency_when_gain_is_nonzero(self):
+        with self.assertRaisesRegex(ValueError, "requires a low-shelf frequency"):
+            ShelfOptions(gain_db=3.0)
+        ShelfOptions()  # inactive default is valid
+        ShelfOptions(freq_hz=40.0, gain_db=0.0)  # frequency without gain is inert, not an error
+
+    def test_shelf_options_inactive_response_is_flat(self):
+        frequencies = log_frequency_grid(20.0, 150.0, 48)
+        response = ShelfOptions().response(frequencies, 4000.0)
+        np.testing.assert_allclose(response, 1.0)
+        self.assertFalse(ShelfOptions().active)
+        self.assertFalse(ShelfOptions(freq_hz=40.0).active)
+        self.assertTrue(ShelfOptions(freq_hz=40.0, gain_db=3.0).active)
+
+    def test_low_shelf_response_reaches_target_gain_at_dc_and_zero_up_high(self):
+        frequencies = np.array([1.0, 640.0, 1000.0])
+        response_db = db20(low_shelf_response(frequencies, 4000.0, 40.0, 6.0, slope=1.0))
+        self.assertAlmostEqual(float(response_db[0]), 6.0, places=2)
+        self.assertLess(abs(float(response_db[-1])), 0.01)
+        # A standard RBJ shelf crosses half its dB gain at fc itself.
+        at_fc = db20(low_shelf_response(np.array([40.0]), 4000.0, 40.0, 6.0, slope=1.0))
+        self.assertAlmostEqual(float(at_fc[0]), 3.0, places=2)
+
+    def test_low_shelf_response_is_monotonic_between_its_asymptotes(self):
+        dense = np.geomspace(1.0, 1000.0, 500)
+        response_db = db20(low_shelf_response(dense, 4000.0, 40.0, 6.0, slope=1.0))
+        self.assertTrue(np.all(np.diff(response_db) <= 1e-9))
+
+    def test_low_end_extension_hz_reports_band_edge_when_fully_extended(self):
+        frequencies = log_frequency_grid(25.0, 150.0, 48)
+        flat_trend = np.zeros_like(frequencies)
+        self.assertAlmostEqual(low_end_extension_hz(flat_trend, frequencies), 25.0, places=3)
+
+    def test_low_end_extension_hz_matches_a_known_rolloff_corner(self):
+        frequencies = log_frequency_grid(25.0, 150.0, 48)
+        corner = 60.0
+        # Flat above the corner, -6 dB/octave below it: the -3 dB point is
+        # exactly half an octave below the corner.
+        trend = np.where(
+            frequencies >= corner, 0.0, -6.0 * np.log2(corner / frequencies)
+        )
+        expected = corner * 2.0 ** -0.5
+        self.assertLess(abs(low_end_extension_hz(trend, frequencies) - expected) / expected, 0.05)
+
+    def test_low_end_extension_hz_does_not_recover_past_a_transient_dip(self):
+        frequencies = log_frequency_grid(25.0, 150.0, 48)
+        trend = np.zeros_like(frequencies)
+        dip_index = int(np.argmin(np.abs(frequencies - 100.0)))
+        trend[dip_index - 1 : dip_index + 2] = -5.0  # transient dip, recovers to 0 on both sides
+        extension = low_end_extension_hz(trend, frequencies)
+        # A dip on the way down still marks the limit, even though the
+        # (lower-frequency) response below it recovers back to reference.
+        self.assertGreaterEqual(extension, frequencies[dip_index])
 
     def test_banded_sort_key_is_identity_when_tolerance_is_zero(self):
         from subpair.engine import _banded_sort_key
@@ -399,6 +473,84 @@ class PipelineTests(unittest.TestCase):
         self.assertGreater(full_score, 0.5)
         self.assertLess(limited_score, full_score * 0.01)
 
+    def test_gd_smoothing_octaves_grows_toward_dc_and_vanishes_up_high(self):
+        frequencies = np.array([15.0, 25.0, 40.0, 100.0, 150.0])
+        sigma = gd_smoothing_octaves(frequencies, native_resolution_hz=1.0)
+        self.assertTrue(np.all(np.diff(sigma) < 0.0))  # strictly decreasing with frequency
+        self.assertGreater(float(sigma[0]), float(sigma[-1]) * 4.0)
+        self.assertTrue(
+            np.array_equal(
+                gd_smoothing_octaves(frequencies, native_resolution_hz=0.0),
+                np.zeros_like(frequencies),
+            )
+        )
+
+    def test_smooth_by_variable_octaves_is_identity_at_zero_sigma(self):
+        rng = np.random.default_rng(1)
+        values = rng.standard_normal(200)
+        smoothed = _smooth_by_variable_octaves(values, ppo=48, sigma_octaves=np.zeros_like(values))
+        np.testing.assert_allclose(smoothed, values)
+
+    def test_smooth_by_variable_octaves_matches_fixed_sigma_at_a_ladder_rung(self):
+        rng = np.random.default_rng(2)
+        values = rng.standard_normal(200)
+        from scipy import ndimage
+
+        expected = ndimage.gaussian_filter1d(values, sigma=1.0 * 48, mode="nearest", truncate=3.0)
+        smoothed = _smooth_by_variable_octaves(values, ppo=48, sigma_octaves=np.full_like(values, 1.0))
+        np.testing.assert_allclose(smoothed, expected)
+
+    def test_excess_group_delay_native_resolution_smooths_subbass_noise_more_than_treble(self):
+        sample_rate = 4000.0
+        n_fft = 8192
+        fft_frequencies = np.fft.rfftfreq(n_fft, 1.0 / sample_rate)
+        evaluation_frequencies = log_frequency_grid(15.0, 150.0, 48)
+        rng = np.random.default_rng(0)
+        # Zero-mean, per-native-bin phase noise: a stand-in for ordinary
+        # measurement noise, with no genuine broadband GD feature at all.
+        noise = 0.03 * rng.standard_normal(fft_frequencies.size)
+        spectrum = np.exp(1j * noise)
+        _, unsmoothed = excess_group_delay(spectrum, fft_frequencies, evaluation_frequencies)
+        _, smoothed = excess_group_delay(
+            spectrum,
+            fft_frequencies,
+            evaluation_frequencies,
+            native_resolution_hz=1.0,
+            ppo=48,
+        )
+        low_mask = evaluation_frequencies < 25.0
+        high_mask = evaluation_frequencies > 90.0
+        low_reduction = float(np.std(unsmoothed[low_mask]) / np.std(smoothed[low_mask]))
+        high_reduction = float(np.std(unsmoothed[high_mask]) / np.std(smoothed[high_mask]))
+        self.assertGreater(low_reduction, 3.0)
+        self.assertGreater(low_reduction, high_reduction * 2.0)
+
+    def test_excess_group_delay_native_resolution_preserves_a_genuine_broad_feature(self):
+        sample_rate = 4000.0
+        n_fft = 8192
+        fft_frequencies = np.fft.rfftfreq(n_fft, 1.0 / sample_rate)
+        evaluation_frequencies = log_frequency_grid(15.0, 150.0, 48)
+        # A real, roughly one-octave-wide phase-storage feature, well clear
+        # of the band edge so edge-derivative artifacts don't confound it.
+        genuine_phase = 2.5 * np.exp(
+            -0.5 * (np.log2(np.maximum(fft_frequencies, 1e-6) / 40.0) / 0.4) ** 2
+        )
+        spectrum = np.exp(1j * genuine_phase)
+        unsmoothed_score, unsmoothed_curve = excess_group_delay(
+            spectrum, fft_frequencies, evaluation_frequencies
+        )
+        smoothed_score, smoothed_curve = excess_group_delay(
+            spectrum,
+            fft_frequencies,
+            evaluation_frequencies,
+            native_resolution_hz=1.0,
+            ppo=48,
+        )
+        self.assertGreater(
+            float(np.max(np.abs(smoothed_curve))), 0.5 * float(np.max(np.abs(unsmoothed_curve)))
+        )
+        self.assertGreater(smoothed_score, 0.7 * unsmoothed_score)
+
     def test_excess_gd_tail_ms_is_shape_neutral_for_equal_area(self):
         # A narrow, tall spike and a wider, shallower bump of the same area
         # (peak height x width) should score similarly: neither a naive
@@ -558,6 +710,16 @@ class PipelineTests(unittest.TestCase):
                 "raw, unsmoothed",
             )
             self.assertEqual(loaded["settings"]["ranking"]["tie_tolerance_db"], 0.0)
+            self.assertIn("low_end_extension", loaded["settings"]["ranking"])
+            self.assertIn("native_resolution", loaded["settings"])
+            # low_end_extension_hz is diagnostic-only: it must not appear in
+            # either ranking's declared sort-key field list.
+            self.assertNotIn(
+                "low_end_extension_hz", loaded["settings"]["ranking"]["raw"]
+            )
+            self.assertNotIn(
+                "post_eq_low_end_extension_hz", loaded["settings"]["ranking"]["eq"]
+            )
             for row in result["pairs"]:
                 self.assertIn("magnitude_only_null_score_db", row)
                 self.assertIn("post_eq_magnitude_only_null_score_db", row)
@@ -566,6 +728,39 @@ class PipelineTests(unittest.TestCase):
                 )
                 self.assertGreaterEqual(row["delay_plateau_ms"], 0.0)
                 self.assertGreaterEqual(row["gain_plateau_db"], 0.0)
+                self.assertIn("low_end_extension_hz", row)
+                self.assertIn("post_eq_low_end_extension_hz", row)
+                self.assertGreaterEqual(row["low_end_extension_hz"], 25.0)
+                self.assertLessEqual(row["low_end_extension_hz"], 150.0)
+                self.assertGreaterEqual(row["post_eq_low_end_extension_hz"], 25.0)
+                self.assertLessEqual(row["post_eq_low_end_extension_hz"], 150.0)
+            no_shelf_report = root / "report-no-shelf.html"
+            shelf_report = root / "report-shelf.html"
+            build_report(cache, results_path, no_shelf_report, top=2, limit=3)
+            build_report(
+                cache,
+                results_path,
+                shelf_report,
+                top=2,
+                limit=3,
+                shelf=ShelfOptions(freq_hz=40.0, gain_db=4.0),
+            )
+            no_shelf_page = no_shelf_report.read_text()
+            shelf_page = shelf_report.read_text()
+
+            def ranking_tables(page: str) -> list[str]:
+                return re.findall(
+                    r'<table id="ranking-(?:raw|eq)".*?</table>', page, flags=re.DOTALL
+                )
+
+            self.assertEqual(len(ranking_tables(no_shelf_page)), 2)
+            self.assertEqual(ranking_tables(no_shelf_page), ranking_tables(shelf_page))
+            self.assertNotIn("LS Fc", no_shelf_page)
+            self.assertNotIn("not scored", no_shelf_page)
+            self.assertIn("LS Fc 40.0 Hz  Gain +4.0 dB", shelf_page)
+            self.assertIn("Post-EQ + low shelf (tonal, not scored)", shelf_page)
+            self.assertIn("not reflected in the ranking metrics", shelf_page)
+
             report = root / "report.html"
             build_report(cache, results_path, report, top=2, limit=3)
             first_render = report.read_bytes()
@@ -609,6 +804,8 @@ class PipelineTests(unittest.TestCase):
             self.assertIn('"shape":"spline"', page)
             self.assertIn("EQ authority", page)
             self.assertIn("background:hsla(", page)
+            self.assertIn("Extension", page)
+            self.assertIn("not part of the ranking", page)
             self.assertIn("Fitted PEQ filters", page)
             self.assertIn("Pre-EQ excess GD", page)
             self.assertIn("Post-EQ excess GD", page)

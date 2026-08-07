@@ -12,7 +12,7 @@ from plotly.offline import get_plotlyjs
 
 from .api import RewClient
 from .cache import CachedMeasurement, load_cache
-from .dsp import AnalysisContext, db20
+from .dsp import AnalysisContext, ShelfOptions, db20
 from .html_report import load_results
 
 
@@ -65,7 +65,9 @@ def run_verification(
     measurement_id: str | None = None,
     keep_level: bool = False,
     band_override: tuple[float, float] | None = None,
+    shelf: ShelfOptions | None = None,
 ) -> dict[str, Any]:
+    shelf = shelf or ShelfOptions()
     cached, _ = load_cache(cache_dir)
     results = load_results(results_path)
     matches = [row for row in results["pairs"] if int(row["rank"]) == rank]
@@ -99,6 +101,8 @@ def run_verification(
         float(pair["delay_ms"]),
         float(pair["gain_db"]),
     )
+    if shelf.active:
+        predicted = predicted * shelf.response(context.frequencies, context.sample_rate)
     bins = np.fft.rfftfreq(impulse.size, 1.0 / sample_rate)
     measured_fft = np.fft.rfft(impulse)
     measured = np.interp(context.frequencies, bins, measured_fft.real) + 1j * np.interp(
@@ -143,6 +147,12 @@ def run_verification(
         div_id="verification-plot",
     )
     title = client.measurement_title(selected)
+    shelf_line = (
+        f"Low shelf applied to prediction: {shelf.gain_db:+.1f} dB at "
+        f"{shelf.freq_hz:g} Hz, slope {shelf.slope:.2f}<br>"
+        if shelf.active
+        else ""
+    )
     document = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>subpair verification</title>
 <style>body{{margin:2rem auto;max-width:1200px;background:#07111f;color:#e5edf8;font:15px/1.5 system-ui,sans-serif}}
@@ -150,7 +160,7 @@ def run_verification(
 <script>{get_plotlyjs()}</script></head><body><h1>subpair verification</h1>
 <div class="summary"><strong>{html.escape(title)}</strong><br>Maximum absolute deviation in band:
 {max_deviation:.3f} dB · constant measured-level offset: {level_offset:+.3f} dB<br>
-API routes discovered from {html.escape(routes.spec_url)}</div>{plot}</body></html>"""
+{shelf_line}API routes discovered from {html.escape(routes.spec_url)}</div>{plot}</body></html>"""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(document, encoding="utf-8")
     return {

@@ -163,6 +163,49 @@ def null_scores(
     return np.max(dip, axis=-1)
 
 
+LOW_END_EXTENSION_THRESHOLD_DB = 3.0
+
+
+def low_end_extension_hz(
+    trend_db: np.ndarray,
+    frequencies: np.ndarray,
+    threshold_db: float = LOW_END_EXTENSION_THRESHOLD_DB,
+) -> float:
+    """Lowest frequency the broad trend reaches before permanently falling threshold_db.
+
+    An in-band, F3-style extension estimate. The reference level is the
+    trend's own value at the very top of the band (closest to a
+    subwoofer's typical crossover, normally the best-supported and
+    flattest part of the passband); ``trend_db`` is already the ~1-octave
+    broad-trend curve (see ``broad_trend_db``), so a single point of it is
+    itself already reasonably denoised without needing an extra averaging
+    window - and avoids a window blending in whatever rolloff it's
+    supposed to be measuring *from* if the passband reference sits close
+    to the band edge. Scanning downward from there, this returns the
+    highest frequency at which the *running minimum* trend level first
+    falls ``threshold_db`` below that reference and does not recover: a
+    transient dip on the way down still marks the limit, since it is
+    audible regardless of what the response does further below it. This is
+    purely diagnostic - it is not part of the raw or EQ'd ranking key - so a
+    placement's own null/excess-GD/tail severity always decides the winner;
+    it only summarizes how far down the winning (or any) placement reaches.
+
+    Reports the band's own lower edge, rather than extrapolating past it,
+    when the trend never drops by ``threshold_db`` anywhere in the band
+    (fully extended through the analyzed range).
+    """
+    frequencies = np.asarray(frequencies, dtype=np.float64)
+    trend_db = np.asarray(trend_db, dtype=np.float64)
+    if frequencies.size == 0:
+        return 0.0
+    threshold = float(trend_db[-1]) - threshold_db
+    running_min_from_top = np.minimum.accumulate(trend_db[::-1])[::-1]
+    meets_threshold = running_min_from_top >= threshold
+    if not np.any(meets_threshold):
+        return float(frequencies[-1])
+    return float(frequencies[np.argmax(meets_threshold)])
+
+
 def peq_response(
     frequencies: np.ndarray, sample_rate: float, fc: float, q: float, gain_db: float
 ) -> np.ndarray:
@@ -187,6 +230,81 @@ def peq_response(
     response = np.ones_like(numerator, dtype=np.complex128)
     np.divide(numerator, denominator, out=response, where=np.abs(denominator) > 1e-14)
     return response
+
+
+def low_shelf_response(
+    frequencies: np.ndarray,
+    sample_rate: float,
+    fc: float,
+    gain_db: float,
+    slope: float = 1.0,
+) -> np.ndarray:
+    """RBJ Audio EQ Cookbook low-shelf biquad response.
+
+    ``slope`` is the RBJ "S" shelf-slope parameter, ``0 < S <= 1``; ``S = 1``
+    is the steepest transition available without gain overshoot. Unlike
+    ``peq_response``'s constant-Q bell, this approaches ``gain_db`` well
+    below ``fc`` and 0 dB well above it, by design: it is a broad tonal
+    control, not a corrective filter, and is deliberately not fitted by
+    ``fit_eq_filters`` (see ``ShelfOptions``).
+    """
+    f = np.asarray(frequencies, dtype=np.float64)
+    omega = 2.0 * np.pi * f / sample_rate
+    omega0 = 2.0 * np.pi * fc / sample_rate
+    cosine0 = np.cos(omega0)
+    sine0 = np.sin(omega0)
+    a = 10.0 ** (gain_db / 40.0)
+    sqrt_a = math.sqrt(a)
+    alpha = 0.5 * sine0 * math.sqrt((a + 1.0 / a) * (1.0 / slope - 1.0) + 2.0)
+    b0 = a * ((a + 1.0) - (a - 1.0) * cosine0 + 2.0 * sqrt_a * alpha)
+    b1 = 2.0 * a * ((a - 1.0) - (a + 1.0) * cosine0)
+    b2 = a * ((a + 1.0) - (a - 1.0) * cosine0 - 2.0 * sqrt_a * alpha)
+    a0 = (a + 1.0) + (a - 1.0) * cosine0 + 2.0 * sqrt_a * alpha
+    a1 = -2.0 * ((a - 1.0) + (a + 1.0) * cosine0)
+    a2 = (a + 1.0) + (a - 1.0) * cosine0 - 2.0 * sqrt_a * alpha
+    z1 = np.exp(-1j * omega)
+    z2 = z1 * z1
+    numerator = b0 + b1 * z1 + b2 * z2
+    denominator = a0 + a1 * z1 + a2 * z2
+    response = np.ones_like(numerator, dtype=np.complex128)
+    np.divide(numerator, denominator, out=response, where=np.abs(denominator) > 1e-14)
+    return response
+
+
+@dataclass(frozen=True)
+class ShelfOptions:
+    """A fixed, user-specified low-shelf tonal control.
+
+    Deliberately separate from ``EqOptions``/``fit_eq_filters``: this is a
+    broad tonality preference set directly by the user (more/less sub-bass),
+    not a correction fitted against a measured target. It is applied only
+    when generating a report or running verification (see ``cli.py``'s
+    ``report``/``verify`` subcommands) and never reaches ``search`` or any
+    ranking key, so a tonal choice can never change which placement wins.
+    """
+
+    freq_hz: float | None = None
+    gain_db: float = 0.0
+    slope: float = 1.0
+
+    def __post_init__(self) -> None:
+        if self.gain_db != 0.0 and self.freq_hz is None:
+            raise ValueError("A nonzero low-shelf gain requires a low-shelf frequency")
+        if self.freq_hz is not None and self.freq_hz <= 0.0:
+            raise ValueError("Low-shelf frequency must be positive")
+        if not -15.0 <= self.gain_db <= 15.0:
+            raise ValueError("Low-shelf gain must be between -15 and 15 dB")
+        if not 0.1 <= self.slope <= 1.0:
+            raise ValueError("Low-shelf slope must be between 0.1 and 1.0")
+
+    @property
+    def active(self) -> bool:
+        return self.gain_db != 0.0 and self.freq_hz is not None
+
+    def response(self, frequencies: np.ndarray, sample_rate: float) -> np.ndarray:
+        if not self.active:
+            return np.ones_like(np.asarray(frequencies, dtype=np.float64), dtype=np.complex128)
+        return low_shelf_response(frequencies, sample_rate, self.freq_hz, self.gain_db, self.slope)
 
 
 @dataclass(frozen=True)
@@ -597,6 +715,75 @@ def minimum_phase_log_spectrum(spectrum: np.ndarray) -> np.ndarray:
     return np.fft.rfft(minimum_cepstrum, n=n_fft)
 
 
+MIN_RELIABLE_NATIVE_BINS = 6.0
+
+
+def gd_smoothing_octaves(
+    frequencies: np.ndarray,
+    native_resolution_hz: float,
+    min_native_bins: float = MIN_RELIABLE_NATIVE_BINS,
+) -> np.ndarray:
+    """Gaussian smoothing sigma, in octaves, that averages ~min_native_bins native bins.
+
+    ``native_resolution_hz`` (``sample_rate / length`` of the *unpadded* cached
+    impulse; see ``AnalysisContext.native_resolution_hz``) is the coarsest
+    frequency spacing a sweep/capture of that length actually resolves;
+    anything finer comes from zero-padded interpolation, not new
+    information. The number of native bins packed into one octave around
+    frequency ``f`` is roughly ``f / native_resolution_hz``, so the sigma
+    needed to average a fixed count of them grows without bound as ``f``
+    falls toward (and below) that native spacing, and is negligible once
+    ``f`` is many multiples of it. A short sweep or a low analysis band
+    therefore gets progressively more smoothing exactly where excess-GD
+    noise is otherwise worst; a long sweep is smoothed almost nowhere.
+    """
+    frequencies = np.asarray(frequencies, dtype=np.float64)
+    if native_resolution_hz <= 0.0:
+        return np.zeros_like(frequencies)
+    return np.log2(1.0 + min_native_bins * native_resolution_hz / frequencies)
+
+
+_GD_SMOOTHING_LADDER_OCTAVES = (0.0, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0)
+
+
+def _smooth_by_variable_octaves(
+    values: np.ndarray, ppo: int, sigma_octaves: np.ndarray
+) -> np.ndarray:
+    """Approximate per-point-variable-sigma Gaussian smoothing on a log grid.
+
+    ``ndimage.gaussian_filter1d`` only takes one sigma per call. This
+    precomputes the curve at each rung of ``_GD_SMOOTHING_LADDER_OCTAVES``
+    (sigma expressed as a bin count, exact because the grid is uniform in
+    log-frequency) and linearly blends, per point, between the two rungs
+    bracketing that point's own requested ``sigma_octaves``. Vectorised and
+    deterministic; a point requesting 0 octaves reproduces the raw value
+    exactly, and a point past the top rung is clamped to the most-smoothed
+    curve rather than extrapolated.
+    """
+    values = np.asarray(values, dtype=np.float64)
+    ladder = np.asarray(_GD_SMOOTHING_LADDER_OCTAVES, dtype=np.float64)
+    target = np.clip(np.asarray(sigma_octaves, dtype=np.float64), 0.0, ladder[-1])
+    rungs = [values]
+    for octaves in ladder[1:]:
+        rungs.append(
+            ndimage.gaussian_filter1d(
+                values, sigma=octaves * ppo, mode="nearest", truncate=3.0
+            )
+        )
+    rungs = np.asarray(rungs)
+    upper_index = np.clip(np.searchsorted(ladder, target, side="left"), 1, ladder.size - 1)
+    lower_index = upper_index - 1
+    lower_octaves = ladder[lower_index]
+    upper_octaves = ladder[upper_index]
+    blend = np.clip(
+        (target - lower_octaves) / np.maximum(upper_octaves - lower_octaves, EPS), 0.0, 1.0
+    )
+    points = np.arange(values.size)
+    lower_values = rungs[lower_index, points]
+    upper_values = rungs[upper_index, points]
+    return lower_values * (1.0 - blend) + upper_values * blend
+
+
 def _weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
     order = np.argsort(values, kind="stable")
     ordered_values = values[order]
@@ -610,6 +797,8 @@ def excess_group_delay(
     fft_frequencies: np.ndarray,
     evaluation_frequencies: np.ndarray,
     integration_range: tuple[float, float] | None = None,
+    native_resolution_hz: float | None = None,
+    ppo: int = 48,
 ) -> tuple[float, np.ndarray]:
     """Return energy-weighted mean absolute excess GD and its de-offset curve.
 
@@ -617,6 +806,17 @@ def excess_group_delay(
     supplied spectra and evaluation grid. When ``integration_range`` is set,
     only that frequency interval contributes to common-delay removal and the
     scalar score used for ranking.
+
+    When ``native_resolution_hz`` is given (the cache's unpadded frequency
+    resolution; see ``AnalysisContext.native_resolution_hz``), the returned
+    curve is progressively smoothed, via ``gd_smoothing_octaves``, wherever
+    the evaluation grid is finer than that sweep/capture can actually
+    resolve - almost always the sub-bass, where a short sweep leaves few
+    genuinely independent samples per octave and ordinary measurement noise
+    otherwise shows up as large, sign-flipping group-delay swings around
+    zero. Leaving this ``None`` (the default) reproduces the original,
+    unsmoothed curve, e.g. for callers that supply hand-built curves rather
+    than a real cache's resolution.
     """
     log_minimum = minimum_phase_log_spectrum(spectrum)
     minimum_phase = np.imag(log_minimum)
@@ -640,8 +840,13 @@ def excess_group_delay(
         if np.count_nonzero(score_mask) < 3:
             raise ValueError("Excess-GD integration range contains fewer than three points")
     # A constant group delay is the arbitrary common time origin. Removing its
-    # weighted median leaves frequency-dependent (excess) storage/decay.
+    # weighted median (computed from the raw, unsmoothed curve, so the
+    # smoothing below cannot bias the common-delay estimate itself) leaves
+    # frequency-dependent (excess) storage/decay.
     group_delay -= _weighted_median(group_delay[score_mask], weights[score_mask])
+    if native_resolution_hz is not None:
+        sigma_octaves = gd_smoothing_octaves(evaluation_frequencies, native_resolution_hz)
+        group_delay = _smooth_by_variable_octaves(group_delay, ppo, sigma_octaves)
     score_frequencies = evaluation_frequencies[score_mask]
     score_weights = weights[score_mask]
     score_delays = group_delay[score_mask]
@@ -768,6 +973,12 @@ class AnalysisContext:
     def __post_init__(self) -> None:
         self.sample_rate = self.measurements[0].sample_rate
         self.length = self.measurements[0].impulse.size
+        # The *unpadded* capture length sets the native, non-interpolated
+        # frequency resolution: zero-padding (used for minimum-phase/CSD
+        # work below) makes the spectrum smoother to look at but does not
+        # add real information finer than this. See excess_group_delay's
+        # use of gd_smoothing_octaves for why this matters most near DC.
+        self.native_resolution_hz = self.sample_rate / self.length
         if self.band[1] >= self.sample_rate / 2.0:
             raise ValueError(
                 f"Band upper edge {self.band[1]:g} Hz must be below Nyquist "
@@ -888,6 +1099,8 @@ def pair_diagnostics(
         full_frequencies,
         context.frequencies,
         integration_range=eq_options.correction_range,
+        native_resolution_hz=context.native_resolution_hz,
+        ppo=context.ppo,
     )
     filters, eq_grid, eq_metadata = fit_eq_filters(
         grid_sum,
@@ -920,6 +1133,8 @@ def pair_diagnostics(
         full_frequencies,
         context.frequencies,
         integration_range=eq_options.correction_range,
+        native_resolution_hz=context.native_resolution_hz,
+        ppo=context.ppo,
     )
     dsp_target = eq_options.target == "dsp"
     result: dict[str, Any] = {
@@ -935,6 +1150,7 @@ def pair_diagnostics(
         ),
         "raw_tail_ms": float(np.max(raw_tail_by_band)),
         "raw_tail_by_band_ms": [round(float(value), 6) for value in raw_tail_by_band],
+        "low_end_extension_hz": low_end_extension_hz(trend_db, context.frequencies),
         "post_eq_null_score_db": gd_weighted_null_score(
             post_magnitude_db,
             post_trend_db,
@@ -951,6 +1167,7 @@ def pair_diagnostics(
         ),
         "post_eq_tail_ms": float(np.max(tail_by_band)),
         "tail_by_band_ms": [round(float(value), 6) for value in tail_by_band],
+        "post_eq_low_end_extension_hz": low_end_extension_hz(post_trend_db, context.frequencies),
         "filters": filters,
         "eq_target": eq_metadata["target"],
         "eq_target_level_db": float(eq_metadata["target_level_db"]),
