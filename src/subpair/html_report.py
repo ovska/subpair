@@ -15,6 +15,17 @@ from .cache import load_cache
 from .dsp import AnalysisContext, EqOptions, ShelfOptions, pair_diagnostics
 
 
+# Hover tooltip number formats, shared across every chart: dB/ms values get
+# one decimal place, Hz and percentage values are shown as full/whole
+# numbers - explicit templates rather than Plotly's own default formatting,
+# which varies by trace and is often needlessly precise.
+_HOVER_HZ_DB = "%{x:.0f} Hz<br>%{y:.1f} dB<extra></extra>"
+_HOVER_HZ_MS = "%{x:.0f} Hz<br>%{y:.1f} ms<extra></extra>"
+_HOVER_HZ_PERCENT = "%{x:.0f} Hz<br>%{y:.0f}%<extra></extra>"
+_HOVER_MS_HZ_DB = "%{x:.1f} ms<br>%{y:.0f} Hz<br>%{z:.1f} dB<extra></extra>"
+_HOVER_HZ_MS_OVERLAY = "%{y:.0f} Hz · %{x:.1f} ms<extra></extra>"
+
+
 class ReportError(RuntimeError):
     pass
 
@@ -54,6 +65,7 @@ def _magnitude_figure(
             y=data["solo_first_db"],
             name=pair["first_name"],
             line={"color": "#fb7185", "width": 1.4},
+            hovertemplate=_HOVER_HZ_DB,
         )
     )
     figure.add_trace(
@@ -62,6 +74,7 @@ def _magnitude_figure(
             y=data["solo_second_db"],
             name=pair["second_name"],
             line={"color": "#fbbf24", "width": 1.4},
+            hovertemplate=_HOVER_HZ_DB,
         )
     )
     figure.add_trace(
@@ -71,6 +84,7 @@ def _magnitude_figure(
             name="Raw sum",
             line={"color": "#7dd3fc", "width": 1},
             visible=True if raw else "legendonly",
+            hovertemplate=_HOVER_HZ_DB,
         )
     )
     if not raw:
@@ -81,6 +95,7 @@ def _magnitude_figure(
                 name="EQ target (range/GD aware)",
                 line={"color": "#e879f9", "width": 1.5},
                 visible="legendonly",
+                hovertemplate=_HOVER_HZ_DB,
             )
         )
         figure.add_trace(
@@ -89,6 +104,7 @@ def _magnitude_figure(
                 y=data["post_eq_db"],
                 name="Post-EQ sum",
                 line={"color": "#86efac", "width": 1.7},
+                hovertemplate=_HOVER_HZ_DB,
             )
         )
         figure.add_trace(
@@ -99,6 +115,7 @@ def _magnitude_figure(
                 line={"color": "#c4b5fd", "width": 1.7},
                 visible="legendonly",
                 yaxis="y2",
+                hovertemplate=_HOVER_HZ_DB,
             )
         )
     layout: dict[str, Any] = {
@@ -148,6 +165,7 @@ def _overview_figure(
                 },
                 meta={"pair_key": key},
                 visible=key in selected_keys,
+                hovertemplate=_HOVER_HZ_DB,
             )
         )
     figure.update_layout(
@@ -194,6 +212,7 @@ def _overview_excess_figure(
                 },
                 meta={"pair_key": key},
                 visible=key in selected_keys,
+                hovertemplate=_HOVER_HZ_MS,
             )
         )
     figure.add_hline(y=0.0, line={"color": "#64748b", "width": 1})
@@ -223,6 +242,7 @@ def _excess_figure(data: dict[str, Any], *, raw: bool = False) -> go.Figure:
             y=data[f"{prefix}excess_curve_ms"],
             line={"color": "#c4b5fd", "width": 2, "shape": "spline", "smoothing": 1.0},
             name=f"{label} excess GD",
+            hovertemplate=_HOVER_HZ_MS,
         )
     )
     if not raw:
@@ -233,6 +253,7 @@ def _excess_figure(data: dict[str, Any], *, raw: bool = False) -> go.Figure:
                 line={"color": "#86efac", "width": 1.5},
                 name="EQ authority",
                 yaxis="y2",
+                hovertemplate=_HOVER_HZ_PERCENT,
             )
         )
     figure.add_hline(y=0.0, line={"color": "#64748b", "width": 1})
@@ -267,6 +288,7 @@ def _decay_figure(data: dict[str, Any], *, raw: bool = False) -> go.Figure:
             zmax=0,
             colorscale="Turbo",
             colorbar={"title": "dB"},
+            hovertemplate=_HOVER_MS_HZ_DB,
         )
     )
     overlay_common = {
@@ -277,7 +299,7 @@ def _decay_figure(data: dict[str, Any], *, raw: bool = False) -> go.Figure:
             "shape": "spline",
             "smoothing": 1.0,
         },
-        "hovertemplate": "%{y:.1f} Hz · %{x:.2f} ms<extra></extra>",
+        "hovertemplate": _HOVER_HZ_MS_OVERLAY,
     }
     figure.add_trace(
         go.Scatter(

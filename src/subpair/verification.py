@@ -13,7 +13,7 @@ from plotly.offline import get_plotlyjs
 from .api import RewClient
 from .cache import CachedMeasurement, load_cache
 from .dsp import AnalysisContext, ShelfOptions, db20
-from .html_report import load_results
+from .html_report import _HOVER_HZ_DB, load_results
 
 
 class VerificationError(RuntimeError):
@@ -124,10 +124,20 @@ def run_verification(
 
     figure = go.Figure()
     figure.add_trace(
-        go.Scatter(x=context.frequencies, y=predicted_db, name="Predicted sum")
+        go.Scatter(
+            x=context.frequencies,
+            y=predicted_db,
+            name="Predicted sum",
+            hovertemplate=_HOVER_HZ_DB,
+        )
     )
     figure.add_trace(
-        go.Scatter(x=context.frequencies, y=aligned_measured_db, name="Physical measurement")
+        go.Scatter(
+            x=context.frequencies,
+            y=aligned_measured_db,
+            name="Physical measurement",
+            hovertemplate=_HOVER_HZ_DB,
+        )
     )
     figure.add_trace(
         go.Scatter(
@@ -136,6 +146,7 @@ def run_verification(
             name="Deviation",
             yaxis="y2",
             line={"color": "#fb7185", "width": 1.7},
+            hovertemplate=_HOVER_HZ_DB,
         )
     )
     figure.update_layout(
