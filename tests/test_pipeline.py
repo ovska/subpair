@@ -211,102 +211,6 @@ class PipelineTests(unittest.TestCase):
         extension = low_end_extension_hz(trend, frequencies)
         self.assertLess(abs(extension - expected) / expected, 0.05)
 
-    def test_low_end_extension_hz_reference_db_rewards_a_louder_placement(self):
-        # Two placements with the *same* rolloff shape but a real, several-dB
-        # difference in absolute output must be directly comparable when a
-        # shared reference is supplied: the quieter one should report worse
-        # (higher) extension even though its own shape, judged purely
-        # against itself, is identical to the louder one's.
-        frequencies = log_frequency_grid(25.0, 150.0, 48)
-        corner = 60.0
-        shape = np.where(frequencies >= corner, 0.0, -6.0 * np.log2(corner / frequencies))
-        louder = shape + 10.0
-        quieter = shape + 4.0
-        reference_db = 0.5 * (float(np.max(louder)) + float(np.max(quieter)))
-        self_referential = low_end_extension_hz(quieter, frequencies)
-        cross_pair = low_end_extension_hz(quieter, frequencies, reference_db=reference_db)
-        self.assertAlmostEqual(self_referential, low_end_extension_hz(louder, frequencies), places=3)
-        self.assertGreater(cross_pair, self_referential)
-        self.assertLess(
-            low_end_extension_hz(louder, frequencies, reference_db=reference_db), cross_pair
-        )
-
-    def test_low_end_extension_hz_reference_db_reports_none_when_never_reached(self):
-        # A placement whose own peak never gets within threshold_db of the
-        # shared reference has no frequency at which it is "in spec" - this
-        # must report None, not a misleadingly-normal in-band (or even
-        # top-edge) number a caller might mistake for a real crossing.
-        frequencies = log_frequency_grid(25.0, 150.0, 48)
-        flat_trend = np.zeros_like(frequencies)
-        extension = low_end_extension_hz(flat_trend, frequencies, reference_db=10.0)
-        self.assertIsNone(extension)
-
-    def test_low_end_extension_hz_departure_from_a_reference_curve_ranks_by_same_frequency_spl(self):
-        # low_end_extension_hz doesn't care how its caller built the
-        # reference curve subtracted into the departure it's given - this
-        # exercises the generic mechanism with a simple two-curve average as
-        # the reference. A and B share the exact same peak (20 dB, both
-        # above 50 Hz) - a peak-scalar-average design would treat them
-        # identically - but A is 7 dB louder than B specifically below
-        # 50 Hz, which is what should actually decide low-end extension.
-        frequencies = log_frequency_grid(25.0, 150.0, 48)
-        louder_at_low_end = np.where(frequencies <= 50.0, 5.0, 20.0)
-        quieter_at_low_end = np.where(frequencies <= 50.0, -2.0, 20.0)
-        reference_curve = 0.5 * (louder_at_low_end + quieter_at_low_end)
-        louder_extension = low_end_extension_hz(
-            louder_at_low_end - reference_curve, frequencies, reference_db=0.0
-        )
-        quieter_extension = low_end_extension_hz(
-            quieter_at_low_end - reference_curve, frequencies, reference_db=0.0
-        )
-        self.assertAlmostEqual(louder_extension, 25.0, places=3)
-        self.assertLess(abs(quieter_extension - 50.0) / 50.0, 0.02)
-
-    def test_low_end_extension_hz_best_curve_beats_average_curve_as_a_reference(self):
-        # run_search actually uses the *elementwise maximum* across every
-        # pair's curve as the reference, not the mean - this reproduces why.
-        # Most real placements roll off toward the bottom of the band to
-        # some degree, so an *average* curve already has a "typical"
-        # rolloff baked into its own shape: a pair (B) that rolls off by
-        # only a fairly ordinary amount can still be *above* a mean that
-        # includes several worse pairs (C, D) everywhere, and therefore
-        # reads as "fully extended" even though it clearly falls behind the
-        # best available pair (A) starting well above the band edge - the
-        # exact failure mode reported against the real cache (two pairs a
-        # genuine 6 dB apart at 30 Hz both read as fully extended against
-        # their mean). The *best* curve has no such baked-in rolloff.
-        frequencies = log_frequency_grid(25.0, 150.0, 48)
-        corner_a, corner_b = 30.0, 45.0
-
-        def rolloff(corner: float, plateau_db: float) -> np.ndarray:
-            return np.where(
-                frequencies >= corner,
-                plateau_db,
-                plateau_db - 6.0 * np.log2(corner / frequencies),
-            )
-
-        loudest = rolloff(corner_a, 18.0)  # extends well past 30 Hz
-        moderate = rolloff(corner_b, 18.0)  # starts rolling off at 45 Hz
-        quiet_one = rolloff(corner_b, 8.0)
-        quiet_two = rolloff(corner_b, 6.0)
-        curves = [loudest, moderate, quiet_one, quiet_two]
-
-        average_curve = np.mean(curves, axis=0)
-        average_extension = low_end_extension_hz(
-            moderate - average_curve, frequencies, reference_db=0.0
-        )
-        self.assertAlmostEqual(average_extension, 25.0, places=3)
-
-        best_curve = np.max(curves, axis=0)
-        best_extension = low_end_extension_hz(
-            moderate - best_curve, frequencies, reference_db=0.0
-        )
-        # -3 dB is half an octave below the 45 Hz corner at 6 dB/octave:
-        # 45 * 2**-0.5 =~ 31.8 Hz - well below "fully extended" (25 Hz) but
-        # a real, in-band corner, unlike the average-referenced case above.
-        self.assertGreater(best_extension, 30.0)
-        self.assertLess(best_extension, 35.0)
-
     def test_ranking_table_renders_none_extension_as_an_empty_gray_cell(self):
         base = {
             "polarity": 1,
@@ -796,7 +700,7 @@ class PipelineTests(unittest.TestCase):
         group_delay = np.concatenate([[6.0], rest])  # index 0 is the outlier
         weights = np.ones_like(group_delay)
         unfiltered = _monotonic_gd_baseline(group_delay, weights)
-        denoised = _monotonic_gd_baseline_from_gradient(group_delay, weights)
+        denoised = _monotonic_gd_baseline_from_gradient(group_delay, weights, ppo=48)
         self.assertAlmostEqual(float(unfiltered[0]), 6.0, places=6)
         self.assertLess(float(denoised[0]), 2.0)
         # A run this short/mild elsewhere shouldn't be dragged around by the
@@ -805,15 +709,19 @@ class PipelineTests(unittest.TestCase):
 
     def test_monotonic_gd_baseline_from_gradient_still_finds_a_genuine_broad_rise(self):
         # A real, broad low-frequency rise on a realistic (log-spaced) grid
-        # - not a single edge sample - must survive the same denoise
-        # essentially unchanged.
+        # - not a single edge sample - must substantially survive the same
+        # denoise. A full 1-octave median window (MONOTONIC_BASELINE_DENOISE_
+        # OCTAVES) does measurably soften even a smooth, genuine C/f rise
+        # (the same "preferentially preserves, not perfectly unaffected"
+        # tradeoff as this module's native-resolution smoothing elsewhere),
+        # but the shape and magnitude must stay recognizably close.
         frequencies = log_frequency_grid(25.0, 150.0, 48)
         group_delay = 5.0 / frequencies  # smooth, genuine C/f rise
         weights = np.ones_like(group_delay)
         unfiltered = _monotonic_gd_baseline(group_delay, weights)
-        denoised = _monotonic_gd_baseline_from_gradient(group_delay, weights)
+        denoised = _monotonic_gd_baseline_from_gradient(group_delay, weights, ppo=48)
         self.assertLess(
-            float(np.max(np.abs(denoised - unfiltered))) / float(np.max(unfiltered)), 0.1
+            float(np.max(np.abs(denoised - unfiltered))) / float(np.max(unfiltered)), 0.2
         )
 
     def test_excess_group_delay_rejects_unknown_gd_baseline(self):
@@ -1232,7 +1140,7 @@ class PipelineTests(unittest.TestCase):
             self.assertIn("EQ authority", page)
             self.assertIn("background:hsla(", page)
             self.assertTrue(
-                all(table.count("background:hsla(") == 17 for table in ranking_tables(page))
+                all(table.count("background:hsla(") == 18 for table in ranking_tables(page))
             )
             self.assertNotIn(".plotly-graph-div { width:100% !important; }", page)
             self.assertIn(".overview-panels,#pair-details { position:relative; }", page)

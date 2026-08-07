@@ -116,29 +116,25 @@ the real logic. Data flows strictly one-way through `.subpair-cache/`:
      diagnostic-only F3/F6-style extension estimates reported in
      `search`/`report` tables. They are deliberately **not** part of either
      ranking tuple — see "Key invariants" below. `low_end_extension_hz()`
-     itself is self-referential (scores a curve against its own envelope
-     peak) unless a caller passes `reference_db`; `run_search` uses this by
-     computing the *elementwise maximum* trend curve (the best SPL any pair
-     actually achieves, per frequency — not necessarily from the same pair
-     throughout) across every pair in the search and calling it with each
-     pair's `(trend - best_curve)` departure curve and `reference_db=0.0`,
-     so the reported Hz is a same-frequency, cross-pair-comparable answer
-     rather than a self-referential shape estimate. Two alternatives were
-     tried and reverted: comparing only against a single scalar (a pair's
-     own peak, or the loudest pair's peak) breaks down for a bandpass-shaped
-     sum, since a pair whose peak sits at a different frequency than the
-     reference can read as *less* extended while actually being louder at
-     the low end; comparing against the *elementwise average* curve breaks
-     down because most real placements roll off toward the bottom of the
-     band to some degree, so the average curve already has a "typical"
-     rolloff baked into its own shape, hiding exactly that amount of rolloff
-     in any pair that isn't unusually bad — confirmed on a real search where
-     two pairs a genuine 6 dB apart at 30 Hz both read as fully extended
-     against their average. The function returns `None` (not a misleading
-     in-band or edge number) when a curve's departure never gets within
-     threshold of the reference even at its own best point; render that as
-     an empty/gray cell, never as a
-     number.
+     is deliberately self-referential: it scores a curve against its own
+     envelope peak only, never against a level or curve shared with other
+     pairs. Two cross-pair-referenced designs were tried and reverted:
+     comparing only against a single scalar (a pair's own peak, or the
+     loudest pair's peak) breaks down for a bandpass-shaped sum, since a
+     pair whose peak sits at a different frequency than the reference can
+     read as *less* extended while actually being louder at the low end;
+     comparing against an elementwise aggregate curve across the search
+     (tried both average and best/maximum) breaks down because every real
+     placement rolls off toward the bottom of the band to *some* degree, so
+     any such aggregate curve has its own baked-in rolloff too - for
+     whichever pair dominates the aggregate (typically the loudest
+     candidate), this hides essentially all of its own rolloff, regardless
+     of how much it actually declines in absolute terms. Confirmed on a real
+     search: the loudest pair visibly rolled off by a real, several-dB
+     amount well above the band edge on its own magnitude plot, yet reported
+     a trivial "fully extended" (25 Hz) answer under both the average- and
+     best-curve designs. Cross-pair absolute SPL is a different, legitimate
+     question already answered by `relative_spl_db`/`post_eq_relative_spl_db`.
    - `ShelfOptions`/`low_shelf_response` add a fixed, user-specified broad
      low-shelf tonal control. It is a `search`-time `EqOptions.shelf` field
      (`cli.py`'s `--low-shelf-*` flags live on the `search` subcommand),
