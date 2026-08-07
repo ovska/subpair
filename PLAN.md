@@ -570,13 +570,21 @@ The work is complete when:
 
 # Low-frequency excess-group-delay reliability and an independent low-shelf tool
 
-**Status: implemented.** Both parts landed as designed below, including the
-Section B.1 scope decision (report/verify-time only, never reaching `search`
-or any ranking key). `format_version` is now `5`. See
+**Status: implemented, with a post-review documentation correction.** Both
+parts landed as designed below, including the Section B.1 scope decision
+(report/verify-time only, never reaching `search` or any ranking key).
+`format_version` is now `5`. See
 `dsp.native_resolution_hz`/`gd_smoothing_octaves`/`_smooth_by_variable_octaves`/
 `ShelfOptions`/`low_shelf_response`, `engine.py`'s `native_resolution` settings
 block, and the `--low-shelf-*` flags on `report`/`verify`. Phase checklists
 below are left in place as a record of what was done.
+
+Code review after the initial implementation found the docs overclaimed that
+genuine low-frequency GD features are "unaffected" by the smoothing (Risk #3
+below); they were corrected to say the smoothing *preferentially preserves*
+broad features over narrow noise, which is what the algorithm and tests
+actually support, and the smoothing ladder's ceiling was tightened from 8 to
+4 octaves.
 
 ## Summary
 
@@ -1035,8 +1043,11 @@ still bump for Part A, independently).
 - Short/coarse-resolution sweeps with injected zero-mean sub-bass noise: scores are
   materially smaller and stable across different random seeds/noise realizations of
   the same underlying (noise-free) response.
-- A genuine, resolution-supported low-frequency excess-GD feature is still detected at
-  essentially unchanged severity.
+- A genuine, resolution-supported low-frequency excess-GD feature is preferentially
+  preserved relative to noise, retaining a substantial majority of its severity
+  (not "essentially unchanged" - see Risk #3 below for the actual measured retention
+  and why a hard "unaffected" claim would overstate what a smoothing-based approach
+  can guarantee).
 - `format_version` bump rejects old `search-results.json` files with a precise
   "rerun `subpair search`" message, exactly like the existing `< 4` guard.
 - Full existing `test_pipeline.py` suite passes unmodified in intent (values may
@@ -1068,11 +1079,25 @@ still bump for Part A, independently).
    (see the test-threshold calibration in `test_pipeline.py`'s Part A tests) rather
    than a formal sweep. Revisit if real-world short-sweep reports still look
    under- or over-smoothed.
-3. **Over-smoothing risk:** confirmed non-fatal at the chosen constants for a
-   roughly one-octave-wide genuine feature under moderately coarse resolution (the
-   feature retained ~72% peak amplitude, ~87% of its scalar score, in the
-   calibration run) — real but bounded, not "smoothed into invisibility". If a
-   narrower genuine feature turns out to be over-smoothed in practice, shrink
+3. **Over-smoothing risk — confirmed real, not eliminated.** Post-review, the initial
+   docs overclaimed that a "genuine, resolution-supported low-frequency excess-GD
+   feature is unaffected." That is not generally true: this is Gaussian smoothing
+   with sigma up to several octaves at the extreme, and any real feature whose own
+   bandwidth is comparable to or narrower than the sigma applied at its frequency is
+   attenuated by construction, the same tradeoff any smoothing-based denoiser makes.
+   `sample_rate / length` is a resolution *heuristic*, and `MIN_RELIABLE_NATIVE_BINS`
+   is a chosen estimator width, neither is a hard measurement-theory reliable/
+   unreliable boundary. The corrected, accurate claim (now in `README.md`/`dsp.py`/
+   `engine.py`) is that this smoothing *preferentially preserves* broad features
+   relative to narrow noise. Measured retention for one roughly one-octave-wide
+   synthetic feature under moderately coarse resolution: ~72% peak amplitude, ~87%
+   of scalar score — real but bounded, not "smoothed into invisibility," and not
+   "unaffected" either. The ladder's top rung was also tightened from 8 to 4 octaves
+   so a pathologically short capture cannot smooth away an entire realistic analysis
+   band. This was validated against exactly one feature shape/width, not the "wider
+   family of physically plausible GD features" a fuller validation would use;
+   revisit with broader synthetic coverage if real-world short-sweep reports turn out
+   to under-report genuine narrow low-frequency features. If that happens, shrink
    `MIN_RELIABLE_NATIVE_BINS` or the sigma-ladder's top rung rather than raising the
    floor another way.
 4. **Boxcar vs Gaussian ladder-blend (Section A.3) — resolved:** implemented the

@@ -166,40 +166,73 @@ def null_scores(
 LOW_END_EXTENSION_THRESHOLD_DB = 3.0
 
 
+def _two_sided_envelope_db(trend_db: np.ndarray) -> np.ndarray:
+    """Two-sided envelope: at each point, the higher of what's attainable from either side.
+
+    ``envelope[i] = min(max(trend_db[:i+1]), max(trend_db[i:]))``. A narrow
+    dip/null that fully recovers on both sides cannot pull this down - both
+    directions "see past" it to the higher level beyond - but a genuine,
+    sustained decline *does* pull it down, since the declining side's own
+    running max keeps tracking the decline while the other (undeclined) side
+    stays pinned at the higher passband level, and the envelope takes
+    whichever side is lower. This is the same idea as
+    ``_two_sided_wide_dip_db``'s two-sided reference, without that function's
+    inter-metric margin: there is nothing else here it needs to avoid
+    double-counting against, and no margin means every index - including
+    both array edges - gets a well-defined value from a plain two-sided
+    cummax rather than needing edge-case fallbacks.
+    """
+    trend_db = np.asarray(trend_db, dtype=np.float64)
+    ascending = np.maximum.accumulate(trend_db)
+    descending = np.maximum.accumulate(trend_db[::-1])[::-1]
+    return np.minimum(ascending, descending)
+
+
 def low_end_extension_hz(
     trend_db: np.ndarray,
     frequencies: np.ndarray,
     threshold_db: float = LOW_END_EXTENSION_THRESHOLD_DB,
 ) -> float:
-    """Lowest frequency the broad trend reaches before permanently falling threshold_db.
+    """Lowest frequency the broad trend's envelope reaches before it permanently rolls off.
 
-    An in-band, F3-style extension estimate. The reference level is the
-    trend's own value at the very top of the band (closest to a
-    subwoofer's typical crossover, normally the best-supported and
-    flattest part of the passband); ``trend_db`` is already the ~1-octave
-    broad-trend curve (see ``broad_trend_db``), so a single point of it is
-    itself already reasonably denoised without needing an extra averaging
-    window - and avoids a window blending in whatever rolloff it's
-    supposed to be measuring *from* if the passband reference sits close
-    to the band edge. Scanning downward from there, this returns the
-    highest frequency at which the *running minimum* trend level first
-    falls ``threshold_db`` below that reference and does not recover: a
-    transient dip on the way down still marks the limit, since it is
-    audible regardless of what the response does further below it. This is
-    purely diagnostic - it is not part of the raw or EQ'd ranking key - so a
-    placement's own null/excess-GD/tail severity always decides the winner;
-    it only summarizes how far down the winning (or any) placement reaches.
+    An in-band, F3-style extension estimate, deliberately measuring the
+    *envelope* (``_two_sided_envelope_db``) rather than the raw trend: a
+    narrow, recoverable dip or null is a placement defect the null-score
+    metric already scores on its own terms, not a low-end-extension defect,
+    so it must not be able to drag the reported extension up to its own
+    frequency by itself the way scanning the raw trend would. A response
+    that is flat down to 25 Hz but has one isolated -5 dB notch at 100 Hz
+    still reports ~25 Hz extension, not ~100 Hz, because the envelope's
+    two-sided cummax sees past the notch on both sides. A *sustained*
+    rolloff is not treated this way: below the corner, only the low side of
+    the envelope keeps tracking the decline (the high side has nothing left
+    to see past), so the envelope decline still lands close to where the
+    raw trend actually crosses the threshold.
+
+    The reference level is the envelope's own value at the very top of the
+    band (closest to a subwoofer's typical crossover, normally the
+    best-supported and flattest part of the passband) - which, by
+    construction, always equals the raw trend there, since the top index's
+    own one-sided cummax can never exceed its own value. Scanning downward
+    from there, this returns the highest frequency at which the *running
+    minimum* of the envelope first falls ``threshold_db`` below that
+    reference and does not recover. This is purely diagnostic - it is not
+    part of the raw or EQ'd ranking key - so a placement's own
+    null/excess-GD/tail severity always decides the winner; it only
+    summarizes how far down the winning (or any) placement's underlying
+    passband shape reaches.
 
     Reports the band's own lower edge, rather than extrapolating past it,
-    when the trend never drops by ``threshold_db`` anywhere in the band
+    when the envelope never drops by ``threshold_db`` anywhere in the band
     (fully extended through the analyzed range).
     """
     frequencies = np.asarray(frequencies, dtype=np.float64)
     trend_db = np.asarray(trend_db, dtype=np.float64)
     if frequencies.size == 0:
         return 0.0
-    threshold = float(trend_db[-1]) - threshold_db
-    running_min_from_top = np.minimum.accumulate(trend_db[::-1])[::-1]
+    envelope = _two_sided_envelope_db(trend_db)
+    threshold = float(envelope[-1]) - threshold_db
+    running_min_from_top = np.minimum.accumulate(envelope[::-1])[::-1]
     meets_threshold = running_min_from_top >= threshold
     if not np.any(meets_threshold):
         return float(frequencies[-1])
@@ -736,6 +769,13 @@ def gd_smoothing_octaves(
     ``f`` is many multiples of it. A short sweep or a low analysis band
     therefore gets progressively more smoothing exactly where excess-GD
     noise is otherwise worst; a long sweep is smoothed almost nowhere.
+
+    ``native_resolution_hz`` is a useful resolution *heuristic*, not a hard
+    measurement-theory reliable/unreliable boundary, and ``min_native_bins``
+    is a chosen estimator width, not a threshold derived from first
+    principles - see ``_smooth_by_variable_octaves``'s ladder cap for the
+    corresponding tradeoff this makes against genuine, narrower-than-the-
+    kernel low-frequency features.
     """
     frequencies = np.asarray(frequencies, dtype=np.float64)
     if native_resolution_hz <= 0.0:
@@ -743,7 +783,14 @@ def gd_smoothing_octaves(
     return np.log2(1.0 + min_native_bins * native_resolution_hz / frequencies)
 
 
-_GD_SMOOTHING_LADDER_OCTAVES = (0.0, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0)
+# Capped at 4 octaves - already wider than most analysis bands - so a
+# pathologically short capture cannot smooth away the entire band; see
+# gd_smoothing_octaves. A genuine feature whose own bandwidth is comparable
+# to or narrower than the sigma applied at its frequency is still
+# attenuated by this smoothing, the same tradeoff any smoothing-based
+# denoiser makes - this preferentially preserves broad features relative to
+# narrow noise, it does not leave every genuine feature unaffected.
+_GD_SMOOTHING_LADDER_OCTAVES = (0.0, 0.25, 0.5, 1.0, 2.0, 4.0)
 
 
 def _smooth_by_variable_octaves(

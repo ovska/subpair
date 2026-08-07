@@ -17,6 +17,7 @@ from subpair.dsp import (
     _denoised_residual,
     _excess_gd_authority,
     _smooth_by_variable_octaves,
+    _two_sided_envelope_db,
     db20,
     excess_gd_tail_ms,
     fit_eq_filters,
@@ -117,15 +118,61 @@ class PipelineTests(unittest.TestCase):
         expected = corner * 2.0 ** -0.5
         self.assertLess(abs(low_end_extension_hz(trend, frequencies) - expected) / expected, 0.05)
 
-    def test_low_end_extension_hz_does_not_recover_past_a_transient_dip(self):
+    def test_low_end_extension_hz_ignores_an_isolated_recoverable_notch(self):
+        # A notch is a placement defect the null score already measures on
+        # its own terms; it must not by itself read as a loss of low-end
+        # extension when the response is otherwise flat well past it.
         frequencies = log_frequency_grid(25.0, 150.0, 48)
         trend = np.zeros_like(frequencies)
         dip_index = int(np.argmin(np.abs(frequencies - 100.0)))
-        trend[dip_index - 1 : dip_index + 2] = -5.0  # transient dip, recovers to 0 on both sides
+        trend[dip_index - 1 : dip_index + 2] = -5.0  # isolated notch, recovers to 0 on both sides
+        self.assertAlmostEqual(low_end_extension_hz(trend, frequencies), 25.0, places=3)
+
+    def test_low_end_extension_hz_flat_to_25hz_with_a_100hz_notch_is_not_100hz(self):
+        # The motivating case: flat response down to the band edge with one
+        # unrelated notch well above it must report full extension, not the
+        # notch's own frequency.
+        frequencies = log_frequency_grid(25.0, 150.0, 48)
+        trend = np.zeros_like(frequencies)
+        notch_index = int(np.argmin(np.abs(frequencies - 100.0)))
+        trend[notch_index - 1 : notch_index + 2] = -5.0
         extension = low_end_extension_hz(trend, frequencies)
-        # A dip on the way down still marks the limit, even though the
-        # (lower-frequency) response below it recovers back to reference.
-        self.assertGreaterEqual(extension, frequencies[dip_index])
+        self.assertLess(extension, 30.0)
+        self.assertLess(extension, frequencies[notch_index] - 20.0)
+
+    def test_low_end_extension_hz_still_finds_a_sustained_rolloff_past_a_notch(self):
+        # A genuine, sustained rolloff below a notch must still be found:
+        # the envelope must not blind the scan to a real corner just
+        # because an unrelated notch sits above it.
+        frequencies = log_frequency_grid(25.0, 150.0, 48)
+        corner = 60.0
+        trend = np.where(frequencies >= corner, 0.0, -6.0 * np.log2(corner / frequencies))
+        notch_index = int(np.argmin(np.abs(frequencies - 120.0)))
+        trend[notch_index - 1 : notch_index + 2] -= 5.0
+        expected = corner * 2.0 ** -0.5
+        extension = low_end_extension_hz(trend, frequencies)
+        self.assertLess(abs(extension - expected) / expected, 0.05)
+
+    def test_low_end_extension_hz_still_finds_a_permanent_rolloff(self):
+        # Unlike a notch, a sustained drop that never recovers is the
+        # genuine extension limit and must still be reported close to where
+        # it happens, not smoothed away by the envelope.
+        frequencies = log_frequency_grid(25.0, 150.0, 48)
+        trend = np.where(frequencies < 140.0, -10.0, 0.0)
+        extension = low_end_extension_hz(trend, frequencies)
+        self.assertLess(abs(extension - 140.0) / 140.0, 0.05)
+
+    def test_two_sided_envelope_db_fills_in_a_narrow_dip_but_not_a_sustained_decline(self):
+        frequencies = log_frequency_grid(25.0, 150.0, 48)
+        notch = np.zeros_like(frequencies)
+        notch_index = int(np.argmin(np.abs(frequencies - 100.0)))
+        notch[notch_index - 1 : notch_index + 2] = -5.0
+        envelope = _two_sided_envelope_db(notch)
+        self.assertAlmostEqual(float(envelope[notch_index]), 0.0, places=6)
+
+        decline = np.where(frequencies < 60.0, -10.0, 0.0)
+        envelope = _two_sided_envelope_db(decline)
+        np.testing.assert_allclose(envelope, decline)
 
     def test_banded_sort_key_is_identity_when_tolerance_is_zero(self):
         from subpair.engine import _banded_sort_key
