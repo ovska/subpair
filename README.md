@@ -167,7 +167,13 @@ null-score difference within that many dB, so the fast-search's finalist
 tie-break and the raw/EQ'd pair rankings fall through to excess-GD and tail
 time between practically-indistinguishable null scores instead of a
 below-audibility difference deciding the winner outright. The default of 0
-preserves strict lexicographic behaviour. Magnitude scoring and PEQ fitting
+preserves strict lexicographic behaviour, which means a null-score gap of a
+few tenths of a dB — well within the resolution/noise of the underlying
+measurements — can otherwise decide a pair outright over another candidate
+that is dramatically better on every other metric (excess GD, tail, SPL).
+A nonzero tolerance in roughly the 1–2 dB range is a reasonable starting
+point for real measurements; `generate-reports.sh` uses 1.5. Magnitude
+scoring and PEQ fitting
 use the raw log-grid samples without fractional-octave or variable
 smoothing. The one-octave trend is only the broad reference from which raw
 dips and the conservative target are measured. Both rankings use the same
@@ -183,20 +189,32 @@ drift, temperature, or DSP quantization.
 
 Each pair also reports `low_end_extension_hz`/`post_eq_low_end_extension_hz`:
 an in-band, F3-style diagnostic giving the lowest frequency the broad
-trend's *envelope* reaches, scanning down from its own value at the top of
-the analysis band, before permanently falling 3 dB below that reference and
-not recovering. The envelope — the higher of the best level attained
-scanning up from the bottom of the band and the best level still attainable
-scanning down from the top — is deliberately not the raw trend: an isolated,
-recoverable notch is a placement defect the null score already measures on
-its own terms, so a response that is flat down to 25 Hz with one unrelated
--5 dB notch at 100 Hz still reports ~25 Hz extension, not ~100 Hz. A genuine,
-sustained rolloff is not masked this way — below the corner, the envelope
-still tracks the decline — so it is still reported close to where the raw
-trend actually crosses the threshold. Lower is more extended. This is purely
-informational — it is shown in `subpair report`'s tables and printed by
-`subpair search`, but it is not a raw or EQ'd ranking key, so it never
-changes which placement wins.
+trend's *envelope* reaches, scanning down from a shared reference level,
+before permanently falling 3 dB below that reference and not recovering.
+The reference is the loudest top-of-band trend level found among *every*
+pair in the same search (raw and EQ'd tables use their own separate
+reference) — not each pair's own top-of-band level — so a pair whose whole
+passband sits below that reference starts losing ground before its own
+rolloff even begins: two placements with similarly-shaped rolloffs but a
+real difference in absolute output no longer report nearly identical
+extension. The envelope — the higher of the best level attained scanning up
+from the bottom of the band and the best level still attainable scanning
+down from the top — is still used to find the corner, deliberately not the
+raw trend: an isolated, recoverable notch is a placement defect the null
+score already measures on its own terms, so a response that is flat down to
+25 Hz with one unrelated -5 dB notch at 100 Hz still reports ~25 Hz
+extension, not ~100 Hz. A genuine, sustained rolloff is not masked this way
+— below the corner, the envelope still tracks the decline — so it is still
+reported close to where the raw trend actually crosses the threshold. Lower
+is more extended. This is purely informational — it is shown in `subpair
+report`'s tables and printed by `subpair search`, but it is not a raw or
+EQ'd ranking key, so it never changes which placement wins; a placement's
+own null/excess-GD/tail severity always decides. Because the reference is
+shared across the whole search, it also means a quieter pair's reported
+extension can visibly worsen even though its own rolloff *shape* did not
+change — that is by design, not a regression, and the accompanying
+`relative_spl_db`/`post_eq_relative_spl_db` column in `subpair report`
+explains why.
 
 For minimum phase, subpair uses the real-cepstrum form of the Hilbert
 transform on the *full available 0-to-Nyquist magnitude*, not a brick-wall
