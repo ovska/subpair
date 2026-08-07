@@ -189,6 +189,7 @@ def run_search(
                 item[3]["null_score_db"],
                 item[3]["excess_gd_ms"],
                 item[3]["excess_gd_tail_ms"],
+                item[3]["excess_gd_peak_ms"],
                 item[3]["raw_tail_ms"],
                 0 if item[0] > 0 else 1,
                 item[1],
@@ -216,6 +217,7 @@ def run_search(
             raw_bands[i],
             pairs[i]["excess_gd_ms"],
             pairs[i]["excess_gd_tail_ms"],
+            pairs[i]["excess_gd_peak_ms"],
             pairs[i]["raw_tail_ms"],
             pairs[i]["first"],
             pairs[i]["second"],
@@ -233,6 +235,7 @@ def run_search(
             eq_bands[i],
             pairs[i]["post_eq_excess_gd_ms"],
             pairs[i]["post_eq_excess_gd_tail_ms"],
+            pairs[i]["post_eq_excess_gd_peak_ms"],
             pairs[i]["post_eq_tail_ms"],
             pairs[i]["first"],
             pairs[i]["second"],
@@ -247,7 +250,7 @@ def run_search(
         )
 
     result = {
-        "format_version": 5,
+        "format_version": 6,
         "measurement_count": len(measurements),
         "sample_rate": measurements[0].sample_rate,
         "response_length": measurements[0].impulse.size,
@@ -316,12 +319,14 @@ def run_search(
                     "null_score_db",
                     "excess_gd_ms",
                     "excess_gd_tail_ms",
+                    "excess_gd_peak_ms",
                     "raw_tail_ms",
                 ],
                 "eq": [
                     "post_eq_null_score_db",
                     "post_eq_excess_gd_ms",
                     "post_eq_excess_gd_tail_ms",
+                    "post_eq_excess_gd_peak_ms",
                     "post_eq_tail_ms",
                 ],
                 "excess_gd_range_hz": list(eq_range),
@@ -346,6 +351,15 @@ def run_search(
                     "severe spike and a wider shallower bump of the same area "
                     "score the same), so a sum that is flat on magnitude but "
                     "smeary in phase somewhere quiet is still caught"
+                ),
+                "excess_gd_peak": (
+                    "excess_gd_peak_ms/post_eq_excess_gd_peak_ms are the single "
+                    "worst denoised |excess GD| sample across the same range, "
+                    "width-invariant rather than area-based (unlike "
+                    "excess_gd_tail_ms, a narrow severe spike and a wide bump of "
+                    "the same area do not score the same here - only their peak "
+                    "heights matter). It is a tie-break after excess_gd_tail_ms, "
+                    "so it only ever separates placements whose tail already ties"
                 ),
                 "plateau_diagnostics": (
                     "delay_plateau_ms/gain_plateau_db report how far delay/gain "

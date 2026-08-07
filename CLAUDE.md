@@ -72,8 +72,12 @@ the real logic. Data flows strictly one-way through `.subpair-cache/`:
    - Two rankings are computed per pair — **raw** magnitude-only and
      **EQ'd** (post-PEQ) — each a strict lexicographic tuple (never a
      weighted blend): GD-weighted null score → excess GD → excess-GD tail →
-     decay tail. `--tie-tolerance-db` only widens what counts as a tie in the
-     *primary* metric before falling through to the rest.
+     excess-GD peak → decay tail. `excess_gd_peak_ms` is the width-invariant
+     counterpart to the area-based excess-GD tail: a denoised, plain maximum
+     of `|excess GD|`, so a narrow severe spike and a wide bump of equal peak
+     height score the same, breaking ties the area-based tail leaves exact.
+     `--tie-tolerance-db` only widens what counts as a tie in the *primary*
+     metric before falling through to the rest.
    - `gd_weighted_null_score` inflates magnitude-dip severity (and scores
      magnitude peaks) only where they coincide with real excess group delay,
      using `_excess_gd_authority` as the shared risk gate — the same gate

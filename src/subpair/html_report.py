@@ -232,6 +232,22 @@ def _excess_figure(data: dict[str, Any]) -> go.Figure:
         )
     )
     figure.add_hline(y=0.0, line={"color": "#64748b", "width": 1})
+    peak_ms = float(data["excess_gd_peak_ms"])
+    for sign in (1.0, -1.0):
+        figure.add_hline(
+            y=sign * peak_ms,
+            line={"color": "#fbbf24", "width": 1, "dash": "dot"},
+        )
+    figure.add_annotation(
+        xref="paper",
+        x=1.0,
+        y=peak_ms,
+        text=f"peak {peak_ms:.2f} ms",
+        showarrow=False,
+        font={"color": "#fbbf24", "size": 11},
+        xanchor="right",
+        yanchor="bottom",
+    )
     figure.update_layout(
         title="Excess group delay (display spline; raw data used for score)",
         xaxis={"type": "log", "title": "Frequency (Hz)"},
@@ -471,10 +487,10 @@ def build_report(
         "low_end_extension_hz",
         "post_eq_low_end_extension_hz",
     }
-    if int(results.get("format_version", 0)) < 5:
+    if int(results.get("format_version", 0)) < 6:
         raise ReportError(
-            "Search results predate resolution-aware excess-GD smoothing and "
-            "low-end extension diagnostics; run 'subpair search' again"
+            "Search results predate the width-invariant excess-GD peak "
+            "tie-break; run 'subpair search' again"
         )
     if any(
         not required_ranking_fields.issubset(pair)
@@ -532,9 +548,11 @@ def build_report(
               <p class="configuration">Sub 2: {'normal' if pair['polarity'] > 0 else 'inverted'},
                 delay {pair['delay_ms']:+.3f} ms, gain {pair['gain_db']:+.2f} dB<br>
                 <span data-mode-copy="raw">Raw: null {pair['null_score_db']:.3f} dB ·
-                excess GD {pair['excess_gd_ms']:.3f} ms · tail {pair['raw_tail_ms']:.1f} ms</span>
+                excess GD {pair['excess_gd_ms']:.3f} ms ·
+                peak {pair['excess_gd_peak_ms']:.2f} ms · tail {pair['raw_tail_ms']:.1f} ms</span>
                 <span data-mode-copy="eq">EQ’d: null {pair['post_eq_null_score_db']:.3f} dB ·
-                excess GD {pair['post_eq_excess_gd_ms']:.3f} ms · tail {pair['post_eq_tail_ms']:.1f} ms</span><br>
+                excess GD {pair['post_eq_excess_gd_ms']:.3f} ms ·
+                peak {pair['post_eq_excess_gd_peak_ms']:.2f} ms · tail {pair['post_eq_tail_ms']:.1f} ms</span><br>
                 EQ: {html.escape(eq_options.target)} target, {eq_range[0]:g}–{eq_range[1]:g} Hz,
                 {eq_options.correction_slope_db_per_octave:g} dB/oct curtain,
                 max boost {eq_options.max_boost_db:g} dB, up to
