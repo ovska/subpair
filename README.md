@@ -377,6 +377,12 @@ count. `report --limit N` limits the table and its selectable diagnostics to
 the top N results (default 15). No network connection or CDN is used when the
 report is viewed.
 
+The selected overview and pair diagnostics share one magnitude Y-axis range
+and one excess-group-delay Y-axis range, recalculated whenever the selection
+changes. Excess-GD plots include zero but clamp their lower scale limit to
+-20 ms so large negative measurement-noise excursions do not flatten the
+useful part of the curves.
+
 Each CSD heatmap includes the corresponding zero-referenced excess-group-delay
 curve and a solid 0 ms reference. A vertical overlay indicates constant delay;
 frequency-dependent bends expose excess storage without relying on visual

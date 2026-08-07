@@ -32,7 +32,13 @@ from subpair.dsp import (
     null_scores,
     peq_response,
 )
-from subpair.html_report import _ranking_table, build_report
+from subpair.html_report import (
+    _overview_excess_figure,
+    _overview_figure,
+    _ranking_table,
+    _selected_axis_ranges,
+    build_report,
+)
 
 
 def _synthetic_ir(sample_rate: float, length: int, delay: int, modes: list[tuple[float, float]]) -> np.ndarray:
@@ -45,6 +51,61 @@ def _synthetic_ir(sample_rate: float, length: int, delay: int, modes: list[tuple
 
 
 class PipelineTests(unittest.TestCase):
+    def test_selected_report_graphs_share_data_bounds_and_cap_negative_excess_gd(self):
+        rows = [
+            (
+                {
+                    "first": 1,
+                    "second": 2,
+                    "rank": 1,
+                    "eq_rank": 1,
+                    "first_name": "A",
+                    "second_name": "B",
+                },
+                {
+                    "frequencies": np.array([20.0, 40.0, 80.0]),
+                    "solo_first_db": np.array([-8.0, -2.0, 1.0]),
+                    "solo_second_db": np.array([-5.0, 0.0, 3.0]),
+                    "sum_db": np.array([-4.0, 2.0, 5.0]),
+                    "post_eq_db": np.array([-3.0, 1.0, 4.0]),
+                    "excess_curve_ms": np.array([-35.0, -2.0, 6.0]),
+                    "post_eq_excess_curve_ms": np.array([-30.0, -1.0, 5.0]),
+                },
+            ),
+            (
+                {
+                    "first": 3,
+                    "second": 4,
+                    "rank": 2,
+                    "eq_rank": 2,
+                    "first_name": "C",
+                    "second_name": "D",
+                },
+                {
+                    "frequencies": np.array([20.0, 40.0, 80.0]),
+                    "solo_first_db": np.array([-60.0, -50.0, -40.0]),
+                    "solo_second_db": np.array([20.0, 30.0, 40.0]),
+                    "sum_db": np.array([-55.0, 0.0, 35.0]),
+                    "post_eq_db": np.array([-50.0, 0.0, 30.0]),
+                    "excess_curve_ms": np.array([-80.0, 0.0, 70.0]),
+                    "post_eq_excess_curve_ms": np.array([-70.0, 0.0, 60.0]),
+                },
+            ),
+        ]
+        selected = {"1-2"}
+
+        magnitude_range, excess_range = _selected_axis_ranges(
+            rows, raw=False, selected_keys=selected
+        )
+        self.assertEqual(magnitude_range, (-8.0, 4.0))
+        self.assertEqual(excess_range, (-20.0, 5.0))
+
+        magnitude = _overview_figure(rows, "eq", selected)
+        excess = _overview_excess_figure(rows, "eq", selected)
+        self.assertEqual(tuple(magnitude.layout.yaxis.range), (-3.0, 4.0))
+        self.assertEqual(tuple(excess.layout.yaxis.range), (-20.0, 5.0))
+        self.assertEqual(excess.layout.yaxis.minallowed, -20.0)
+
     def test_report_result_limit_argument(self):
         parser = _build_parser()
         defaults = parser.parse_args(["report"])
@@ -985,6 +1046,9 @@ class PipelineTests(unittest.TestCase):
             self.assertNotIn("setReportMode", page)
             self.assertIn("setOverviewView('magnitude')", page)
             self.assertIn("setOverviewView('excess')", page)
+            self.assertIn("const excessGdLowerLimitMs=-20;", page)
+            self.assertIn("function updateSharedYAxisRanges()", page)
+            self.assertIn("low=Math.max(excessGdLowerLimitMs,low);", page)
             self.assertIn("data-pair-tabs", page)
             self.assertIn("Hotkeys 1–9", page)
             self.assertIn("aria-keyshortcuts", page)
@@ -1005,6 +1069,8 @@ class PipelineTests(unittest.TestCase):
                 )
             )
             self.assertEqual(detail_pair_keys, table_pair_keys)
+            self.assertEqual(page.count("data-magnitude-min="), len(detail_pair_keys))
+            self.assertEqual(page.count("data-excess-min="), len(detail_pair_keys))
             self.assertIn('"visible":"legendonly"', page)
             self.assertNotIn("Variable smoothed", page)
             self.assertNotIn("Nominal flat target", page)

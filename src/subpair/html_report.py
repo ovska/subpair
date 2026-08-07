@@ -24,10 +24,88 @@ _HOVER_HZ_MS = "%{x:.0f} Hz<br>%{y:.1f} ms<extra></extra>"
 _HOVER_HZ_PERCENT = "%{x:.0f} Hz<br>%{y:.0f}%<extra></extra>"
 _HOVER_MS_HZ_DB = "%{x:.1f} ms<br>%{y:.0f} Hz<br>%{z:.1f} dB<extra></extra>"
 _HOVER_HZ_MS_OVERLAY = "%{y:.0f} Hz · %{x:.1f} ms<extra></extra>"
+_EXCESS_GD_LOWER_LIMIT_MS = -20.0
 
 
 class ReportError(RuntimeError):
     pass
+
+
+def _finite_axis_range(
+    series: list[Any],
+    *,
+    lower_limit: float | None = None,
+    include_zero: bool = False,
+) -> tuple[float, float] | None:
+    """Return finite extrema suitable for a shared Plotly axis."""
+
+    low = 0.0 if include_zero else np.inf
+    high = 0.0 if include_zero else -np.inf
+    for values in series:
+        array = np.asarray(values, dtype=np.float64)
+        finite = array[np.isfinite(array)]
+        if finite.size:
+            low = min(low, float(np.min(finite)))
+            high = max(high, float(np.max(finite)))
+    if not np.isfinite(low) or not np.isfinite(high):
+        return None
+    if lower_limit is not None:
+        low = max(float(lower_limit), low)
+    if high <= low:
+        high = low + max(1.0, abs(low) * 0.05)
+    return low, high
+
+
+def _diagnostic_axis_ranges(
+    data: dict[str, Any], *, raw: bool
+) -> tuple[tuple[float, float] | None, tuple[float, float] | None]:
+    """Bounds for the primary traces shown by default in one pair diagnostic."""
+
+    magnitude = _finite_axis_range(
+        [
+            data["solo_first_db"],
+            data["solo_second_db"],
+            data["sum_db" if raw else "post_eq_db"],
+        ]
+    )
+    excess = _finite_axis_range(
+        [data["excess_curve_ms" if raw else "post_eq_excess_curve_ms"]],
+        lower_limit=_EXCESS_GD_LOWER_LIMIT_MS,
+        include_zero=True,
+    )
+    return magnitude, excess
+
+
+def _selected_axis_ranges(
+    rows: list[tuple[dict[str, Any], dict[str, Any]]],
+    *,
+    raw: bool,
+    selected_keys: set[str],
+) -> tuple[tuple[float, float] | None, tuple[float, float] | None]:
+    """Combine per-pair bounds so selected diagnostics use identical axes."""
+
+    magnitude_bounds: list[tuple[float, float]] = []
+    excess_bounds: list[tuple[float, float]] = []
+    for pair, data in rows:
+        key = f"{int(pair['first'])}-{int(pair['second'])}"
+        if key not in selected_keys:
+            continue
+        magnitude, excess = _diagnostic_axis_ranges(data, raw=raw)
+        if magnitude is not None:
+            magnitude_bounds.append(magnitude)
+        if excess is not None:
+            excess_bounds.append(excess)
+    magnitude = _finite_axis_range(magnitude_bounds) if magnitude_bounds else None
+    excess = (
+        _finite_axis_range(
+            excess_bounds,
+            lower_limit=_EXCESS_GD_LOWER_LIMIT_MS,
+            include_zero=True,
+        )
+        if excess_bounds
+        else None
+    )
+    return magnitude, excess
 
 
 def load_results(path: Path) -> dict[str, Any]:
@@ -55,7 +133,11 @@ def _plot_html(figure: go.Figure, div_id: str, *, static: bool = False) -> str:
 
 
 def _magnitude_figure(
-    pair: dict[str, Any], data: dict[str, Any], *, raw: bool = False
+    pair: dict[str, Any],
+    data: dict[str, Any],
+    *,
+    raw: bool = False,
+    y_range: tuple[float, float] | None = None,
 ) -> go.Figure:
     f = data["frequencies"]
     figure = go.Figure()
@@ -118,12 +200,15 @@ def _magnitude_figure(
                 hovertemplate=_HOVER_HZ_DB,
             )
         )
+    yaxis: dict[str, Any] = {"title": "Level (dB; cache reference)"}
+    if y_range is not None:
+        yaxis["range"] = y_range
     layout: dict[str, Any] = {
         "title": (
             "Magnitude: solos and raw sum" if raw else "Magnitude: solos and EQ’d sum"
         ),
         "xaxis": {"type": "log", "title": "Frequency (Hz)"},
-        "yaxis": {"title": "Level (dB; cache reference)"},
+        "yaxis": yaxis,
         "margin": {"l": 62, "r": 70, "t": 52, "b": 55},
         "legend": {"orientation": "h", "y": -0.22},
         "template": "plotly_dark",
@@ -145,6 +230,7 @@ def _overview_figure(
     rows: list[tuple[dict[str, Any], dict[str, Any]]],
     mode: str,
     selected_keys: set[str],
+    y_range: tuple[float, float] | None = None,
 ) -> go.Figure:
     figure = go.Figure()
     eq = mode == "eq"
@@ -168,16 +254,27 @@ def _overview_figure(
                 hovertemplate=_HOVER_HZ_DB,
             )
         )
+    if y_range is None:
+        y_range = _finite_axis_range(
+            [
+                data["post_eq_db" if eq else "sum_db"]
+                for pair, data in rows
+                if f"{int(pair['first'])}-{int(pair['second'])}" in selected_keys
+            ]
+        )
+    yaxis: dict[str, Any] = {
+        "title": (
+            "Post-EQ summed level (dB; cache reference)"
+            if eq
+            else "Raw summed level (dB; cache reference)"
+        )
+    }
+    if y_range is not None:
+        yaxis["range"] = y_range
     figure.update_layout(
         title="Selected pair EQ’d sums" if eq else "Selected pair raw sums",
         xaxis={"type": "log", "title": "Frequency (Hz)"},
-        yaxis={
-            "title": (
-                "Post-EQ summed level (dB; cache reference)"
-                if eq
-                else "Raw summed level (dB; cache reference)"
-            )
-        },
+        yaxis=yaxis,
         margin={"l": 62, "r": 24, "t": 52, "b": 55},
         legend={"orientation": "h", "y": -0.22},
         template="plotly_dark",
@@ -190,6 +287,7 @@ def _overview_excess_figure(
     rows: list[tuple[dict[str, Any], dict[str, Any]]],
     mode: str,
     selected_keys: set[str],
+    y_range: tuple[float, float] | None = None,
 ) -> go.Figure:
     figure = go.Figure()
     eq = mode == "eq"
@@ -216,6 +314,22 @@ def _overview_excess_figure(
             )
         )
     figure.add_hline(y=0.0, line={"color": "#64748b", "width": 1})
+    if y_range is None:
+        y_range = _finite_axis_range(
+            [
+                data["post_eq_excess_curve_ms" if eq else "excess_curve_ms"]
+                for pair, data in rows
+                if f"{int(pair['first'])}-{int(pair['second'])}" in selected_keys
+            ],
+            lower_limit=_EXCESS_GD_LOWER_LIMIT_MS,
+            include_zero=True,
+        )
+    yaxis: dict[str, Any] = {
+        "title": "Excess GD (ms)",
+        "minallowed": _EXCESS_GD_LOWER_LIMIT_MS,
+    }
+    if y_range is not None:
+        yaxis["range"] = y_range
     figure.update_layout(
         title=(
             "Selected pair post-EQ excess group delay"
@@ -223,7 +337,7 @@ def _overview_excess_figure(
             else "Selected pair raw excess group delay"
         ),
         xaxis={"type": "log", "title": "Frequency (Hz)"},
-        yaxis={"title": "Excess GD (ms)"},
+        yaxis=yaxis,
         margin={"l": 62, "r": 24, "t": 52, "b": 55},
         legend={"orientation": "h", "y": -0.22},
         template="plotly_dark",
@@ -232,7 +346,12 @@ def _overview_excess_figure(
     return figure
 
 
-def _excess_figure(data: dict[str, Any], *, raw: bool = False) -> go.Figure:
+def _excess_figure(
+    data: dict[str, Any],
+    *,
+    raw: bool = False,
+    y_range: tuple[float, float] | None = None,
+) -> go.Figure:
     figure = go.Figure()
     prefix = "" if raw else "post_eq_"
     label = "Raw" if raw else "Post-EQ"
@@ -257,10 +376,16 @@ def _excess_figure(data: dict[str, Any], *, raw: bool = False) -> go.Figure:
             )
         )
     figure.add_hline(y=0.0, line={"color": "#64748b", "width": 1})
+    yaxis: dict[str, Any] = {
+        "title": "Excess GD (ms)",
+        "minallowed": _EXCESS_GD_LOWER_LIMIT_MS,
+    }
+    if y_range is not None:
+        yaxis["range"] = y_range
     layout = {
         "title": f"{label} excess group delay (display spline; raw data used for score)",
         "xaxis": {"type": "log", "title": "Frequency (Hz)"},
-        "yaxis": {"title": "Excess GD (ms)"},
+        "yaxis": yaxis,
         "margin": {"l": 62, "r": 24, "t": 52, "b": 55},
         "template": "plotly_dark",
         "height": 390,
@@ -545,10 +670,9 @@ def build_report(
     default_count = max(0, min(top, len(pairs)))
     default_keys = {pair_key(pair) for pair in pairs[:default_count]}
     initial_active_key = pair_key(pairs[0]) if default_count else None
-    detail_sections = []
     diagnostic_by_key: dict[str, dict[str, Any]] = {}
     for pair in pairs:
-        data = pair_diagnostics(
+        diagnostic_by_key[pair_key(pair)] = pair_diagnostics(
             context,
             int(pair["first"]) - 1,
             int(pair["second"]) - 1,
@@ -558,8 +682,29 @@ def build_report(
             include_decay=True,
             eq_options=eq_options,
         )
+
+    overview = [(pair, diagnostic_by_key[pair_key(pair)]) for pair in pairs]
+    magnitude_range, excess_range = _selected_axis_ranges(
+        overview,
+        raw=raw,
+        selected_keys=default_keys,
+    )
+    detail_sections = []
+    for pair in pairs:
         key = pair_key(pair)
-        diagnostic_by_key[key] = data
+        data = diagnostic_by_key[key]
+        pair_magnitude_range, pair_excess_range = _diagnostic_axis_ranges(data, raw=raw)
+        axis_attributes = ""
+        if pair_magnitude_range is not None:
+            axis_attributes += (
+                f' data-magnitude-min="{pair_magnitude_range[0]:.17g}"'
+                f' data-magnitude-max="{pair_magnitude_range[1]:.17g}"'
+            )
+        if pair_excess_range is not None:
+            axis_attributes += (
+                f' data-excess-min="{pair_excess_range[0]:.17g}"'
+                f' data-excess-max="{pair_excess_range[1]:.17g}"'
+            )
         detail_class = (
             "pair-detail" if key == initial_active_key else "pair-detail is-inactive"
         )
@@ -603,7 +748,7 @@ def build_report(
             f"""
             <section class="{detail_class}" data-pair-key="{key}"
               data-pair-label="{pair['first']}+{pair['second']}"
-              data-rank="{pair[rank_key]}">
+              data-rank="{pair[rank_key]}"{axis_attributes}>
               <h2>#{pair[rank_key]} {mode_label}:
                 {html.escape(pair['first_name'])} + {html.escape(pair['second_name'])}</h2>
               <p class="configuration">Sub 2: {'normal' if pair['polarity'] > 0 else 'inverted'},
@@ -611,15 +756,17 @@ def build_report(
                 {metric_summary}<br>
                 {eq_description}
                 CSD overlay: excess GD with common delay removed; a vertical line is frequency-independent delay.</p>
-              {_plot_html(_magnitude_figure(pair, data, raw=raw), f'magnitude-{key}')}
+              {_plot_html(
+                  _magnitude_figure(pair, data, raw=raw, y_range=magnitude_range),
+                  f'magnitude-{key}',
+              )}
               {_plot_html(_decay_figure(data, raw=raw), f'decay-{key}', static=True)}
-              {_plot_html(_excess_figure(data, raw=raw), f'excess-{key}')}
+              {_plot_html(_excess_figure(data, raw=raw, y_range=excess_range), f'excess-{key}')}
               {peq_html}
             </section>
             """.strip()
         )
 
-    overview = [(pair, diagnostic_by_key[pair_key(pair)]) for pair in pairs]
     default_json = json.dumps(
         [pair_key(pair) for pair in pairs[:default_count]], separators=(",", ":")
     )
@@ -691,10 +838,16 @@ details {{ margin:22px 0; }} details pre {{ overflow:auto; color:var(--muted); }
 </div>
 <div class="overview-panels">
   <div class="overview-panel" data-overview-panel data-overview-view="magnitude">
-    {_plot_html(_overview_figure(overview, mode, default_keys), f'selected-pairs-magnitude-{mode}')}
+    {_plot_html(
+        _overview_figure(overview, mode, default_keys, magnitude_range),
+        f'selected-pairs-magnitude-{mode}',
+    )}
   </div>
   <div class="overview-panel is-inactive" data-overview-panel data-overview-view="excess">
-    {_plot_html(_overview_excess_figure(overview, mode, default_keys), f'selected-pairs-excess-{mode}')}
+    {_plot_html(
+        _overview_excess_figure(overview, mode, default_keys, excess_range),
+        f'selected-pairs-excess-{mode}',
+    )}
   </div>
 </div>
 <p class="note">{('Raw ranking: raw-magnitude null depth, raw excess group delay, then raw tail.' if raw else 'EQ’d ranking: post-EQ raw-magnitude null depth, post-EQ excess group delay, then post-EQ tail.')}</p>
@@ -724,6 +877,7 @@ document.querySelectorAll('.ranking-table th[data-type]').forEach(th=>{{
 }});
 {legend_handler}
 const reportMode={json.dumps(mode)};
+const excessGdLowerLimitMs={_EXCESS_GD_LOWER_LIMIT_MS:g};
 const selectedPairs=new Set({default_json});
 let activePair=Array.from(selectedPairs)[0]||null;
 function sectionForKey(key) {{
@@ -736,6 +890,36 @@ function orderedSelectedKeys() {{
     return Number(sectionForKey(a).dataset.rank)-Number(sectionForKey(b).dataset.rank);
   }});
 }}
+function selectedAxisRange(kind) {{
+  const bounds=orderedSelectedKeys().map(key=>{{
+    const section=sectionForKey(key);
+    return [Number(section.dataset[kind+'Min']),Number(section.dataset[kind+'Max'])];
+  }}).filter(([low,high])=>Number.isFinite(low)&&Number.isFinite(high));
+  if(!bounds.length) return null;
+  let low=Math.min(...bounds.map(bound=>bound[0]));
+  let high=Math.max(...bounds.map(bound=>bound[1]));
+  if(kind==='excess') {{
+    low=Math.max(excessGdLowerLimitMs,low);
+    high=Math.max(0,high);
+  }}
+  if(high<=low) high=low+Math.max(1,Math.abs(low)*0.05);
+  return [low,high];
+}}
+function updateSharedYAxisRanges() {{
+  const ranges={{
+    magnitude:selectedAxisRange('magnitude'),
+    excess:selectedAxisRange('excess'),
+  }};
+  ['magnitude','excess'].forEach(view=>{{
+    const range=ranges[view];
+    const plots=[document.getElementById('selected-pairs-'+view+'-'+reportMode)];
+    orderedSelectedKeys().forEach(key=>plots.push(document.getElementById(view+'-'+key)));
+    plots.filter(Boolean).forEach(plot=>{{
+      if(range) Plotly.relayout(plot,{{'yaxis.range':range,'yaxis.autorange':false}});
+      else Plotly.relayout(plot,{{'yaxis.autorange':true}});
+    }});
+  }});
+}}
 function updateOverview() {{
   ['magnitude','excess'].forEach(view=>{{
     const plot=document.getElementById('selected-pairs-'+view+'-'+reportMode);
@@ -745,6 +929,7 @@ function updateOverview() {{
       if(trace.visible!==visible) Plotly.restyle(plot,{{visible:visible}},[index]);
     }});
   }});
+  updateSharedYAxisRanges();
 }}
 function setOverviewView(view) {{
   document.querySelectorAll('[data-overview-panel]').forEach(panel=>{{
@@ -821,6 +1006,7 @@ document.addEventListener('keydown',event=>{{
 renderPairTabs();
 setOverviewView('magnitude');
 renderActiveDetail();
+updateSharedYAxisRanges();
 </script></body></html>"""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(document, encoding="utf-8")
