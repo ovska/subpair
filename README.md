@@ -141,6 +141,26 @@ sharper, more severe excursion the area-based tail metric alone cannot see.
 It does not replace `excess_gd_tail_ms`; like every metric in this ranking,
 it only breaks ties the earlier ones leave exact.
 
+All four excess-GD-derived metrics above — the null-score GD weighting,
+`excess_gd_ms`, `excess_gd_tail_ms`, and `excess_gd_peak_ms` — measure
+"excess" relative to a baseline selected by `--gd-baseline`, which is
+`flat` by default: a single constant (this curve's weighted median), so any
+frequency-dependent group delay at all counts as excess. `--gd-baseline
+monotonic` instead fits a per-point baseline, via weighted isotonic
+regression (pool-adjacent-violators), constrained to be non-increasing in
+magnitude as frequency rises, over the complete analysis band. This treats a
+genuine, physically-expected group-delay rise confined to the bottom of the
+band as normal rather than as excess — the fit can trace a high-to-low
+descent through it — while a bump anywhere the non-increasing constraint
+cannot explain (a rise appearing after a lower value earlier in the band)
+still counts in full, regardless of how wide or gentle it is; this falls out
+of the monotonic constraint itself, not a separate width heuristic. This is
+an explicit, opt-in *acoustic* assumption about what a benign low end looks
+like, not a measurement-reliability correction like the native-resolution
+smoothing below — it changes rankings, so validate it against real
+measurements before trusting it over the default. When active, the report's
+per-pair excess-GD plot overlays the fitted baseline curve.
+
 There is no weighted blend. Each later metric only breaks an exact tie in the
 earlier metrics. `--tie-tolerance-db` (0–3 dB, default 0) widens "tie" to any
 null-score difference within that many dB, so the fast-search's finalist

@@ -16,6 +16,8 @@ from subpair.dsp import (
     ShelfOptions,
     _denoised_residual,
     _excess_gd_authority,
+    _isotonic_non_increasing,
+    _monotonic_gd_baseline,
     _smooth_by_variable_octaves,
     _two_sided_envelope_db,
     db20,
@@ -59,6 +61,16 @@ class PipelineTests(unittest.TestCase):
         )
         self.assertEqual(overridden.max_cut, 24.0)
         self.assertEqual(overridden.tie_tolerance_db, 0.5)
+
+    def test_search_gd_baseline_argument(self):
+        parser = _build_parser()
+        self.assertEqual(parser.parse_args(["search"]).gd_baseline, "flat")
+        self.assertEqual(
+            parser.parse_args(["search", "--gd-baseline", "monotonic"]).gd_baseline,
+            "monotonic",
+        )
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["search", "--gd-baseline", "bogus"])
 
     def test_low_shelf_cli_arguments_on_report_and_verify(self):
         parser = _build_parser()
@@ -509,10 +521,10 @@ class PipelineTests(unittest.TestCase):
             -0.5 * (np.log2(np.maximum(fft_frequencies, 1e-6) / 125.0) / 0.08) ** 2
         )
         spectrum = np.exp(1j * phase)
-        full_score, _ = excess_group_delay(
+        full_score, _, _ = excess_group_delay(
             spectrum, fft_frequencies, evaluation_frequencies
         )
-        limited_score, _ = excess_group_delay(
+        limited_score, _, _ = excess_group_delay(
             spectrum,
             fft_frequencies,
             evaluation_frequencies,
@@ -558,8 +570,8 @@ class PipelineTests(unittest.TestCase):
         # measurement noise, with no genuine broadband GD feature at all.
         noise = 0.03 * rng.standard_normal(fft_frequencies.size)
         spectrum = np.exp(1j * noise)
-        _, unsmoothed = excess_group_delay(spectrum, fft_frequencies, evaluation_frequencies)
-        _, smoothed = excess_group_delay(
+        _, unsmoothed, _ = excess_group_delay(spectrum, fft_frequencies, evaluation_frequencies)
+        _, smoothed, _ = excess_group_delay(
             spectrum,
             fft_frequencies,
             evaluation_frequencies,
@@ -584,10 +596,10 @@ class PipelineTests(unittest.TestCase):
             -0.5 * (np.log2(np.maximum(fft_frequencies, 1e-6) / 40.0) / 0.4) ** 2
         )
         spectrum = np.exp(1j * genuine_phase)
-        unsmoothed_score, unsmoothed_curve = excess_group_delay(
+        unsmoothed_score, unsmoothed_curve, _ = excess_group_delay(
             spectrum, fft_frequencies, evaluation_frequencies
         )
-        smoothed_score, smoothed_curve = excess_group_delay(
+        smoothed_score, smoothed_curve, _ = excess_group_delay(
             spectrum,
             fft_frequencies,
             evaluation_frequencies,
@@ -598,6 +610,77 @@ class PipelineTests(unittest.TestCase):
             float(np.max(np.abs(smoothed_curve))), 0.5 * float(np.max(np.abs(unsmoothed_curve)))
         )
         self.assertGreater(smoothed_score, 0.7 * unsmoothed_score)
+
+    def test_isotonic_non_increasing_reproduces_an_already_non_increasing_sequence(self):
+        values = np.array([5.0, 5.0, 3.0, 3.0, 1.0])
+        fit = _isotonic_non_increasing(values, np.ones_like(values))
+        np.testing.assert_allclose(fit, values)
+
+    def test_isotonic_non_increasing_pools_a_local_rise(self):
+        values = np.array([1.0, 1.0, 5.0, 1.0, 1.0])
+        fit = _isotonic_non_increasing(values, np.ones_like(values))
+        self.assertTrue(np.all(np.diff(fit) <= 1e-9))
+        self.assertLess(fit[2], values[2])
+        self.assertGreater(fit[2], values[0])
+
+    def test_monotonic_gd_baseline_is_symmetric_in_sign(self):
+        group_delay = np.array([5.0, 4.0, 1.0, 3.0, 1.0])
+        weights = np.ones_like(group_delay)
+        positive_baseline = _monotonic_gd_baseline(group_delay, weights)
+        negative_baseline = _monotonic_gd_baseline(-group_delay, weights)
+        np.testing.assert_allclose(positive_baseline, -negative_baseline)
+
+    def test_excess_group_delay_rejects_unknown_gd_baseline(self):
+        fft_frequencies = np.fft.rfftfreq(8192, 1.0 / 4000.0)
+        spectrum = np.ones_like(fft_frequencies, dtype=np.complex128)
+        evaluation_frequencies = log_frequency_grid(25.0, 150.0, 48)
+        with self.assertRaisesRegex(ValueError, "gd_baseline"):
+            excess_group_delay(
+                spectrum, fft_frequencies, evaluation_frequencies, gd_baseline="bogus"
+            )
+
+    def test_excess_group_delay_monotonic_baseline_absorbs_a_genuine_bass_rise(self):
+        sample_rate = 4000.0
+        n_fft = 8192
+        fft_frequencies = np.fft.rfftfreq(n_fft, 1.0 / sample_rate)
+        evaluation_frequencies = log_frequency_grid(25.0, 150.0, 48)
+        # Flat magnitude, phase = -2*pi*C*ln(f) => group delay = C/f: a smooth
+        # rise toward the bottom of the band that gently declines with
+        # frequency, the "normal room/port behaviour" case from the README.
+        f_safe = np.maximum(fft_frequencies, 1.0)
+        time_constant = 0.125
+        phase = -2.0 * np.pi * time_constant * np.log(f_safe)
+        spectrum = np.exp(1j * phase)
+        flat_score, _, _ = excess_group_delay(
+            spectrum, fft_frequencies, evaluation_frequencies, gd_baseline="flat"
+        )
+        monotonic_score, _, monotonic_baseline = excess_group_delay(
+            spectrum, fft_frequencies, evaluation_frequencies, gd_baseline="monotonic"
+        )
+        self.assertGreater(flat_score, 0.5)
+        self.assertLess(monotonic_score, 0.25 * flat_score)
+        self.assertTrue(np.all(np.diff(np.abs(monotonic_baseline)) <= 1e-6))
+
+    def test_excess_group_delay_monotonic_baseline_still_flags_a_higher_band_bump(self):
+        sample_rate = 4000.0
+        n_fft = 8192
+        fft_frequencies = np.fft.rfftfreq(n_fft, 1.0 / sample_rate)
+        evaluation_frequencies = log_frequency_grid(25.0, 150.0, 48)
+        # A genuine, roughly one-octave-wide non-minimum-phase bump centred
+        # well above the bottom of the band, on top of near-zero phase
+        # elsewhere - not explainable by any non-increasing fit starting
+        # from ~0 at the bottom of the band.
+        bump_phase = 2.5 * np.exp(
+            -0.5 * (np.log2(np.maximum(fft_frequencies, 1e-6) / 100.0) / 0.15) ** 2
+        )
+        spectrum = np.exp(1j * bump_phase)
+        flat_score, _, _ = excess_group_delay(
+            spectrum, fft_frequencies, evaluation_frequencies, gd_baseline="flat"
+        )
+        monotonic_score, _, _ = excess_group_delay(
+            spectrum, fft_frequencies, evaluation_frequencies, gd_baseline="monotonic"
+        )
+        self.assertGreater(monotonic_score, 0.5 * flat_score)
 
     def test_excess_gd_tail_ms_is_shape_neutral_for_equal_area(self):
         # A narrow, tall spike and a wider, shallower bump of the same area
@@ -696,6 +779,14 @@ class PipelineTests(unittest.TestCase):
             excess_gd_peak_ms(positive, frequencies),
             excess_gd_peak_ms(negative, frequencies),
         )
+
+    def test_run_search_rejects_unknown_gd_baseline(self):
+        with self.assertRaisesRegex(ValueError, "gd_baseline"):
+            run_search(
+                Path("/nonexistent-cache"),
+                Path("/nonexistent-cache/out.json"),
+                SearchOptions(gd_baseline="bogus"),
+            )
 
     def test_rejects_mismatched_lengths(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -931,6 +1022,52 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(page.count('"displayModeBar": false'), len(detail_pair_keys))
             self.assertNotIn("#f0abfc", page)
             self.assertGreater(report.stat().st_size, 1_000_000)
+
+    def test_synthetic_search_and_report_with_monotonic_gd_baseline(self):
+        sample_rate = 4000.0
+        length = 4096
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cache = root / "cache"
+            definitions = [
+                (100, [(42, 0.20), (75, 0.10)]),
+                (106, [(48, 0.16), (92, 0.10)]),
+                (112, [(58, 0.18), (110, 0.08)]),
+            ]
+            rows = [
+                {
+                    "source_index": index,
+                    "title": f"Position {index}",
+                    "uuid": f"uuid-{index}",
+                    "sample_rate": sample_rate,
+                    "start_time_seconds": -0.025,
+                    "impulse": _synthetic_ir(sample_rate, length, delay, modes),
+                }
+                for index, (delay, modes) in enumerate(definitions, start=1)
+            ]
+            write_cache(cache, rows, {"test": True})
+            results_path = cache / "search-results.json"
+            result = run_search(
+                cache,
+                results_path,
+                SearchOptions(
+                    band=(25.0, 150.0),
+                    delay_range_ms=(-2.0, 2.0, 1.0),
+                    gain_range_db=(-1.0, 1.0, 1.0),
+                    ppo=24,
+                    gd_baseline="monotonic",
+                ),
+            )
+            self.assertEqual(len(result["pairs"]), 3)
+            loaded = json.loads(results_path.read_text())
+            self.assertEqual(loaded["settings"]["gd_baseline"]["mode"], "monotonic")
+            for row in result["pairs"]:
+                self.assertGreaterEqual(row["excess_gd_peak_ms"], 0.0)
+                self.assertGreaterEqual(row["post_eq_excess_gd_peak_ms"], 0.0)
+            report_path = root / "report.html"
+            build_report(cache, results_path, report_path, top=2, limit=3)
+            page = report_path.read_text()
+            self.assertIn("monotonic GD baseline", page)
 
 
 if __name__ == "__main__":
