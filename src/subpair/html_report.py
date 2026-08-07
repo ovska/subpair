@@ -516,10 +516,10 @@ def build_report(
             "Search results predate the width-invariant excess-GD peak "
             "tie-break; run 'subpair search' again"
         )
-    if int(results.get("format_version", 0)) < 9:
+    if int(results.get("format_version", 0)) < 10:
         raise ReportError(
-            "Search results predate the peak-anchored low-end extension "
-            "calculation; run 'subpair search' again"
+            "Search results predate the cross-pair average-referenced "
+            "low-end extension calculation; run 'subpair search' again"
         )
     if any(
         not required_ranking_fields.issubset(pair)

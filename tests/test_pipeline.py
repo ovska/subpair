@@ -19,6 +19,7 @@ from subpair.dsp import (
     _excess_gd_authority,
     _isotonic_non_increasing,
     _monotonic_gd_baseline,
+    _monotonic_gd_baseline_from_gradient,
     _smooth_by_variable_octaves,
     _two_sided_envelope_db,
     db20,
@@ -204,6 +205,36 @@ class PipelineTests(unittest.TestCase):
         expected = peak * 2.0 ** -0.5
         extension = low_end_extension_hz(trend, frequencies)
         self.assertLess(abs(extension - expected) / expected, 0.05)
+
+    def test_low_end_extension_hz_reference_db_rewards_a_louder_placement(self):
+        # Two placements with the *same* rolloff shape but a real, several-dB
+        # difference in absolute output must be directly comparable when a
+        # shared reference is supplied: the quieter one should report worse
+        # (higher) extension even though its own shape, judged purely
+        # against itself, is identical to the louder one's.
+        frequencies = log_frequency_grid(25.0, 150.0, 48)
+        corner = 60.0
+        shape = np.where(frequencies >= corner, 0.0, -6.0 * np.log2(corner / frequencies))
+        louder = shape + 10.0
+        quieter = shape + 4.0
+        reference_db = 0.5 * (float(np.max(louder)) + float(np.max(quieter)))
+        self_referential = low_end_extension_hz(quieter, frequencies)
+        cross_pair = low_end_extension_hz(quieter, frequencies, reference_db=reference_db)
+        self.assertAlmostEqual(self_referential, low_end_extension_hz(louder, frequencies), places=3)
+        self.assertGreater(cross_pair, self_referential)
+        self.assertLess(
+            low_end_extension_hz(louder, frequencies, reference_db=reference_db), cross_pair
+        )
+
+    def test_low_end_extension_hz_reference_db_reports_no_extension_when_never_reached(self):
+        # A placement whose own peak never gets within threshold_db of the
+        # shared reference has no frequency at which it is "in spec" - this
+        # must report the band's own top edge, not a misleadingly-normal
+        # in-band number.
+        frequencies = log_frequency_grid(25.0, 150.0, 48)
+        flat_trend = np.zeros_like(frequencies)
+        extension = low_end_extension_hz(flat_trend, frequencies, reference_db=10.0)
+        self.assertAlmostEqual(extension, frequencies[-1], places=3)
 
     def test_two_sided_envelope_db_fills_in_a_narrow_dip_but_not_a_sustained_decline(self):
         frequencies = log_frequency_grid(25.0, 150.0, 48)
@@ -659,6 +690,35 @@ class PipelineTests(unittest.TestCase):
         positive_baseline = _monotonic_gd_baseline(group_delay, weights)
         negative_baseline = _monotonic_gd_baseline(-group_delay, weights)
         np.testing.assert_allclose(positive_baseline, -negative_baseline)
+
+    def test_monotonic_gd_baseline_from_gradient_suppresses_a_lone_edge_outlier(self):
+        # np.gradient(..., edge_order=2) can leave a single, sharply
+        # elevated sample at the very first (lowest-frequency) point, which
+        # an unfiltered PAVA fit adopts completely unfiltered since nothing
+        # later in a mostly-flat array is large enough to force a merge.
+        rest = 1.0 + 0.02 * np.sin(np.arange(59))  # mild, realistic ripple
+        group_delay = np.concatenate([[6.0], rest])  # index 0 is the outlier
+        weights = np.ones_like(group_delay)
+        unfiltered = _monotonic_gd_baseline(group_delay, weights)
+        denoised = _monotonic_gd_baseline_from_gradient(group_delay, weights)
+        self.assertAlmostEqual(float(unfiltered[0]), 6.0, places=6)
+        self.assertLess(float(denoised[0]), 2.0)
+        # A run this short/mild elsewhere shouldn't be dragged around by the
+        # denoise either - the tail should stay close to the raw ripple.
+        self.assertLess(float(np.max(np.abs(denoised[10:] - rest[9:]))), 0.05)
+
+    def test_monotonic_gd_baseline_from_gradient_still_finds_a_genuine_broad_rise(self):
+        # A real, broad low-frequency rise on a realistic (log-spaced) grid
+        # - not a single edge sample - must survive the same denoise
+        # essentially unchanged.
+        frequencies = log_frequency_grid(25.0, 150.0, 48)
+        group_delay = 5.0 / frequencies  # smooth, genuine C/f rise
+        weights = np.ones_like(group_delay)
+        unfiltered = _monotonic_gd_baseline(group_delay, weights)
+        denoised = _monotonic_gd_baseline_from_gradient(group_delay, weights)
+        self.assertLess(
+            float(np.max(np.abs(denoised - unfiltered))) / float(np.max(unfiltered)), 0.1
+        )
 
     def test_excess_group_delay_rejects_unknown_gd_baseline(self):
         fft_frequencies = np.fft.rfftfreq(8192, 1.0 / 4000.0)
