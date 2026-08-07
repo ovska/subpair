@@ -9,7 +9,6 @@ from typing import Sequence
 
 from .api import RewApiError, RewClient
 from .cache import CacheError, write_cache
-from .dsp import ShelfOptions
 from .engine import SearchOptions, run_search
 from .html_report import ReportError, build_report
 from .verification import VerificationError, run_verification
@@ -177,6 +176,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "before trusting it over the default"
         ),
     )
+    _add_shelf_arguments(search)
     search.add_argument("--top", type=_positive_int, default=10, help="rows to print")
 
     report = commands.add_parser("report", help="write the self-contained HTML report")
@@ -201,7 +201,6 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="show raw results instead of the default EQ'd results",
     )
-    _add_shelf_arguments(report)
 
     verify = commands.add_parser("verify", help="compare one physical sum with a prediction")
     verify.add_argument("--url", default=DEFAULT_REW_URL, help="REW API root URL")
@@ -212,15 +211,18 @@ def _build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--band", nargs=2, type=float, metavar=("LOW_HZ", "HIGH_HZ"))
     verify.add_argument("--keep-level", action="store_true", help="do not remove a constant level offset")
     verify.add_argument("--output", type=Path, default=Path("subpair-verification.html"))
-    _add_shelf_arguments(verify)
     return parser
 
 
 def _add_shelf_arguments(subparser: argparse.ArgumentParser) -> None:
     """A fixed, broad low-shelf tonal control, independent of the fitted PEQ bank.
 
-    Shared by ``report``/``verify`` only: it never reaches ``search`` or any
-    ranking key, so it cannot change which placement wins (see
+    A ``search``-time EQ configuration choice, exactly like ``--max-boost``/
+    ``--eq-bands``: it is folded into every post-EQ score, so it can change
+    which placement wins if a deliberate tonal tilt makes one placement's
+    corrected response meaningfully better or worse than another's. Not
+    available on ``report``/``verify`` - those read whichever shelf the
+    loaded ``search-results.json`` already has baked in (see
     ``dsp.ShelfOptions``).
     """
     subparser.add_argument(
@@ -360,6 +362,9 @@ def _search(args: argparse.Namespace) -> int:
         eq_bands=args.eq_bands,
         tie_tolerance_db=args.tie_tolerance_db,
         gd_baseline=args.gd_baseline,
+        low_shelf_freq_hz=args.low_shelf_freq,
+        low_shelf_gain_db=args.low_shelf_gain,
+        low_shelf_slope=args.low_shelf_slope,
     )
 
     def progress(done: int, total: int, pair: str) -> None:
@@ -372,14 +377,6 @@ def _search(args: argparse.Namespace) -> int:
     return 0
 
 
-def _shelf_options(args: argparse.Namespace) -> ShelfOptions:
-    return ShelfOptions(
-        freq_hz=args.low_shelf_freq,
-        gain_db=args.low_shelf_gain,
-        slope=args.low_shelf_slope,
-    )
-
-
 def _report(args: argparse.Namespace) -> int:
     results = _results_path(args.cache, args.results)
     output = build_report(
@@ -388,7 +385,6 @@ def _report(args: argparse.Namespace) -> int:
         args.output,
         top=args.top,
         limit=args.limit,
-        shelf=_shelf_options(args),
         raw=args.raw,
     )
     print(f"Wrote self-contained report to {output.resolve()}")
@@ -406,7 +402,6 @@ def _verify(args: argparse.Namespace) -> int:
         measurement_id=args.measurement,
         keep_level=args.keep_level,
         band_override=tuple(args.band) if args.band else None,
-        shelf=_shelf_options(args),
     )
     print(
         f"Measurement #{value['measurement_index']} {value['measurement_name']}: "

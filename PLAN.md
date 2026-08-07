@@ -579,6 +579,25 @@ parts landed as designed below, including the Section B.1 scope decision
 block, and the `--low-shelf-*` flags on `report`/`verify`. Phase checklists
 below are left in place as a record of what was done.
 
+**Section B.1 update: the report/verify-only scoping was later reversed by
+explicit user request** (`format_version` bumped again, to `12`). The shelf
+is now a `search`-time `EqOptions.shelf` field, folded into every post-EQ
+score exactly like `max_boost_db`/`max_filters`, and `--low-shelf-*` moved
+from `report`/`verify` to `search`. The alternative flagged at the end of
+the original B.1 write-up below ("a `SearchOptions`/`EqOptions` field
+serialized into settings and picked up by `report`/`verify` automatically")
+is what was actually built, not the report/verify-overlay design the rest
+of this section describes. The original rationale (a tonal preference
+should not silently change which placement wins) is preserved in spirit by
+keeping `fit_eq_filters`'s greedy PK-bell loop completely unaware of the
+shelf - the bells still target the raw, unshelved response, so the shelf
+does not get "corrected away"; it is applied once, at the end, exactly like
+a fixed hardware EQ would be. It is a deliberate choice that the shelf *can*
+now change which placement wins, since the whole point of moving it into
+scoring was to let it. The rest of Section B.1 is left as a historical
+record of the reasoning behind the design that was later superseded, not as
+a description of current behaviour.
+
 Code review after the initial implementation found the docs overclaimed that
 genuine low-frequency GD features are "unaffected" by the smoothing (Risk #3
 below); they were corrected to say the smoothing *preferentially preserves*
@@ -824,6 +843,11 @@ block `search` from running.
 ## Part B: an independent low-shelf tonality tool
 
 ### B.1 Scope decision: report/verify-time overlay, not a search-time or scored option
+
+**Superseded — see the note at the top of this section.** This scoping was later
+reversed by explicit user request: the shelf is now a `search`-time, scored
+`EqOptions` field. The reasoning below explains why the *original* implementation
+chose the opposite, and is kept for historical context, not as current behaviour.
 
 **Design decision — confirm before implementing.** The shelf is implemented as a
 fixed filter applied only when generating a `report` or running `verify`, using flags

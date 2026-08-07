@@ -32,6 +32,8 @@ SEARCH_ARGS=(
   --tie-tolerance-db 1.5
   --top 10
   --gd-baseline monotonic
+  --low-shelf-freq 40
+  --low-shelf-gain 3
 )
 
 generate_report() {

@@ -132,10 +132,25 @@ the real logic. Data flows strictly one-way through `.subpair-cache/`:
      at its own best point; render that as an empty/gray cell, never as a
      number.
    - `ShelfOptions`/`low_shelf_response` add a fixed, user-specified broad
-     low-shelf tonal control. It is wired through `report`/`verify` only
-     (`cli.py`'s `--low-shelf-*` flags), never through `search`,
-     `SearchOptions`, or `EqOptions` — a tonal preference must never change
-     which placement wins.
+     low-shelf tonal control. It is a `search`-time `EqOptions.shelf` field
+     (`cli.py`'s `--low-shelf-*` flags live on the `search` subcommand),
+     exactly like `max_boost_db`/`max_filters` — it *can* change which
+     placement wins, since it's folded into every post-EQ score. `report`/
+     `verify` no longer take `--low-shelf-*`; they read whichever shelf a
+     given `search-results.json` already has baked into `settings.eq.shelf`.
+     `fit_eq_filters`'s greedy PK-bell loop is fitted completely unaware of
+     the shelf (targets the raw, unshelved response exactly as if it were
+     inactive) and the shelf is multiplied into the returned response only
+     at the very end, so a deliberate tonal tilt is never fought/cancelled
+     by the corrective fitter as if it were a defect at the same
+     frequencies. `filters_response()` only ever reconstructs the PK-bell
+     list (the shelf has no fc/gain/q representation there); every site
+     that reconstructs a full EQ'd response from `filters` — `eq_full`/
+     `eq_trend_wide` in `pair_diagnostics` — must also multiply in
+     `eq_options.shelf.response(...)` at its own frequency grid to stay
+     consistent with `fit_eq_filters`'s own returned `total`. Raw (pre-EQ)
+     diagnostics are untouched by the shelf, exactly like every other
+     `EqOptions` field only affecting `post_eq_*`.
    - Read the module-level docstrings before touching any scoring function —
      most encode a specific, previously-debugged failure mode (e.g. why dip
      detection uses a two-sided wide check in addition to the one-octave
@@ -157,11 +172,12 @@ the real logic. Data flows strictly one-way through `.subpair-cache/`:
    `search-results.json` (+ cache) to produce self-contained HTML (Plotly
    inlined, no CDN/network at view time). `verification.py` additionally
    talks to `RewClient` once, to fetch the one new physical measurement being
-   checked against a predicted sum. Both accept an optional `ShelfOptions`
-   (see above): `build_report` overlays it as a separate, clearly-labeled
-   trace/PEQ-text block that never touches the ranking tables;
-   `run_verification` applies it to the *predicted* curve before computing
-   deviation, since verification is about one fully-specified configuration.
+   checked against a predicted sum. Neither takes its own shelf flags; both
+   reconstruct `ShelfOptions` from the loaded `search-results.json`'s
+   `settings.eq.shelf` (see above) and pass it through `EqOptions.shelf` -
+   `build_report` via `pair_diagnostics`, `run_verification` by applying it
+   to the *predicted* curve before computing deviation, matching whatever
+   was actually scored.
 
 ### Key invariants to preserve
 
@@ -175,9 +191,10 @@ the real logic. Data flows strictly one-way through `.subpair-cache/`:
   `engine.py` into a single weighted score; each later metric exists
   specifically to break ties in the one before it.
 - **Diagnostic-only fields stay out of ranking.** `low_end_extension_f3_hz`/
-  `low_end_extension_f6_hz` and the low-shelf overlay are deliberately
-  excluded from every ranking tuple
-  in `engine.py`/`run_search`. If you add another informational metric,
+  `low_end_extension_f6_hz` are deliberately excluded from every ranking
+  tuple in `engine.py`/`run_search` (the low-shelf is *not* one of these —
+  it is a scored `EqOptions` field, see above). If you add another
+  informational metric,
   don't fold it into `raw_bands`/`eq_bands`'s sort keys without an explicit
   decision to do so — the whole point of these two is that they summarize a
   placement without being able to change which one wins.

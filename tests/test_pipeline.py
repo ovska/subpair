@@ -77,20 +77,25 @@ class PipelineTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             parser.parse_args(["search", "--gd-baseline", "bogus"])
 
-    def test_low_shelf_cli_arguments_on_report_and_verify(self):
+    def test_low_shelf_cli_arguments_on_search_only(self):
+        # The shelf is a search-time EQ setting, like --max-boost/--eq-bands
+        # - report/verify read whatever a given search-results.json already
+        # has baked in and don't take their own --low-shelf-* overrides.
         parser = _build_parser()
+        defaults = parser.parse_args(["search"])
+        self.assertIsNone(defaults.low_shelf_freq)
+        self.assertEqual(defaults.low_shelf_gain, 0.0)
+        self.assertEqual(defaults.low_shelf_slope, 1.0)
+        overridden = parser.parse_args(
+            ["search", "--low-shelf-freq", "40", "--low-shelf-gain", "-4.5"]
+        )
+        self.assertEqual(overridden.low_shelf_freq, 40.0)
+        self.assertEqual(overridden.low_shelf_gain, -4.5)
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["search", "--low-shelf-gain", "20"])
         for command in ("report", "verify"):
-            defaults = parser.parse_args([command])
-            self.assertIsNone(defaults.low_shelf_freq)
-            self.assertEqual(defaults.low_shelf_gain, 0.0)
-            self.assertEqual(defaults.low_shelf_slope, 1.0)
-            overridden = parser.parse_args(
-                [command, "--low-shelf-freq", "40", "--low-shelf-gain", "-4.5"]
-            )
-            self.assertEqual(overridden.low_shelf_freq, 40.0)
-            self.assertEqual(overridden.low_shelf_gain, -4.5)
             with self.assertRaises(SystemExit):
-                parser.parse_args([command, "--low-shelf-gain", "20"])
+                parser.parse_args([command, "--low-shelf-freq", "40"])
 
     def test_shelf_options_requires_frequency_when_gain_is_nonzero(self):
         with self.assertRaisesRegex(ValueError, "requires a low-shelf frequency"):
@@ -1081,17 +1086,49 @@ class PipelineTests(unittest.TestCase):
                     if row[key] is not None:
                         self.assertGreaterEqual(row[key], 25.0)
                         self.assertLessEqual(row[key], 150.0)
+            # The shelf is a search-time EQ setting, exactly like max_boost/
+            # eq_bands: a different shelf means a different search, and its
+            # effect is expected to show up in the post-EQ scores themselves,
+            # not just as an unscored report-time overlay.
+            shelf_results_path = cache / "search-results-shelf.json"
+            shelf_result = run_search(
+                cache,
+                shelf_results_path,
+                SearchOptions(
+                    band=(25.0, 150.0),
+                    delay_range_ms=(-2.0, 2.0, 1.0),
+                    gain_range_db=(-1.0, 1.0, 1.0),
+                    ppo=24,
+                    low_shelf_freq_hz=40.0,
+                    low_shelf_gain_db=4.0,
+                ),
+            )
+            no_shelf_spl = {
+                (row["first"], row["second"]): row["post_eq_spl_db"]
+                for row in result["pairs"]
+            }
+            shelf_spl = {
+                (row["first"], row["second"]): row["post_eq_spl_db"]
+                for row in shelf_result["pairs"]
+            }
+            self.assertTrue(
+                all(shelf_spl[key] > no_shelf_spl[key] + 0.2 for key in no_shelf_spl)
+            )
+            self.assertEqual(
+                shelf_result["settings"]["eq"]["shelf"],
+                {
+                    "active": True,
+                    "freq_hz": 40.0,
+                    "gain_db": 4.0,
+                    "slope": 1.0,
+                    "note": shelf_result["settings"]["eq"]["shelf"]["note"],
+                },
+            )
+
             no_shelf_report = root / "report-no-shelf.html"
             shelf_report = root / "report-shelf.html"
             build_report(cache, results_path, no_shelf_report, top=2, limit=3)
-            build_report(
-                cache,
-                results_path,
-                shelf_report,
-                top=2,
-                limit=3,
-                shelf=ShelfOptions(freq_hz=40.0, gain_db=4.0),
-            )
+            build_report(cache, shelf_results_path, shelf_report, top=2, limit=3)
             no_shelf_page = no_shelf_report.read_text()
             shelf_page = shelf_report.read_text()
 
@@ -1101,12 +1138,9 @@ class PipelineTests(unittest.TestCase):
                 )
 
             self.assertEqual(len(ranking_tables(no_shelf_page)), 1)
-            self.assertEqual(ranking_tables(no_shelf_page), ranking_tables(shelf_page))
             self.assertNotIn("LS Fc", no_shelf_page)
-            self.assertNotIn("not scored", no_shelf_page)
             self.assertIn("LS Fc 40.0 Hz  Gain +4.0 dB", shelf_page)
-            self.assertIn("Post-EQ + low shelf (tonal, not scored)", shelf_page)
-            self.assertIn("not reflected in the ranking metrics", shelf_page)
+            self.assertIn("part of the score", shelf_page)
 
             report = root / "report.html"
             build_report(cache, results_path, report, top=2, limit=3)
