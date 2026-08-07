@@ -150,13 +150,21 @@ a narrow one is a razor's-edge optimum easily upset by real-world delay
 drift, temperature, or DSP quantization.
 
 Each pair also reports `low_end_extension_hz`/`post_eq_low_end_extension_hz`:
-an in-band, F3-style diagnostic giving the lowest frequency the broad trend
-reaches, scanning down from its own value at the top of the analysis band,
-before permanently falling 3 dB below that reference (a transient dip on the
-way down still marks the limit, even if the response recovers further below
-it). Lower is more extended. This is purely informational — it is shown in
-`subpair report`'s tables and printed by `subpair search`, but it is not a
-raw or EQ'd ranking key, so it never changes which placement wins.
+an in-band, F3-style diagnostic giving the lowest frequency the broad
+trend's *envelope* reaches, scanning down from its own value at the top of
+the analysis band, before permanently falling 3 dB below that reference and
+not recovering. The envelope — the higher of the best level attained
+scanning up from the bottom of the band and the best level still attainable
+scanning down from the top — is deliberately not the raw trend: an isolated,
+recoverable notch is a placement defect the null score already measures on
+its own terms, so a response that is flat down to 25 Hz with one unrelated
+-5 dB notch at 100 Hz still reports ~25 Hz extension, not ~100 Hz. A genuine,
+sustained rolloff is not masked this way — below the corner, the envelope
+still tracks the decline — so it is still reported close to where the raw
+trend actually crosses the threshold. Lower is more extended. This is purely
+informational — it is shown in `subpair report`'s tables and printed by
+`subpair search`, but it is not a raw or EQ'd ranking key, so it never
+changes which placement wins.
 
 For minimum phase, subpair uses the real-cepstrum form of the Hilbert
 transform on the *full available 0-to-Nyquist magnitude*, not a brick-wall
@@ -177,13 +185,26 @@ noise into large, sign-flipping excess-group-delay swings that have nothing
 to do with the placement itself. `excess_gd_ms`/`post_eq_excess_gd_ms`,
 `excess_gd_tail_ms`/`post_eq_excess_gd_tail_ms`, the excess-GD authority
 gate, and the report's excess-GD plot are therefore progressively smoothed
-below roughly six times the cache's native resolution per octave — negligible
-for a long sweep or well above the sub-bass, and strongest right where a
-short sweep's own resolution runs out. A genuine, resolution-supported
-low-frequency excess-GD feature (a real reflection or port resonance) is
-unaffected; only noise narrower than the cache can actually resolve is
-suppressed. The cache's native resolution and this threshold are recorded in
-`search-results.json`'s `settings.native_resolution` block.
+below roughly six times the cache's native resolution per octave (capped at
+4 octaves of smoothing so an unusually short capture can't smooth away the
+entire analysis band) — negligible for a long sweep or well above the
+sub-bass, strongest right where a short sweep's own resolution runs out.
+
+`sample_rate / length` is a useful resolution *heuristic*, not a hard
+measurement-theory cutoff, and "six native bins" is a chosen, tunable
+estimator width (`MIN_RELIABLE_NATIVE_BINS`), not a threshold derived from
+first principles. Consequently this smoothing *preferentially preserves*
+genuine, resolution-supported low-frequency excess-GD features (a real
+reflection or port resonance many bins wide relative to the cache's native
+resolution) over noise concentrated near or below that resolution — it does
+not leave every genuine feature bit-for-bit unaffected. A real feature whose
+own bandwidth is comparable to or narrower than the smoothing width applied
+at its frequency will still be attenuated somewhat, the same tradeoff any
+smoothing-based denoiser makes; only pathologically short captures (well
+outside normal REW usage) push the smoothing width large enough for this to
+matter for an ordinarily-wide feature. The cache's native resolution and
+this threshold are recorded in `search-results.json`'s
+`settings.native_resolution` block.
 
 The PEQ simulator uses constrained greedy target matching with RBJ constant-Q
 bells: it evaluates the largest raw-magnitude target errors and retains the
