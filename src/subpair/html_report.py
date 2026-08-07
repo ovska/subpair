@@ -384,12 +384,12 @@ def _ranking_table(
         f6_key: "low",
         spl_key: "high",
     }
-    # F3/F6 can be None (see low_end_extension_hz: a pair whose departure
-    # from the search's average curve never gets within threshold even at
-    # its own best point has no meaningful crossing to report). Excluded
-    # from the colour-scaled range entirely rather than coerced to a number,
-    # so a single None can't skew what counts as "best"/"worst" for the
-    # pairs that did get a real value.
+    # F3/F6 (and any other future metric) may be None - handled generically
+    # here even though low_end_extension_hz's current self-referential
+    # design always finds a crossing in practice (its own peak trivially
+    # satisfies the threshold). Excluded from the colour-scaled range
+    # entirely rather than coerced to a number, so a single None can't skew
+    # what counts as "best"/"worst" for the pairs that did get a real value.
     metric_ranges: dict[str, tuple[float, float]] = {}
     for key in metric_directions:
         numeric = [float(pair[key]) for pair in pairs if pair[key] is not None]
@@ -521,9 +521,9 @@ def build_report(
             "Search results predate the width-invariant excess-GD peak "
             "tie-break; run 'subpair search' again"
         )
-    if int(results.get("format_version", 0)) < 13:
+    if int(results.get("format_version", 0)) < 14:
         raise ReportError(
-            "Search results predate the best-curve-referenced F3/F6 "
+            "Search results predate the self-referential F3/F6 "
             "low-end extension calculation; run 'subpair search' again"
         )
     if any(
@@ -701,7 +701,7 @@ details {{ margin:22px 0; }} details pre {{ overflow:auto; color:var(--muted); }
 <p class="note">{('Raw ranking: raw-magnitude null depth, raw excess group delay, then raw tail.' if raw else 'EQ’d ranking: post-EQ raw-magnitude null depth, post-EQ excess group delay, then post-EQ tail.')}</p>
 <div class="table-wrap">{_ranking_table(pairs, mode, f'ranking-{mode}', default_keys)}</div>
 <div class="pair-tabs" data-pair-tabs role="tablist" aria-label="Selected {mode_label} pairs"></div>
-<p class="note">Click a table heading to sort. Metric cells run from green (best) to red (worst); lower is better except relative SPL, where higher is better. Relative SPL references this ranking’s rank 1. F3/F6 are informational -3/-6 dB extension estimates versus this search’s own average curve (lower is more extended) and are not part of the ranking; a blank gray cell means that pair never gets within range of the search average, so no meaningful crossing exists.</p>
+<p class="note">Click a table heading to sort. Metric cells run from green (best) to red (worst); lower is better except relative SPL, where higher is better. Relative SPL references this ranking’s rank 1. F3/F6 are informational -3/-6 dB extension estimates: the lowest frequency each pair’s own response holds up before permanently falling that far below its own best-supported plateau (lower is more extended). They are self-referential (not compared against other pairs — check Relative SPL for that) and are not part of the ranking.</p>
 <div id="pair-details">{''.join(detail_sections)}</div>
 <details><summary>Analysis settings and minimum-phase convention</summary><pre>{settings_json}</pre></details>
 </main>

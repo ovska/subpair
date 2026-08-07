@@ -193,9 +193,8 @@ def low_end_extension_hz(
     trend_db: np.ndarray,
     frequencies: np.ndarray,
     threshold_db: float = LOW_END_EXTENSION_F3_THRESHOLD_DB,
-    reference_db: float | None = None,
-) -> float | None:
-    """Lowest frequency the broad trend holds up before permanently falling ``threshold_db`` below a reference.
+) -> float:
+    """Lowest frequency the broad trend holds up before permanently falling ``threshold_db`` below its own peak.
 
     An F3/F6-style extension estimate (``threshold_db`` selects which one -
     ``LOW_END_EXTENSION_F3_THRESHOLD_DB``/``LOW_END_EXTENSION_F6_THRESHOLD_DB``),
@@ -212,20 +211,34 @@ def low_end_extension_hz(
     side has nothing left to see past), so the envelope decline still lands
     close to where the raw curve actually crosses the threshold.
 
-    The scan always starts at the envelope's own *peak*, wherever in the
-    band it occurs - not the value at the top of the band. A two-subwoofer
-    sum is routinely bandpass-shaped (it rises out of the bottom of the
-    band, peaks somewhere in the middle, and rolls off again toward
-    crossover) rather than staying flat all the way to the top edge;
-    starting the scan at the top-of-band sample specifically is fragile in
-    that case - if the curve is already declining well before the top edge
-    (true for a completely ordinary, well-behaved response, not a defect),
-    that edge sample can sit more than ``threshold_db`` below the response's
-    own peak, which would make the *entire* scan fail immediately and
-    misreport a permanently-collapsed low end regardless of how
-    well-extended the actual low end is. Starting at the envelope's own peak
-    (its highest sustained plateau, found via ``np.argmax`` - which lands on
-    the *lowest* frequency of that plateau when the peak is a broad flat
+    This is deliberately self-referential: the reference level is the
+    envelope's own *peak* value, wherever in the band it occurs - not a
+    level or curve shared with any other pair. Cross-pair-referenced designs
+    (comparing a pair's departure against an elementwise average or best/
+    maximum curve across a search) were tried and reverted: every real
+    placement in a search rolls off toward the bottom of the band to *some*
+    degree, so any reference built by aggregating across pairs inevitably
+    has its own baked-in rolloff too, which hides exactly that much rolloff
+    in whichever pair the reference is closest to - for the pair that
+    dominates the reference (typically the loudest candidate), it hides
+    essentially all of it, regardless of how much that pair actually
+    declines in absolute terms. See ``run_search``'s settings for the
+    cross-pair-comparable answer instead (``relative_spl_db``).
+
+    The scan always starts at the envelope's own peak, not the value at the
+    top of the band. A two-subwoofer sum is routinely bandpass-shaped (it
+    rises out of the bottom of the band, peaks somewhere in the middle, and
+    rolls off again toward crossover) rather than staying flat all the way
+    to the top edge; starting the scan at the top-of-band sample
+    specifically is fragile in that case - if the curve is already
+    declining well before the top edge (true for a completely ordinary,
+    well-behaved response, not a defect), that edge sample can sit more
+    than ``threshold_db`` below the response's own peak, which would make
+    the *entire* scan fail immediately and misreport a
+    permanently-collapsed low end regardless of how well-extended the
+    actual low end is. Starting at the envelope's own peak (its highest
+    sustained plateau, found via ``np.argmax`` - which lands on the
+    *lowest* frequency of that plateau when the peak is a broad flat
     region, not a single sample) is unaffected by whatever happens to the
     response *above* the peak, which is a high-end/crossover concern this
     metric is not about. When the peak is already at the top of the band (a
@@ -233,46 +246,12 @@ def low_end_extension_hz(
     this is identical to scanning down from the top edge, so ordinary
     single-corner responses are scored exactly as before.
 
-    ``trend_db`` need not be an absolute level. ``reference_db`` sets what
-    level the ``threshold_db`` drop is measured from:
-
-    - Leaving ``reference_db`` ``None`` uses the envelope's own peak value,
-      making the metric fully self-referential: "how far does this
-      placement's own low end extend relative to its own best-supported
-      level," regardless of how that level compares to any other placement.
-    - Passing ``trend_db - best_curve`` (an elementwise difference against
-      the *best* value found at each frequency across every candidate in a
-      search - not necessarily from the same candidate throughout, one
-      value per frequency, i.e. compute the subtraction *before* calling
-      this function) together with ``reference_db=0.0`` answers a genuinely
-      cross-pair-comparable question instead: "how far does this
-      placement's low end extend before falling behind what the *best*
-      candidate here delivers at that same frequency." The scan position
-      still starts at this placement's own best-relative-to-the-best-curve
-      point (found from the departure curve's own envelope, for the
-      bandpass-shape reason above), but the threshold itself no longer
-      depends on where that point is or how high it is - it is fixed at
-      "0 dB departure from the best curve," so a placement that is
-      uniformly quieter everywhere, not just at one frequency, cannot hide
-      that by construction. An elementwise *average* curve was tried and
-      reverted: most real placements naturally roll off toward the bottom
-      of the band to some degree, so the average curve already has a
-      "typical" rolloff baked into its own shape, which hides exactly a
-      normal amount of rolloff in any placement that isn't unusually bad -
-      the *best* curve has no such baked-in rolloff, since it is literally
-      the best SPL any candidate actually delivers at each frequency.
-
-    A placement whose own peak (of whatever curve was passed) already falls
-    more than ``threshold_db`` below the reference legitimately has no
-    frequency at which it is within spec, so this returns ``None`` - not a
-    number, since any Hz value would misleadingly suggest a real crossing
-    point exists. Report/CLI consumers should render that as an empty/blank
-    cell, not a number.
-
     Scanning downward from the peak, this returns the highest frequency at
     which the *running minimum* of the envelope first falls ``threshold_db``
-    below the reference and does not recover, or the band's own lower edge
-    if it never does (fully extended through the analyzed range). This is
+    below the peak and does not recover, or the band's own lower edge if it
+    never does (fully extended through the analyzed range) - since the
+    reference is always the curve's own peak, that peak itself always
+    trivially satisfies the threshold, so a crossing always exists. This is
     purely diagnostic - it is not part of the raw or EQ'd ranking key - so a
     placement's own null/excess-GD/tail severity always decides the winner;
     it only summarizes how far down the winning (or any) placement's
@@ -284,13 +263,12 @@ def low_end_extension_hz(
         return 0.0
     envelope = _two_sided_envelope_db(trend_db)
     peak_index = int(np.argmax(envelope))
-    reference = float(envelope[peak_index]) if reference_db is None else float(reference_db)
-    threshold = reference - threshold_db
+    threshold = float(envelope[peak_index]) - threshold_db
     segment = envelope[: peak_index + 1]
     running_min_from_peak = np.minimum.accumulate(segment[::-1])[::-1]
     meets_threshold = running_min_from_peak >= threshold
     if not np.any(meets_threshold):
-        return None
+        return float(frequencies[-1])
     return float(frequencies[np.argmax(meets_threshold)])
 
 
@@ -916,16 +894,30 @@ def _weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
 
 GD_BASELINE_MODES = ("flat", "monotonic")
 
-# np.gradient(..., edge_order=2) uses a one-sided finite difference at the
-# very first/last evaluated frequency instead of the centered difference
-# used everywhere else, which can leave a single, sharply elevated
-# |group_delay| sample right at the edge - see _monotonic_gd_baseline's
-# call site in excess_group_delay for why this specifically breaks a
-# non-increasing PAVA fit. Small and odd so the window is centered; not
-# tied to native_resolution_hz because the artifact is a property of the
-# differencing formula at the array boundary, not of measurement noise or
-# capture length.
-MONOTONIC_BASELINE_EDGE_DENOISE_BINS = 5
+# A non-increasing PAVA fit only pools a point into its neighbours when a
+# *later* point violates monotonicity (see _isotonic_non_increasing); a
+# single noisy upward tick *anywhere* in the curve forces backward pooling
+# of everything before it, all the way back to wherever the curve was last
+# that high. Two distinct sources of such ticks motivate this: (1)
+# np.gradient(..., edge_order=2)'s one-sided finite difference at the array
+# boundary, which can leave a single, sharply elevated sample right at the
+# very edge; (2) ordinary measurement ripple/local features scattered
+# throughout the curve, which - even individually modest - can each force
+# another round of backward pooling, compounding into an implausibly wide,
+# tall "baseline" plateau that has nothing to do with a genuine, gradual
+# low-end rise (confirmed against a real measurement: a baseline pooled
+# flat across nearly two octaves, several times taller than the curve's own
+# genuine excess-GD peak). A median pre-filter - robust to outliers narrower
+# than about half its window, unlike a moving average, which only dilutes
+# them - removes both without smoothing away a genuine, broader low-frequency
+# rise (_isotonic_non_increasing still governs the actual shape; a perfectly
+# smooth analytic curve is unaffected by any window width). One octave is a
+# deliberately generous width, matching broad_trend_db's own ~1-octave FWHM
+# elsewhere in this module: verified against this module's own bump/rise
+# fixtures up to at least 2 octaves before either assertion's margin is at
+# risk, so one octave leaves ample headroom while still visibly improving a
+# real measurement's baseline plausibility.
+MONOTONIC_BASELINE_DENOISE_OCTAVES = 1.0
 
 
 def _isotonic_non_increasing(values: np.ndarray, weights: np.ndarray) -> np.ndarray:
@@ -972,31 +964,18 @@ def _isotonic_non_increasing(values: np.ndarray, weights: np.ndarray) -> np.ndar
 
 
 def _monotonic_gd_baseline_from_gradient(
-    group_delay: np.ndarray, weights: np.ndarray
+    group_delay: np.ndarray, weights: np.ndarray, ppo: int
 ) -> np.ndarray:
-    """``_monotonic_gd_baseline``, pre-denoised against a np.gradient edge artifact.
+    """``_monotonic_gd_baseline``, pre-denoised against pooling artifacts (see module constant above).
 
-    A non-increasing PAVA fit (see ``_isotonic_non_increasing``) only pools
-    a point into its neighbours when a *later* point violates
-    monotonicity; a point that happens to be the largest value remaining in
-    the array never gets that chance and is adopted into the baseline
-    completely unfiltered. That is almost always the very first
-    (lowest-frequency) sample of a real ``group_delay`` curve, because
-    ``np.gradient(..., edge_order=2)`` uses a one-sided finite difference at
-    the array boundary instead of the centered difference used everywhere
-    else, which can leave a single, sharply elevated sample right there -
-    unrelated to measurement noise or capture length, so it is not covered
-    by the native-resolution smoothing elsewhere in this module. A small
-    median pre-filter - robust to a single outlier, unlike a moving average
-    - with a boundary mode that mirrors real interior values rather than
-    replicating the edge sample into its own window removes that specific
-    artifact before the fit sees it, without smoothing away a genuine,
-    broader low-frequency rise (``_isotonic_non_increasing`` still governs
-    the actual shape).
+    ``ppo`` sets the evaluation grid's points-per-octave, so the
+    ``MONOTONIC_BASELINE_DENOISE_OCTAVES``-wide median window is expressed
+    in octaves rather than a hardcoded bin count.
     """
+    window_bins = max(1, int(round(MONOTONIC_BASELINE_DENOISE_OCTAVES * ppo)))
     denoised = ndimage.median_filter(
         np.asarray(group_delay, dtype=np.float64),
-        size=MONOTONIC_BASELINE_EDGE_DENOISE_BINS,
+        size=window_bins,
         mode="mirror",
     )
     return _monotonic_gd_baseline(denoised, weights)
@@ -1104,8 +1083,9 @@ def excess_group_delay(
         # Fit over the full curve (see docstring), computed from the raw,
         # unsmoothed curve so the smoothing below cannot bias the baseline
         # (see _monotonic_gd_baseline_from_gradient for the one exception:
-        # a targeted denoise of a specific np.gradient edge artifact).
-        baseline = _monotonic_gd_baseline_from_gradient(group_delay, weights)
+        # a targeted denoise of pooling artifacts, including but not
+        # limited to a np.gradient edge artifact).
+        baseline = _monotonic_gd_baseline_from_gradient(group_delay, weights, ppo)
     else:
         # A constant group delay is the arbitrary common time origin. Removing
         # its weighted median (computed from the raw, unsmoothed curve, so the
@@ -1487,13 +1467,6 @@ def pair_diagnostics(
         ),
         "raw_tail_ms": float(np.max(raw_tail_by_band)),
         "raw_tail_by_band_ms": [round(float(value), 6) for value in raw_tail_by_band],
-        # Self-referential (own-peak) defaults, overwritten by run_search's
-        # search-wide second pass with the group-average-referenced version
-        # actually used in reports; kept here so pair_diagnostics() alone
-        # still returns complete, sensible diagnostics for callers that
-        # don't go through run_search (a self-referential value is always a
-        # real number - see low_end_extension_hz's docstring - so these are
-        # never None).
         "low_end_extension_f3_hz": low_end_extension_hz(
             trend_db, context.frequencies, threshold_db=LOW_END_EXTENSION_F3_THRESHOLD_DB
         ),
