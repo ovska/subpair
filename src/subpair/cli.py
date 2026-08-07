@@ -311,17 +311,23 @@ def _fetch(args: argparse.Namespace) -> int:
     return 0
 
 
+def _format_optional_hz(value: float | None) -> str:
+    return f"{value:>6.1f}" if value is not None else f"{'--':>6}"
+
+
 def _print_ranking(result: dict, top: int) -> None:
     def print_mode(rows: list[dict], eq: bool) -> None:
         label = "EQ'd" if eq else "Raw"
         print(f"\n{label} ranking")
         print(
             "Rank  Pair     Pol   Delay ms  Gain dB  Null dB  Excess ms  "
-            "Excess95 ms  Peak ms  Tail ms  Ext Hz  Rel SPL"
+            "Excess95 ms  Peak ms  Tail ms   F3 Hz   F6 Hz  Rel SPL"
         )
         for row in rows[:top]:
             pair = f"{row['first']}+{row['second']}"
             polarity = "+" if row["polarity"] > 0 else "-"
+            f3 = row["post_eq_low_end_extension_f3_hz" if eq else "low_end_extension_f3_hz"]
+            f6 = row["post_eq_low_end_extension_f6_hz" if eq else "low_end_extension_f6_hz"]
             print(
                 f"{row['eq_rank' if eq else 'rank']:>4}  {pair:<7}  {polarity:>3}  "
                 f"{row['delay_ms']:>+9.3f}  {row['gain_db']:>+7.2f}  "
@@ -330,7 +336,8 @@ def _print_ranking(result: dict, top: int) -> None:
                 f"{row['post_eq_excess_gd_tail_ms' if eq else 'excess_gd_tail_ms']:>11.3f}  "
                 f"{row['post_eq_excess_gd_peak_ms' if eq else 'excess_gd_peak_ms']:>7.3f}  "
                 f"{row['post_eq_tail_ms' if eq else 'raw_tail_ms']:>7.1f}  "
-                f"{row['post_eq_low_end_extension_hz' if eq else 'low_end_extension_hz']:>6.1f}  "
+                f"{_format_optional_hz(f3)}  "
+                f"{_format_optional_hz(f6)}  "
                 f"{row['post_eq_relative_spl_db' if eq else 'relative_spl_db']:>+7.2f}"
             )
 

@@ -111,10 +111,26 @@ the real logic. Data flows strictly one-way through `.subpair-cache/`:
      smoothing above, it is not a measurement-reliability correction, changes
      rankings, and is not the default. `excess_group_delay` returns
      `(score, curve_ms, baseline_ms)`; every caller unpacks three values now.
-   - `low_end_extension_hz`/`post_eq_low_end_extension_hz` (from
-     `low_end_extension_hz()`) are a diagnostic-only, F3-style extension
-     estimate reported in `search`/`report` tables. They are deliberately
-     **not** part of either ranking tuple — see "Key invariants" below.
+   - `low_end_extension_f3_hz`/`low_end_extension_f6_hz` (and their
+     `post_eq_` counterparts, from `low_end_extension_hz()`) are
+     diagnostic-only F3/F6-style extension estimates reported in
+     `search`/`report` tables. They are deliberately **not** part of either
+     ranking tuple — see "Key invariants" below. `low_end_extension_hz()`
+     itself is self-referential (scores a curve against its own envelope
+     peak) unless a caller passes `reference_db`; `run_search` uses this by
+     computing the *elementwise average* trend curve across every pair in
+     the search and calling it with each pair's `(trend - average)`
+     departure curve and `reference_db=0.0`, so the reported Hz is a
+     same-frequency, cross-pair-comparable answer rather than a
+     self-referential shape estimate — comparing only against a single
+     scalar (a pair's own peak, or the loudest pair's peak) was tried and
+     reverted; it breaks down for a bandpass-shaped sum, since a pair whose
+     peak sits at a different frequency than the reference can read as
+     *less* extended while actually being louder at the low end. The
+     function returns `None` (not a misleading in-band or edge number) when
+     a curve's departure never gets within threshold of the reference even
+     at its own best point; render that as an empty/gray cell, never as a
+     number.
    - `ShelfOptions`/`low_shelf_response` add a fixed, user-specified broad
      low-shelf tonal control. It is wired through `report`/`verify` only
      (`cli.py`'s `--low-shelf-*` flags), never through `search`,
@@ -158,8 +174,9 @@ the real logic. Data flows strictly one-way through `.subpair-cache/`:
 - **Lexicographic ranking only.** Don't collapse the ranking tuples in
   `engine.py` into a single weighted score; each later metric exists
   specifically to break ties in the one before it.
-- **Diagnostic-only fields stay out of ranking.** `low_end_extension_hz` and
-  the low-shelf overlay are deliberately excluded from every ranking tuple
+- **Diagnostic-only fields stay out of ranking.** `low_end_extension_f3_hz`/
+  `low_end_extension_f6_hz` and the low-shelf overlay are deliberately
+  excluded from every ranking tuple
   in `engine.py`/`run_search`. If you add another informational metric,
   don't fold it into `raw_bands`/`eq_bands`'s sort keys without an explicit
   decision to do so — the whole point of these two is that they summarize a

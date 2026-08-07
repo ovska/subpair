@@ -272,22 +272,6 @@ def _excess_figure(data: dict[str, Any], *, raw: bool = False) -> go.Figure:
             )
         )
     figure.add_hline(y=0.0, line={"color": "#64748b", "width": 1})
-    peak_ms = float(data[f"{prefix}excess_gd_peak_ms"])
-    for sign in (1.0, -1.0):
-        figure.add_hline(
-            y=sign * peak_ms,
-            line={"color": "#fbbf24", "width": 1, "dash": "dot"},
-        )
-    figure.add_annotation(
-        xref="paper",
-        x=1.0,
-        y=peak_ms,
-        text=f"peak {peak_ms:.2f} ms",
-        showarrow=False,
-        font={"color": "#fbbf24", "size": 11},
-        xanchor="right",
-        yanchor="bottom",
-    )
     layout = {
         "title": f"{label} excess group delay (display spline; raw data used for score)",
         "xaxis": {"type": "log", "title": "Frequency (Hz)"},
@@ -381,7 +365,8 @@ def _ranking_table(
     null_key = "post_eq_null_score_db" if eq else "null_score_db"
     excess_key = "post_eq_excess_gd_ms" if eq else "excess_gd_ms"
     tail_key = "post_eq_tail_ms" if eq else "raw_tail_ms"
-    extension_key = "post_eq_low_end_extension_hz" if eq else "low_end_extension_hz"
+    f3_key = "post_eq_low_end_extension_f3_hz" if eq else "low_end_extension_f3_hz"
+    f6_key = "post_eq_low_end_extension_f6_hz" if eq else "low_end_extension_f6_hz"
     spl_key = "post_eq_relative_spl_db" if eq else "relative_spl_db"
     columns = [
         (rank_key, "Rank", "number"),
@@ -392,7 +377,8 @@ def _ranking_table(
         (null_key, "Worst null (dB)", "number"),
         (excess_key, "Excess GD (ms)", "number"),
         (tail_key, "Tail (ms)", "number"),
-        (extension_key, "Extension −3dB (Hz)", "number"),
+        (f3_key, "F3 (Hz)", "number"),
+        (f6_key, "F6 (Hz)", "number"),
         (spl_key, "Relative SPL (dB)", "number"),
     ]
     heading = '<th class="selection-heading">Show</th>' + "".join(
@@ -404,16 +390,23 @@ def _ranking_table(
         null_key: "low",
         excess_key: "low",
         tail_key: "low",
-        extension_key: "low",
+        f3_key: "low",
+        f6_key: "low",
         spl_key: "high",
     }
+    # F3/F6 can be None (see low_end_extension_hz: a pair whose departure
+    # from the search's average curve never gets within threshold even at
+    # its own best point has no meaningful crossing to report). Excluded
+    # from the colour-scaled range entirely rather than coerced to a number,
+    # so a single None can't skew what counts as "best"/"worst" for the
+    # pairs that did get a real value.
     metric_ranges: dict[str, tuple[float, float]] = {}
     for key in metric_directions:
-        numeric = [float(pair[key]) for pair in pairs]
-        metric_ranges[key] = (min(numeric), max(numeric))
+        numeric = [float(pair[key]) for pair in pairs if pair[key] is not None]
+        metric_ranges[key] = (min(numeric), max(numeric)) if numeric else (0.0, 0.0)
 
-    def score_style(key: str, value: float) -> str:
-        if key not in metric_directions:
+    def score_style(key: str, value: float | None) -> str:
+        if key not in metric_directions or value is None:
             return ""
         low, high = metric_ranges[key]
         if high == low:
@@ -430,6 +423,17 @@ def _ranking_table(
     rows = []
     for pair in pairs:
         key_value = f"{int(pair['first'])}-{int(pair['second'])}"
+
+        def format_optional_hz(key: str) -> tuple[str, str]:
+            value = pair[key]
+            # "Infinity" sorts a missing value to the worst end of the
+            # column regardless of sort direction (JS's Number("Infinity")
+            # parses cleanly); the empty display string renders as a blank,
+            # visually gray cell via the "is-empty" class below.
+            if value is None:
+                return "", "Infinity"
+            return f"{value:.1f}", str(value)
+
         values: dict[str, tuple[str, str]] = {
             rank_key: (str(pair[rank_key]), str(pair[rank_key])),
             "pair": (
@@ -442,15 +446,21 @@ def _ranking_table(
             null_key: (f"{pair[null_key]:.3f}", str(pair[null_key])),
             excess_key: (f"{pair[excess_key]:.3f}", str(pair[excess_key])),
             tail_key: (f"{pair[tail_key]:.1f}", str(pair[tail_key])),
-            extension_key: (f"{pair[extension_key]:.1f}", str(pair[extension_key])),
+            f3_key: format_optional_hz(f3_key),
+            f6_key: format_optional_hz(f6_key),
             spl_key: (f"{pair[spl_key]:+.2f}", str(pair[spl_key])),
         }
         cells = []
         for key, _, _ in columns:
-            style = score_style(key, float(pair[key])) if key in metric_directions else ""
+            is_metric = key in metric_directions
+            raw_value = pair.get(key) if is_metric else None
+            numeric_value = float(raw_value) if raw_value is not None else None
+            style = score_style(key, numeric_value) if is_metric else ""
+            empty_class = " is-empty" if is_metric and numeric_value is None else ""
             style_attribute = f' style="{style}"' if style else ""
             cells.append(
-                f'<td data-value="{html.escape(values[key][1])}"{style_attribute}>'
+                f'<td class="metric-cell{empty_class}" '
+                f'data-value="{html.escape(values[key][1])}"{style_attribute}>'
                 f'{html.escape(values[key][0])}</td>'
             )
         checked = " checked" if key_value in selected_keys else ""
@@ -508,18 +518,20 @@ def build_report(
         "post_eq_null_score_db",
         "post_eq_excess_gd_ms",
         "post_eq_relative_spl_db",
-        "low_end_extension_hz",
-        "post_eq_low_end_extension_hz",
+        "low_end_extension_f3_hz",
+        "low_end_extension_f6_hz",
+        "post_eq_low_end_extension_f3_hz",
+        "post_eq_low_end_extension_f6_hz",
     }
     if int(results.get("format_version", 0)) < 6:
         raise ReportError(
             "Search results predate the width-invariant excess-GD peak "
             "tie-break; run 'subpair search' again"
         )
-    if int(results.get("format_version", 0)) < 10:
+    if int(results.get("format_version", 0)) < 11:
         raise ReportError(
-            "Search results predate the cross-pair average-referenced "
-            "low-end extension calculation; run 'subpair search' again"
+            "Search results predate the F3/F6 low-end extension "
+            "calculation; run 'subpair search' again"
         )
     if any(
         not required_ranking_fields.issubset(pair)
@@ -668,6 +680,7 @@ th:nth-child(3),td:nth-child(3) {{ text-align:left; }}
 th {{ position:sticky; top:0; cursor:pointer; background:#142238; color:#c9d8eb; }}
 th:hover {{ background:#1b2d48; }} tbody tr:hover {{ background:#132238; }}
 .selection-heading,.selection-cell {{ text-align:center; }}
+.metric-cell.is-empty {{ background:rgba(148,163,184,.14) !important; color:var(--muted); box-shadow:none !important; }}
 .selection-heading {{ cursor:default; }} .selection-heading:hover {{ background:#142238; }}
 .pair-select {{ width:17px; height:17px; accent-color:#7dd3fc; cursor:pointer; vertical-align:middle; }}
 .pair-detail {{ margin-top:18px; padding:24px; border:1px solid var(--line); border-radius:14px; background:var(--card); }}
@@ -697,7 +710,7 @@ details {{ margin:22px 0; }} details pre {{ overflow:auto; color:var(--muted); }
 <p class="note">{('Raw ranking: raw-magnitude null depth, raw excess group delay, then raw tail.' if raw else 'EQ’d ranking: post-EQ raw-magnitude null depth, post-EQ excess group delay, then post-EQ tail.')}</p>
 <div class="table-wrap">{_ranking_table(pairs, mode, f'ranking-{mode}', default_keys)}</div>
 <div class="pair-tabs" data-pair-tabs role="tablist" aria-label="Selected {mode_label} pairs"></div>
-<p class="note">Click a table heading to sort. Metric cells run from green (best) to red (worst); lower is better except relative SPL, where higher is better. Relative SPL references this ranking’s rank 1. Extension is an informational F3-style estimate (lower is more extended) and is not part of the ranking.</p>
+<p class="note">Click a table heading to sort. Metric cells run from green (best) to red (worst); lower is better except relative SPL, where higher is better. Relative SPL references this ranking’s rank 1. F3/F6 are informational -3/-6 dB extension estimates versus this search’s own average curve (lower is more extended) and are not part of the ranking; a blank gray cell means that pair never gets within range of the search average, so no meaningful crossing exists.</p>
 <div id="pair-details">{''.join(detail_sections)}</div>
 <details><summary>Analysis settings and minimum-phase convention</summary><pre>{settings_json}</pre></details>
 </main>
