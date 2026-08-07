@@ -240,24 +240,27 @@ def low_end_extension_hz(
       making the metric fully self-referential: "how far does this
       placement's own low end extend relative to its own best-supported
       level," regardless of how that level compares to any other placement.
-    - Passing ``trend_db - group_average_curve`` (an elementwise difference
-      against the average curve across every candidate in a search, one
+    - Passing ``trend_db - best_curve`` (an elementwise difference against
+      the *best* value found at each frequency across every candidate in a
+      search - not necessarily from the same candidate throughout, one
       value per frequency, i.e. compute the subtraction *before* calling
       this function) together with ``reference_db=0.0`` answers a genuinely
       cross-pair-comparable question instead: "how far does this
-      placement's low end extend before falling behind what a *typical*
-      placement here delivers at that same frequency." The scan position
-      still starts at this placement's own best-relative-to-the-group point
-      (found from the departure curve's own envelope, for the bandpass-shape
-      reason above), but the threshold itself no longer depends on where
-      that point is or how high it is - it is fixed at "0 dB departure from
-      the group," so a placement that is uniformly quieter than the group
-      everywhere, not just at one frequency, cannot hide that by
-      construction. This is deliberately not anchored to the single
-      *loudest* candidate: that made almost every other placement read as
-      "too far below reference" purely because one placement happened to be
-      exceptional, which is a much less informative comparison than "better
-      or worse than typical."
+      placement's low end extend before falling behind what the *best*
+      candidate here delivers at that same frequency." The scan position
+      still starts at this placement's own best-relative-to-the-best-curve
+      point (found from the departure curve's own envelope, for the
+      bandpass-shape reason above), but the threshold itself no longer
+      depends on where that point is or how high it is - it is fixed at
+      "0 dB departure from the best curve," so a placement that is
+      uniformly quieter everywhere, not just at one frequency, cannot hide
+      that by construction. An elementwise *average* curve was tried and
+      reverted: most real placements naturally roll off toward the bottom
+      of the band to some degree, so the average curve already has a
+      "typical" rolloff baked into its own shape, which hides exactly a
+      normal amount of rolloff in any placement that isn't unusually bad -
+      the *best* curve has no such baked-in rolloff, since it is literally
+      the best SPL any candidate actually delivers at each frequency.
 
     A placement whose own peak (of whatever curve was passed) already falls
     more than ``threshold_db`` below the reference legitimately has no

@@ -207,53 +207,62 @@ the lowest frequency each pair's broad trend's *envelope* holds up before
 permanently falling 3 dB (F3) or 6 dB (F6) below a **reference curve** and
 not recovering.
 
-The reference is the *elementwise average trend curve* across every pair in
-the same search — literally the mean of every candidate's trend, frequency
-by frequency (raw and EQ'd use their own separate average, computed once per
-search) — not a single scalar taken from any one pair. Each pair's curve is
-first expressed as its *departure* from that average (`this pair's trend
-minus the average trend`, one value per frequency), and the F3/F6 scan then
-looks for where that departure permanently falls below `-3`/`-6` dB. This
-makes the comparison genuinely apples-to-apples at every frequency, not just
-at one pair-specific reference point: since every candidate here was
-measured with the same speakers in the same room, absolute SPL relative to
-the search's own average is what should distinguish two pairs' low-end
-capability once rolloff shape is accounted for. The scan itself still starts
-at each pair's own best-relative-to-the-average point (found from the
-departure curve's own two-sided envelope peak, wherever it occurs) rather
-than a fixed frequency: a two-subwoofer sum is routinely bandpass-shaped (it
-rises out of the bottom of the band, peaks somewhere in the middle, and
-rolls off again toward crossover), so a pair whose passband merely peaks
-away from the top of the band isn't penalised for that alone. The envelope —
-the higher of the best level attained scanning up from the bottom of the
-band and the best level still attainable scanning down from the top — is
-used to find both that anchor point and the corner, deliberately not the raw
-trend: an isolated, recoverable notch is a placement defect the null score
-already measures on its own terms, so a response that is flat down to 25 Hz
-with one unrelated -5 dB notch at 100 Hz still reports ~25 Hz extension, not
-~100 Hz. A genuine, sustained rolloff is not masked this way. Lower is more
-extended. This is purely informational — it is shown in `subpair report`'s
-tables and printed by `subpair search`, but it is not a raw or EQ'd ranking
-key, so it never changes which placement wins; a placement's own
-null/excess-GD/tail severity always decides.
+The reference is the *elementwise best curve* across every pair in the same
+search — at each frequency, the highest level *any* candidate actually
+achieves there (raw and EQ'd use their own separate best curve, computed
+once per search; the best value at one frequency need not come from the same
+pair as the best value at another) — not a single scalar taken from any one
+pair, and not an average. Each pair's curve is first expressed as its
+*departure* from that best curve (`this pair's trend minus the best curve`,
+one value per frequency), and the F3/F6 scan then looks for where that
+departure permanently falls below `-3`/`-6` dB. This makes the comparison
+genuinely apples-to-apples at every frequency, not just at one pair-specific
+reference point: since every candidate here was measured with the same
+speakers in the same room, absolute SPL relative to the best this search
+actually achieves at each frequency is what should distinguish two pairs'
+low-end capability once rolloff shape is accounted for. The scan itself
+still starts at each pair's own best-relative-to-the-best-curve point (found
+from the departure curve's own two-sided envelope peak, wherever it occurs)
+rather than a fixed frequency: a two-subwoofer sum is routinely
+bandpass-shaped (it rises out of the bottom of the band, peaks somewhere in
+the middle, and rolls off again toward crossover), so a pair whose passband
+merely peaks away from the top of the band isn't penalised for that alone.
+The envelope — the higher of the best level attained scanning up from the
+bottom of the band and the best level still attainable scanning down from
+the top — is used to find both that anchor point and the corner, deliberately
+not the raw trend: an isolated, recoverable notch is a placement defect the
+null score already measures on its own terms, so a response that is flat
+down to 25 Hz with one unrelated -5 dB notch at 100 Hz still reports ~25 Hz
+extension, not ~100 Hz. A genuine, sustained rolloff is not masked this way.
+Lower is more extended. This is purely informational — it is shown in
+`subpair report`'s tables and printed by `subpair search`, but it is not a
+raw or EQ'd ranking key, so it never changes which placement wins; a
+placement's own null/excess-GD/tail severity always decides.
 
-A pair whose departure from the average never gets within the threshold even
-at its own best point — a placement that is simply, categorically quieter
-than what a typical candidate in this search delivers, or one where
-measurement noise makes a real corner impossible to place with any
-confidence — reports **`null`** (rendered as an empty, gray cell in
-`subpair report` and `--` in `subpair search`'s printed table), not a
-misleading in-band or top-of-band number. Two earlier designs were tried and
-rejected: purely self-referential (each pair scored only against its own
-peak) makes extension numbers look nearly identical for two pairs with a
-genuine several-dB SPL difference and identical rolloff shape, which is
-exactly the comparison this metric exists to support; and comparing each
-pair only to a single scalar reference (either its own peak or the single
-loudest pair's peak) breaks down for a bandpass-shaped sum, since a pair
-whose *own* peak sits at a very different frequency than the reference
-pair's can be — and, on real placement searches, has been — louder at the
-low end while reading as *less* extended, purely because the comparison
-point wasn't at a matching frequency.
+A pair whose departure from the best curve never gets within the threshold
+even at its own best point — a placement that is simply, categorically
+quieter than the best candidate in this search, or one where measurement
+noise makes a real corner impossible to place with any confidence — reports
+**`null`** (rendered as an empty, gray cell in `subpair report` and `--` in
+`subpair search`'s printed table), not a misleading in-band or top-of-band
+number. Three earlier designs were tried and rejected: purely
+self-referential (each pair scored only against its own peak) makes
+extension numbers look nearly identical for two pairs with a genuine
+several-dB SPL difference and identical rolloff shape, which is exactly the
+comparison this metric exists to support; comparing each pair only to a
+single scalar reference (either its own peak or the single loudest pair's
+peak) breaks down for a bandpass-shaped sum, since a pair whose *own* peak
+sits at a very different frequency than the reference pair's can be — and,
+on real placement searches, has been — louder at the low end while reading
+as *less* extended, purely because the comparison point wasn't at a matching
+frequency; and comparing against the *average* curve breaks down because
+most real placements naturally roll off toward the bottom of the band to
+some degree, so the average curve already has a "typical" amount of rolloff
+baked into its own shape — confirmed on a real search, where two pairs a
+genuine 6 dB apart at 30 Hz, with the gap opening up from 45 Hz down, both
+read as fully extended purely because both happened to sit above that
+search's own average everywhere. The *best* curve has no such baked-in
+rolloff.
 
 For minimum phase, subpair uses the real-cepstrum form of the Hilbert
 transform on the *full available 0-to-Nyquist magnitude*, not a brick-wall
