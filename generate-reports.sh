@@ -29,8 +29,9 @@ SEARCH_ARGS=(
   --max-boost 6
   --max-cut 18
   --eq-bands 10
-  --tie-tolerance-db 0
+  --tie-tolerance-db 1.5
   --top 10
+  --gd-baseline monotonic
 )
 
 generate_report() {
