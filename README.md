@@ -143,42 +143,21 @@ it only breaks ties the earlier ones leave exact.
 
 All four excess-GD-derived metrics above — the null-score GD weighting,
 `excess_gd_ms`, `excess_gd_tail_ms`, and `excess_gd_peak_ms` — measure
-"excess" relative to a baseline selected by `--gd-baseline`, which is
-`flat` by default: a single constant (this curve's weighted median), so any
-frequency-dependent group delay at all counts as excess. `--gd-baseline
-monotonic` instead fits a per-point baseline, via weighted isotonic
-regression (pool-adjacent-violators), constrained to be non-increasing in
-magnitude as frequency rises, over the complete analysis band. This treats a
-genuine, physically-expected group-delay rise confined to the bottom of the
-band as normal rather than as excess — the fit can trace a high-to-low
-descent through it — while a bump anywhere the non-increasing constraint
-cannot explain (a rise appearing after a lower value earlier in the band)
-still counts in full, regardless of how wide or gentle it is; this falls out
-of the monotonic constraint itself, not a separate width heuristic. This is
-an explicit, opt-in *acoustic* assumption about what a benign low end looks
-like, not a measurement-reliability correction like the native-resolution
-smoothing below — it changes rankings, so validate it against real
-measurements before trusting it over the default. When active, the report's
-per-pair excess-GD plot overlays the fitted baseline curve, shifted to read
-0 dB at the top of the evaluated band — the fitted baseline still carries
-the arbitrary common-alignment offset (typically hundreds to thousands of
-ms) that the plotted excess-GD curve has already had removed, so plotting
-it at that absolute scale on the same axis would make the excess-GD curve
-unreadable; only the *display* is shifted, not the scored data. The fit
-itself also gets a denoise before the isotonic regression runs: a
-non-increasing PAVA fit only pools a point into its neighbours when a
-*later* point violates monotonicity, so a single noisy upward tick
-*anywhere* in the curve forces backward pooling of everything before it —
-`np.gradient`'s boundary formula at the very first evaluated frequency is
-measurably less reliable than the centered difference used elsewhere and is
-one reliable source of such a tick, but ordinary measurement ripple
-scattered through the rest of the curve is another, and on a real
-measurement the two together were observed producing an implausible,
-several-times-too-tall baseline plateau pooled across nearly two octaves. A
-one-octave-wide median pre-filter (robust to outliers narrower than about
-half its window, unlike a moving average, which only dilutes them; matching
-`broad_trend_db`'s own ~1-octave smoothing scale elsewhere in this codebase)
-removes both without smoothing away a genuine, broader low-frequency rise.
+"excess" relative to a single constant baseline (this curve's weighted
+median), so any frequency-dependent group delay at all counts as excess. An
+earlier, opt-in `--gd-baseline monotonic` mode instead fit a per-point
+baseline via weighted isotonic regression, constrained to be non-increasing
+in magnitude as frequency rose, modelling a genuine low-end group-delay rise
+as normal rather than as excess. It was removed after proving unreliable on
+real measurements: a non-increasing (pool-adjacent-violators) fit pools
+*any* later violation backward across everything before it, so a single
+local bump anywhere in the curve — ordinary measurement ripple, not
+necessarily a genuine feature — could inflate the fitted baseline into an
+implausible, near-flat plateau spanning nearly the whole band, several times
+taller than the curve's own genuine excess-GD peak. The resolution-aware
+smoothing described below already addresses the measurement-reliability
+concern that motivated it, so a single constant baseline is the only mode
+now.
 
 There is no weighted blend. Each later metric only breaks an exact tie in the
 earlier metrics. `--tie-tolerance-db` (0–3 dB, default 0) widens "tie" to any

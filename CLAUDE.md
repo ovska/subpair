@@ -98,19 +98,20 @@ the real logic. Data flows strictly one-way through `.subpair-cache/`:
      excess group delay. This feeds every downstream consumer of the curve
      (`excess_gd_ms`/`excess_gd_tail_ms`, `_excess_gd_authority`,
      `gd_weighted_null_score`, the report's excess-GD plot) from one place.
-   - `excess_group_delay`'s `gd_baseline` argument (`SearchOptions.gd_baseline`,
-     CLI `--gd-baseline`, default `"flat"`) selects what "excess" is measured
-     from: `"flat"` removes a single weighted-median constant (the existing,
-     unchanged behaviour); `"monotonic"` instead removes a per-point baseline
-     from `_monotonic_gd_baseline` (weighted isotonic regression via PAVA,
-     `_isotonic_non_increasing`), constrained non-increasing in magnitude as
-     frequency rises, over the full band regardless of `integration_range`.
-     This is a deliberate, opt-in *acoustic* assumption (a genuine low-end GD
-     rise is normal; a bump anywhere the non-increasing fit can't explain
-     still counts in full, by construction) — unlike the resolution-based
-     smoothing above, it is not a measurement-reliability correction, changes
-     rankings, and is not the default. `excess_group_delay` returns
-     `(score, curve_ms, baseline_ms)`; every caller unpacks three values now.
+   - `excess_group_delay` measures "excess" relative to a single
+     weighted-median constant, removed unconditionally. An earlier, opt-in
+     `--gd-baseline monotonic` mode (`SearchOptions.gd_baseline`) instead fit
+     a per-point baseline via weighted isotonic regression (PAVA),
+     constrained non-increasing in magnitude as frequency rose, modelling a
+     genuine low-end GD rise as normal rather than as excess. It was removed:
+     a non-increasing PAVA fit pools *any* later violation backward across
+     everything before it, so ordinary measurement ripple anywhere in the
+     curve could inflate the fitted baseline into an implausible, near-flat
+     plateau spanning nearly the whole band — confirmed on a real
+     measurement, several times taller than the curve's own genuine
+     excess-GD peak. The resolution-based smoothing above already covers the
+     measurement-reliability concern that motivated it. `excess_group_delay`
+     returns `(score, curve_ms)`.
    - `low_end_extension_f3_hz`/`low_end_extension_f6_hz` (and their
      `post_eq_` counterparts, from `low_end_extension_hz()`) are
      diagnostic-only F3/F6-style extension estimates reported in
