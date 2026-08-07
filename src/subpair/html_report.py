@@ -493,19 +493,23 @@ def _decay_figure(data: dict[str, Any], *, raw: bool = False) -> go.Figure:
     return figure
 
 
-def _peq_text(filters: list[dict[str, float]], shelf: dict[str, Any] | None = None) -> str:
-    lines = [
+def _peq_text(
+    filters: list[dict[str, float]],
+    shelf: dict[str, Any] | None = None,
+    headroom_db: float = 0.0,
+) -> str:
+    filter_lines = [
         f"PK Fc {item['fc_hz']:.1f} Hz  Gain {item['gain_db']:.1f} dB  Q {item['q']:.3f}"
         for item in filters
     ]
     shelf_active = shelf is not None and shelf.get("active")
     if shelf_active:
-        lines.append(
+        filter_lines.append(
             f"LS Fc {shelf['freq_hz']:.1f} Hz  Gain {shelf['gain_db']:+.1f} dB  "
             f"Slope {shelf['slope']:.2f}  (automatically fitted EQ band)"
         )
-    if not lines:
-        lines.append("No filters fitted")
+    lines = [f"Preamp {headroom_db:+.1f} dB  (equal-drive headroom)"]
+    lines.extend(filter_lines or ["No filters fitted"])
     return "\n".join(lines)
 
 
@@ -520,6 +524,7 @@ def _ranking_table(
     null_key = "post_eq_null_score_db" if eq else "null_score_db"
     excess_key = "post_eq_excess_gd_ms" if eq else "excess_gd_ms"
     tail_key = "post_eq_tail_ms" if eq else "raw_tail_ms"
+    headroom_key = "post_eq_headroom_db" if eq else "headroom_db"
     low_end_power_key = (
         "post_eq_relative_low_end_power_db" if eq else "relative_low_end_power_db"
     )
@@ -530,6 +535,7 @@ def _ranking_table(
         ("polarity", "Pol 2", "number"),
         ("delay_ms", "Delay 2 (ms)", "number"),
         ("gain_db", "Gain 2 (dB)", "number"),
+        (headroom_key, "Headroom (dB)", "number"),
         (null_key, "Worst null (dB)", "number"),
         (excess_key, "Excess GD (ms)", "number"),
         (tail_key, "Tail (ms)", "number"),
@@ -583,6 +589,10 @@ def _ranking_table(
             "polarity": ("+" if pair["polarity"] > 0 else "−", str(pair["polarity"])),
             "delay_ms": (f"{pair['delay_ms']:+.3f}", str(pair["delay_ms"])),
             "gain_db": (f"{pair['gain_db']:+.2f}", str(pair["gain_db"])),
+            headroom_key: (
+                f"{pair[headroom_key]:+.2f}",
+                str(pair[headroom_key]),
+            ),
             null_key: (f"{pair[null_key]:.3f}", str(pair[null_key])),
             excess_key: (f"{pair[excess_key]:.3f}", str(pair[excess_key])),
             tail_key: (f"{pair[tail_key]:.1f}", str(pair[tail_key])),
@@ -659,6 +669,8 @@ def build_report(
         "post_eq_relative_spl_db",
         "eq_filter_count",
         "eq_shelf",
+        "headroom_db",
+        "post_eq_headroom_db",
         "low_end_power_db",
         "relative_low_end_power_db",
         "post_eq_low_end_power_db",
@@ -692,6 +704,11 @@ def build_report(
     if int(results.get("format_version", 0)) < 18:
         raise ReportError(
             "Search results predate excursion-weighted low-end power; "
+            "run 'subpair search' again"
+        )
+    if int(results.get("format_version", 0)) < 19:
+        raise ReportError(
+            "Search results predate response-wide headroom normalization; "
             "run 'subpair search' again"
         )
     if any(
@@ -780,9 +797,13 @@ def build_report(
                     "compete with PK filters and consume one EQ-band slot "
                     "when selected.<br>"
                 )
-            peq = _peq_text(data["filters"], data.get("eq_shelf"))
+            peq = _peq_text(
+                data["filters"],
+                data.get("eq_shelf"),
+                float(data["post_eq_headroom_db"]),
+            )
             peq_html = (
-                '<div class="peq"><h3>Fitted EQ filters</h3>'
+                '<div class="peq"><h3>Headroom + Fitted EQ filters</h3>'
                 '<button onclick="copyPeq(this)">Copy</button>'
                 f"<pre>{html.escape(peq)}</pre></div>"
             )
@@ -794,7 +815,8 @@ def build_report(
               <h2>#{pair[rank_key]} {mode_label}:
                 {html.escape(pair['first_name'])} + {html.escape(pair['second_name'])}</h2>
               <p class="configuration">Sub 2: {'normal' if pair['polarity'] > 0 else 'inverted'},
-                delay {pair['delay_ms']:+.3f} ms, gain {pair['gain_db']:+.2f} dB<br>
+                delay {pair['delay_ms']:+.3f} ms, gain {pair['gain_db']:+.2f} dB,
+                headroom {pair['post_eq_headroom_db' if not raw else 'headroom_db']:+.2f} dB<br>
                 {metric_summary}<br>
                 {eq_description}
                 CSD overlay: excess GD with common delay removed; a vertical line is frequency-independent delay.</p>
@@ -884,7 +906,7 @@ details {{ margin:22px 0; }} details pre {{ overflow:auto; color:var(--muted); }
 <p class="note">{('Raw ranking: raw-magnitude null depth, raw excess group delay, then raw tail.' if raw else 'EQ’d ranking: post-EQ raw-magnitude null depth, post-EQ excess group delay, then post-EQ tail.')}</p>
 <div class="table-wrap">{_ranking_table(pairs, mode, f'ranking-{mode}', default_keys)}</div>
 <div class="pair-tabs" data-pair-tabs role="tablist" aria-label="Selected {mode_label} pairs"></div>
-<p class="note">Click a table heading to sort. Metric cells run from green (best) to red (worst); lower is better for null, excess GD, and tail; higher is better for low-end power and relative SPL. Both relative level metrics reference this ranking’s rank 1. Low-end power is the broad response through 100 Hz weighted by the amplifier/excursion cost of producing pressure at each frequency (+12.04 dB per octave downward), with positive pair gain—and, post-EQ, the fitted response’s maximum boost—removed so every pair uses the same maximum driver drive. It is informational and is not part of the recommendation ranking.</p>
+<p class="note">Click a table heading to sort. Metric cells run from green (best) to red (worst); lower is better for null, excess GD, and tail; higher is better for low-end power and Relative SPL. Both relative level metrics reference this ranking’s rank 1. Headroom is the negative global gain which removes positive pair gain—and, post-EQ, the fitted response’s maximum boost—so every pair uses the same maximum driver drive. It is already applied to the magnitude comparisons, final summed response, Low-end power, and Relative SPL. Low-end power additionally weights the broad response through 100 Hz by the amplifier/excursion cost of producing pressure at each frequency (+12.04 dB per octave downward). Headroom and Low-end power are informational and do not affect recommendation order.</p>
 <div id="pair-details">{''.join(detail_sections)}</div>
 <details><summary>Analysis settings and minimum-phase convention</summary><pre>{settings_json}</pre></details>
 </main>

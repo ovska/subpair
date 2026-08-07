@@ -273,7 +273,7 @@ def run_search(
     ]
 
     result = {
-        "format_version": 18,
+        "format_version": 19,
         "measurement_count": len(measurements),
         "sample_rate": measurements[0].sample_rate,
         "response_length": measurements[0].impulse.size,
@@ -367,6 +367,21 @@ def run_search(
                 "excess_gd_range_hz": list(eq_range),
                 "magnitude_basis": "raw, unsmoothed",
                 "tie_tolerance_db": options.tie_tolerance_db,
+                "headroom": {
+                    "fields": {
+                        "raw": "headroom_db",
+                        "post_eq": "post_eq_headroom_db",
+                    },
+                    "basis": (
+                        "negative global gain applied directly to every compared "
+                        "response. Raw headroom removes positive relative pair "
+                        "gain so the hottest driver is at 0 dB. Post-EQ headroom "
+                        "also removes the fitted EQ response's largest in-band "
+                        "boost. Magnitude comparisons, low-end power, Relative "
+                        "SPL, and the reported combined EQ response all include "
+                        "this gain"
+                    ),
+                },
                 "null_score_gd_weighting": (
                     "null_score_db/post_eq_null_score_db scale magnitude dips up, "
                     "and score magnitude peaks that only exist alongside it, "
@@ -420,13 +435,11 @@ def run_search(
                         "log frequency. Pistonic pressure is proportional to "
                         "f^2 times cone displacement, so equal pressure one "
                         "octave lower needs 4x displacement and approximately "
-                        "16x amplifier power (+12.04 dB). Positive relative "
-                        "pair gain is subtracted from the complete sum so its "
-                        "hottest driver is always at 0 dB; post-EQ scores also "
-                        "subtract the fitted EQ response's maximum boost. This "
-                        "makes comparisons use equal maximum drive rather than "
-                        "letting pair or EQ gain manufacture headroom. Exact "
-                        "watts/excursion require "
+                        "16x amplifier power (+12.04 dB). The input broad trend "
+                        "already includes the shared raw or post-EQ headroom "
+                        "gain described above, so this metric sees the same "
+                        "equal-drive response as the magnitude and Relative SPL "
+                        "comparisons. Exact watts/excursion require "
                         "driver impedance, motor, enclosure, and protection/DSP "
                         "data absent from REW impulse responses. Relative fields "
                         "reference rank 1 in the corresponding raw or EQ'd "

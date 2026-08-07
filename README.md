@@ -201,16 +201,22 @@ that stays loud deep into its roll-off earns more than one which has the same
 ordinary mean SPL only higher in the band, without the discontinuities of a
 single -3 or -6 dB threshold crossing.
 
-The searched gain is also included in the equal-drive comparison. The first
-sub is at 0 dB and the second receives the reported relative gain; if that
-gain is positive, it is subtracted from the complete sum's low-end score.
-For the post-EQ score, the fitted EQ response's largest boost is subtracted as
-well. The hottest driver is consequently at 0 dB for every pair, swapping
-which sub is called first cannot create output headroom, and EQ boost cannot
-manufacture equal-drive capability. Exact electrical watts or cone excursion
+The searched gain is included through `headroom_db`/`post_eq_headroom_db`, a
+negative gain applied to the actual compared response. The first sub is at
+0 dB and the second receives the reported relative gain, so raw headroom is
+the negative of any positive pair gain. Post-EQ headroom additionally removes
+the fitted EQ response's largest in-band boost. The hottest driver is
+consequently at 0 dB for every pair, swapping which sub is called first cannot
+create output headroom, and EQ boost cannot manufacture equal-drive
+capability.
+
+Headroom is applied once to the complete raw or post-EQ sum before calculating
+low-end power and Relative SPL. The report's overview/detail magnitude curves,
+combined EQ response, Headroom table column, and copyable `Preamp ... dB`
+setting all use that same value. Exact electrical watts or cone excursion
 would require driver impedance, motor, enclosure, limiter, and built-in DSP
 transfer data which an acoustic REW impulse response does not contain, so
-this is deliberately an excursion-cost proxy rather than a claim of absolute
+low-end power remains an excursion-cost proxy rather than a claim of absolute
 output capability.
 
 The relative raw and post-EQ values each reference rank 1 in their own
@@ -333,12 +339,11 @@ overshoot; there are no manual shelf-frequency, gain, or slope flags. A fitted
 shelf appears alongside the PK filters in the report as an `LS Fc ... Gain ...
 Slope ...` line and is included in every post-EQ plot and score.
 
-Relative SPL is reported, not ranked. It is the energy-mean in-band SPL at the
-searched gain settings (gains are referenced to an equal 1 kHz electrical
-drive). Raw and EQ'd modes each reference their own rank 1. Unlike low-end
-power, it intentionally does not remove positive relative gain: the two
-columns respectively show ordinary level at the searched settings and
-low-frequency capability at equal maximum driver drive.
+Relative SPL is reported, not ranked. It is the energy-mean in-band SPL after
+applying the corresponding raw or post-EQ headroom, so it compares equal
+maximum driver drive rather than nominal searched levels. Gains are referenced
+to an equal 1 kHz electrical drive; raw and EQ'd modes each reference their
+own rank 1.
 
 ### `subpair report`
 
@@ -370,9 +375,9 @@ frequency-dependent bends expose excess storage without relying on visual
 estimation of the heatmap ridge. CSD figures are static to avoid accidental
 zooming or panning and appear before the separate excess-group-delay graph.
 
-The ranking table also shows the colour-rated, informational low-end-power
-column described above. It uses higher-is-better colouring and does not
-affect the recommendation order.
+The ranking table also shows the applied Headroom gain and the colour-rated,
+informational low-end-power column described above. Low-end power uses
+higher-is-better colouring; neither column affects the recommendation order.
 
 ### `subpair verify`
 
@@ -391,9 +396,9 @@ constant level offset by default (`--keep-level` disables that); it does not
 hide frequency-dependent mutual-coupling error.
 
 Verification compares the physical sum with the unequalized prediction. It
-therefore does not apply PK filters or the automatically fitted low shelf;
-the shelf now follows exactly the same verification semantics as every other
-EQ band.
+applies the raw `headroom_db` global gain, but not PK filters, post-EQ
+headroom, or the automatically fitted low shelf; the shelf follows exactly
+the same verification semantics as every other EQ band.
 
 ## Important assumptions
 

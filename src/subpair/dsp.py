@@ -176,7 +176,6 @@ EXCURSION_POWER_DB_PER_OCTAVE = float(
 def low_end_power_db(
     trend_db: np.ndarray,
     frequencies: np.ndarray,
-    max_drive_gain_db: float = 0.0,
     upper_hz: float = LOW_END_POWER_UPPER_HZ,
 ) -> float:
     """Excursion-cost-weighted mean low-frequency pressure power.
@@ -196,17 +195,10 @@ def low_end_power_db(
     one-octave broad response, so narrow placement nulls do not dominate this
     extension-oriented metric.
 
-    ``max_drive_gain_db`` is the largest gain applied anywhere in the path
-    relative to the common measurement drive. Scaling the complete response
-    back by that amount puts its hottest driver at 0 dB. ``run_search`` uses
-    positive pair gain for raw results and positive pair gain plus the fitted
-    EQ response's maximum boost for post-EQ results. This makes the raw score
-    invariant to which subwoofer happens to be listed first and prevents EQ
-    boost from manufacturing equal-drive output headroom. It is the best
-    frequency-only proxy for equal maximum excursion available from cached
-    acoustic measurements. Exact watts or excursion would additionally
-    require the driver's impedance, motor, enclosure, and protection/DSP
-    transfer functions, none of which REW impulse responses contain.
+    The caller must pass the final equal-drive response, including its global
+    headroom gain. Keeping headroom in the response itself -- rather than as
+    a special deduction inside this one metric -- ensures magnitude plots,
+    Relative SPL, and low-end power all compare exactly the same signal.
     """
     frequencies = np.asarray(frequencies, dtype=np.float64)
     trend_db = np.asarray(trend_db, dtype=np.float64)
@@ -220,8 +212,6 @@ def low_end_power_db(
         raise ValueError("Low-end power frequencies must be positive and increasing")
     if not np.all(np.isfinite(trend_db)):
         raise ValueError("Low-end power trend must contain only finite values")
-    if not math.isfinite(max_drive_gain_db):
-        raise ValueError("Low-end power maximum drive gain must be finite")
     if not math.isfinite(upper_hz) or upper_hz <= 0.0:
         raise ValueError("Low-end power upper frequency must be positive and finite")
 
@@ -230,9 +220,8 @@ def low_end_power_db(
         mask = np.ones(frequencies.shape, dtype=bool)
     used_frequencies = frequencies[mask]
     used_trend_db = trend_db[mask]
-    drive_headroom_db = max(0.0, float(max_drive_gain_db))
     if used_frequencies.size == 1:
-        return float(used_trend_db[0] - drive_headroom_db)
+        return float(used_trend_db[0])
 
     # The reference frequency cancels between numerator and denominator; the
     # highest included frequency keeps the intermediate weights near unity.
@@ -247,7 +236,7 @@ def low_end_power_db(
         / np.trapezoid(weights, x=log_frequencies)
     )
     return float(
-        peak_db + 10.0 * np.log10(max(weighted_power, EPS)) - drive_headroom_db
+        peak_db + 10.0 * np.log10(max(weighted_power, EPS))
     )
 
 
@@ -1402,12 +1391,10 @@ def pair_diagnostics(
 ) -> dict[str, Any]:
     eq_options = eq_options or EqOptions(correction_range=context.band)
     grid_sum = context.sum_on_grid(first, second, polarity, delay_ms, gain_db)
-    magnitude_db = db20(grid_sum)
     # The trend is smoothed over a margin-extended grid with real spectral
     # content beyond the reported band, then cropped back, so it is not
     # biased by edge-replicated ("nearest") smoothing at the band boundaries.
     trend_wide_sum = context.sum_on_trend_grid(first, second, polarity, delay_ms, gain_db)
-    trend_db = broad_trend_db(db20(trend_wide_sum), context.ppo)[context.trend_slice]
     full_sum, full_frequencies = context.sum_full(
         first, second, polarity, delay_ms, gain_db
     )
@@ -1438,9 +1425,21 @@ def pair_diagnostics(
     ) * _fitted_low_shelf_response(
         full_frequencies, context.sample_rate, fitted_shelf
     )
+    # Headroom is a real negative gain in the compared signal path, not a
+    # private correction inside one diagnostic. The first sub is the 0 dB
+    # reference and the second receives gain_db, so positive pair gain must
+    # be removed globally to put the hottest driver back at 0 dB. Post-EQ,
+    # remove the fitted response's largest positive boost as well.
+    headroom_db = -float(gain_db) if gain_db > 0.0 else 0.0
+    eq_drive_boost_db = max(0.0, float(np.max(db20(eq_grid))))
+    post_eq_headroom_db = headroom_db - eq_drive_boost_db
+    raw_headroom_linear = 10.0 ** (headroom_db / 20.0)
+    post_eq_headroom_linear = 10.0 ** (post_eq_headroom_db / 20.0)
+
     n_fft = 2 * (full_sum.size - 1)
-    pre_ir = np.fft.irfft(full_sum, n=n_fft)
-    post_full = full_sum * eq_full
+    normalized_full_sum = full_sum * raw_headroom_linear
+    post_full = full_sum * eq_full * post_eq_headroom_linear
+    pre_ir = np.fft.irfft(normalized_full_sum, n=n_fft)
     post_ir = np.fft.irfft(post_full, n=n_fft)
     _, _, _, raw_tail_by_band = csd_style_decay(
         pre_ir, context.sample_rate, context.band, ppo=3
@@ -1448,14 +1447,22 @@ def pair_diagnostics(
     _, _, _, tail_by_band = csd_style_decay(
         post_ir, context.sample_rate, context.band, ppo=3
     )
-    post_grid = grid_sum * eq_grid
+    normalized_grid_sum = grid_sum * raw_headroom_linear
+    post_grid = grid_sum * eq_grid * post_eq_headroom_linear
+    magnitude_db = db20(normalized_grid_sum)
     post_magnitude_db = db20(post_grid)
+    normalized_trend_wide_sum = trend_wide_sum * raw_headroom_linear
+    trend_db = broad_trend_db(
+        db20(normalized_trend_wide_sum), context.ppo
+    )[context.trend_slice]
     eq_trend_wide = filters_response(
         context.trend_frequencies, context.sample_rate, filters
     ) * _fitted_low_shelf_response(
         context.trend_frequencies, context.sample_rate, fitted_shelf
     )
-    post_trend_wide_sum = trend_wide_sum * eq_trend_wide
+    post_trend_wide_sum = (
+        trend_wide_sum * eq_trend_wide * post_eq_headroom_linear
+    )
     post_trend_db = broad_trend_db(db20(post_trend_wide_sum), context.ppo)[context.trend_slice]
     post_excess_score, post_excess_curve = excess_group_delay(
         post_full,
@@ -1465,9 +1472,6 @@ def pair_diagnostics(
         native_resolution_hz=context.native_resolution_hz,
         ppo=context.ppo,
     )
-    raw_drive_headroom_db = max(0.0, float(gain_db))
-    eq_drive_boost_db = max(0.0, float(np.max(db20(eq_grid))))
-    post_eq_drive_headroom_db = raw_drive_headroom_db + eq_drive_boost_db
     dsp_target = eq_options.target == "dsp"
     result: dict[str, Any] = {
         "null_score_db": gd_weighted_null_score(
@@ -1488,9 +1492,8 @@ def pair_diagnostics(
         "low_end_power_db": low_end_power_db(
             trend_db,
             context.frequencies,
-            max_drive_gain_db=raw_drive_headroom_db,
         ),
-        "drive_headroom_db": raw_drive_headroom_db,
+        "headroom_db": headroom_db,
         "post_eq_null_score_db": gd_weighted_null_score(
             post_magnitude_db,
             post_trend_db,
@@ -1513,16 +1516,19 @@ def pair_diagnostics(
         "post_eq_low_end_power_db": low_end_power_db(
             post_trend_db,
             context.frequencies,
-            max_drive_gain_db=post_eq_drive_headroom_db,
         ),
-        "post_eq_drive_headroom_db": post_eq_drive_headroom_db,
+        "post_eq_headroom_db": post_eq_headroom_db,
         "filters": filters,
         "eq_target": eq_metadata["target"],
-        "eq_target_level_db": float(eq_metadata["target_level_db"]),
+        "eq_target_level_db": float(
+            eq_metadata["target_level_db"] + post_eq_headroom_db
+        ),
         "eq_mean_authority": float(np.mean(eq_metadata["eq_authority"])),
         "eq_filter_count": int(eq_metadata["filter_count"]),
         "eq_shelf": dict(fitted_shelf),
-        "spl_db": float(10.0 * np.log10(max(np.mean(np.abs(grid_sum) ** 2), EPS))),
+        "spl_db": float(
+            10.0 * np.log10(max(np.mean(np.abs(normalized_grid_sum) ** 2), EPS))
+        ),
         "post_eq_spl_db": float(
             10.0 * np.log10(max(np.mean(np.abs(post_grid) ** 2), EPS))
         ),
@@ -1549,8 +1555,12 @@ def pair_diagnostics(
                 "post_eq_db": post_magnitude_db,
                 "post_eq_trend_db": post_trend_db,
                 "post_eq_excess_curve_ms": post_excess_curve,
-                "eq_target_db": eq_metadata["effective_target_db"],
-                "eq_nominal_target_db": eq_metadata["nominal_target_db"],
+                "eq_target_db": (
+                    eq_metadata["effective_target_db"] + post_eq_headroom_db
+                ),
+                "eq_nominal_target_db": (
+                    eq_metadata["nominal_target_db"] + post_eq_headroom_db
+                ),
                 "eq_authority": eq_metadata["eq_authority"],
                 "decay_frequencies": pre_f,
                 "decay_times": pre_t,

@@ -99,6 +99,10 @@ def run_verification(
         float(pair["delay_ms"]),
         float(pair["gain_db"]),
     )
+    # Verification is unequalized, but it still compares the same equal-drive
+    # raw sum as search/report. Applying raw headroom matters when --keep-level
+    # is used; the default constant level alignment would otherwise hide it.
+    predicted *= 10.0 ** (float(pair.get("headroom_db", 0.0)) / 20.0)
     bins = np.fft.rfftfreq(impulse.size, 1.0 / sample_rate)
     measured_fft = np.fft.rfft(impulse)
     measured = np.interp(context.frequencies, bins, measured_fft.real) + 1j * np.interp(

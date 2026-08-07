@@ -285,7 +285,7 @@ def _print_ranking(result: dict, top: int) -> None:
         label = "EQ'd" if eq else "Raw"
         print(f"\n{label} ranking")
         print(
-            "Rank  Pair     Pol   Delay ms  Gain dB  Null dB  Excess ms  "
+            "Rank  Pair     Pol   Delay ms  Gain dB  Headroom  Null dB  Excess ms  "
             "Excess95 ms  Peak ms  Tail ms  LE power  Rel SPL"
         )
         for row in rows[:top]:
@@ -294,6 +294,7 @@ def _print_ranking(result: dict, top: int) -> None:
             print(
                 f"{row['eq_rank' if eq else 'rank']:>4}  {pair:<7}  {polarity:>3}  "
                 f"{row['delay_ms']:>+9.3f}  {row['gain_db']:>+7.2f}  "
+                f"{row['post_eq_headroom_db' if eq else 'headroom_db']:>+8.2f}  "
                 f"{row['post_eq_null_score_db' if eq else 'null_score_db']:>7.3f}  "
                 f"{row['post_eq_excess_gd_ms' if eq else 'excess_gd_ms']:>9.3f}  "
                 f"{row['post_eq_excess_gd_tail_ms' if eq else 'excess_gd_tail_ms']:>11.3f}  "

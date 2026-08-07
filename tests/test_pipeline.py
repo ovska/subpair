@@ -8,12 +8,13 @@ from pathlib import Path
 
 import numpy as np
 
-from subpair.cache import CacheError, write_cache
+from subpair.cache import CacheError, load_cache, write_cache
 from subpair.cli import _build_parser
 from subpair.engine import SearchOptions, run_search
 from subpair.dsp import (
     EqOptions,
     EXCURSION_POWER_DB_PER_OCTAVE,
+    AnalysisContext,
     _denoised_residual,
     _excess_gd_authority,
     _smooth_by_variable_octaves,
@@ -28,6 +29,7 @@ from subpair.dsp import (
     low_end_power_db,
     low_shelf_response,
     null_scores,
+    pair_diagnostics,
     peq_response,
 )
 from subpair.html_report import (
@@ -280,7 +282,9 @@ class PipelineTests(unittest.TestCase):
                 "gain_db": -3.5,
                 "slope": 1.0,
             },
+            -4.46,
         )
+        self.assertIn("Preamp -4.5 dB", text)
         self.assertIn("LS Fc 42.0 Hz  Gain -3.5 dB", text)
         self.assertIn("automatically fitted EQ band", text)
         self.assertNotIn("No filters fitted", text)
@@ -316,24 +320,6 @@ class PipelineTests(unittest.TestCase):
             places=6,
         )
 
-    def test_low_end_power_removes_positive_relative_gain_headroom(self):
-        frequencies = log_frequency_grid(20.0, 150.0, 48)
-        baseline = np.zeros_like(frequencies)
-        # +6 dB in the whole summed response bought with +6 dB on the hotter
-        # driver has no equal-maximum-drive advantage.
-        self.assertAlmostEqual(
-            low_end_power_db(baseline + 6.0, frequencies, max_drive_gain_db=6.0),
-            low_end_power_db(baseline, frequencies),
-            places=6,
-        )
-        # Attenuating the second driver leaves the first driver as the 0 dB
-        # constraint and therefore needs no additional headroom deduction.
-        self.assertAlmostEqual(
-            low_end_power_db(baseline, frequencies, max_drive_gain_db=-6.0),
-            low_end_power_db(baseline, frequencies),
-            places=6,
-        )
-
     def test_low_end_power_ignores_response_above_100_hz(self):
         frequencies = log_frequency_grid(20.0, 200.0, 48)
         baseline = np.zeros_like(frequencies)
@@ -349,6 +335,7 @@ class PipelineTests(unittest.TestCase):
             "polarity": 1,
             "delay_ms": 0.0,
             "gain_db": 0.0,
+            "headroom_db": -4.5,
             "null_score_db": 1.0,
             "excess_gd_ms": 0.5,
             "raw_tail_ms": 10.0,
@@ -362,6 +349,9 @@ class PipelineTests(unittest.TestCase):
         ]
         table = _ranking_table(pairs, "raw", "ranking-raw", {"1-2", "3-4"})
         self.assertIn("Low-end power (dB)", table)
+        self.assertIn("Headroom (dB)", table)
+        self.assertIn('data-value="-4.5"', table)
+        self.assertIn(">-4.50</td>", table)
         self.assertIn('data-value="1.25"', table)
         self.assertIn(">+1.25</td>", table)
         self.assertIn('data-value="-2.5"', table)
@@ -1010,6 +1000,7 @@ class PipelineTests(unittest.TestCase):
                 "raw, unsmoothed",
             )
             self.assertEqual(loaded["settings"]["ranking"]["tie_tolerance_db"], 0.0)
+            self.assertIn("headroom", loaded["settings"]["ranking"])
             low_end_settings = loaded["settings"]["ranking"]["low_end_power"]
             self.assertIn("fields", low_end_settings)
             self.assertEqual(low_end_settings["range_hz"][0], 25.0)
@@ -1051,14 +1042,50 @@ class PipelineTests(unittest.TestCase):
                     self.assertIn(key, row)
                     self.assertTrue(np.isfinite(row[key]))
                 self.assertAlmostEqual(
-                    row["drive_headroom_db"], max(0.0, row["gain_db"])
+                    row["headroom_db"], -max(0.0, row["gain_db"])
                 )
-                self.assertGreaterEqual(
-                    row["post_eq_drive_headroom_db"], row["drive_headroom_db"]
+                self.assertLessEqual(
+                    row["post_eq_headroom_db"], row["headroom_db"]
                 )
-            self.assertAlmostEqual(result["pairs"][0]["relative_low_end_power_db"], 0.0)
+                self.assertAlmostEqual(
+                    row["relative_spl_db"],
+                    row["spl_db"] - result["pairs"][0]["spl_db"],
+                )
+            self.assertAlmostEqual(
+                result["pairs"][0]["relative_low_end_power_db"], 0.0
+            )
             eq_first = min(result["pairs"], key=lambda row: row["eq_rank"])
             self.assertAlmostEqual(eq_first["post_eq_relative_low_end_power_db"], 0.0)
+            for row in result["pairs"]:
+                self.assertAlmostEqual(
+                    row["post_eq_relative_spl_db"],
+                    row["post_eq_spl_db"] - eq_first["post_eq_spl_db"],
+                )
+
+            # Final raw/post-EQ sums carry the serialized headroom gains.
+            # The complete EQ transfer, including preamp, therefore cannot
+            # exceed 0 dB anywhere on the analyzed grid.
+            measurements, _ = load_cache(cache)
+            context = AnalysisContext(measurements, (25.0, 150.0), 24)
+            probe = max(result["pairs"], key=lambda row: row["gain_db"])
+            diagnostic = pair_diagnostics(
+                context,
+                int(probe["first"]) - 1,
+                int(probe["second"]) - 1,
+                int(probe["polarity"]),
+                float(probe["delay_ms"]),
+                float(probe["gain_db"]),
+                include_decay=True,
+                eq_options=EqOptions(correction_range=(25.0, 150.0)),
+            )
+            self.assertAlmostEqual(diagnostic["headroom_db"], probe["headroom_db"])
+            self.assertAlmostEqual(
+                diagnostic["post_eq_headroom_db"], probe["post_eq_headroom_db"]
+            )
+            combined_eq_db = np.asarray(diagnostic["post_eq_db"]) - np.asarray(
+                diagnostic["sum_db"]
+            )
+            self.assertLessEqual(float(np.max(combined_eq_db)), 1e-9)
             self.assertEqual(
                 result["settings"]["eq"]["shelf"],
                 {
@@ -1180,7 +1207,7 @@ class PipelineTests(unittest.TestCase):
             self.assertNotIn("function revealPlots", page)
             self.assertNotIn("window.dispatchEvent(new Event('resize'))", page)
             self.assertIn("Low-end power", page)
-            self.assertIn("not part of the recommendation ranking", page)
+            self.assertIn("do not affect recommendation order", page)
             self.assertIn("Fitted EQ filters", page)
             self.assertIn("Post-EQ excess GD", page)
             self.assertNotIn("Pre-EQ excess GD", page)
