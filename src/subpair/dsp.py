@@ -80,87 +80,79 @@ def broad_trend_db(values: np.ndarray, ppo: int) -> np.ndarray:
     )
 
 
+SCORE_DIP_SMOOTHING_OCTAVES = 1.0 / 3.0
+DEFAULT_SCORE_LOW_END_WEIGHT = 0.5
+DEFAULT_SCORE_DIP_WEIGHT = 1.0
+
+
+def smoothed_dip_db(
+    magnitude_db: np.ndarray,
+    ppo: int,
+    smoothing_octaves: float = SCORE_DIP_SMOOTHING_OCTAVES,
+    score_slice: slice | None = None,
+) -> np.ndarray | float:
+    """Worst negative deviation from a fractional-octave smoothed response.
+
+    Unlike the old null detector, this has no two-sided recovery heuristic and
+    no group-delay multiplier. It answers the visually direct question: how
+    far does the response fall below its local, smoothed shape? A one-third-
+    octave FWHM follows broad roll-off while retaining narrow cancellation
+    dips. Callers with real response data beyond the scored range should pass
+    that margin and crop only the residual via ``score_slice``.
+    """
+    magnitude_db = np.asarray(magnitude_db, dtype=np.float64)
+    if magnitude_db.ndim < 1 or magnitude_db.shape[-1] == 0:
+        raise ValueError("Smoothed-dip magnitude must have a non-empty final axis")
+    if ppo < 1 or not math.isfinite(smoothing_octaves) or smoothing_octaves <= 0.0:
+        raise ValueError("Smoothed-dip resolution and width must be positive")
+    sigma = ppo * smoothing_octaves / 2.354820045
+    smoothed = ndimage.gaussian_filter1d(
+        magnitude_db,
+        sigma=max(sigma, 0.01),
+        axis=-1,
+        mode="nearest",
+        truncate=3.0,
+    )
+    residual = np.maximum(0.0, smoothed - magnitude_db)
+    if score_slice is not None:
+        residual = residual[..., score_slice]
+    result = np.max(residual, axis=-1)
+    return float(result) if result.ndim == 0 else result
+
+
+def usable_output_score_db(
+    spl_db: np.ndarray | float,
+    low_end_power: np.ndarray | float,
+    dip_db: np.ndarray | float,
+    low_end_weight: float = DEFAULT_SCORE_LOW_END_WEIGHT,
+    dip_weight: float = DEFAULT_SCORE_DIP_WEIGHT,
+) -> np.ndarray | float:
+    """Equal-drive output minus the weighted local-dip penalty, in dB.
+
+    ``low_end_weight`` interpolates in dB between ordinary full-band pressure
+    power and excursion-weighted low-end power. ``dip_weight`` controls how
+    many score dB are deducted per dB below the one-third-octave reference.
+    The result shifts with the cache's arbitrary level reference, but score
+    differences and ordering do not; the engine also serializes a best=0 dB
+    relative score for presentation.
+    """
+    if not math.isfinite(low_end_weight) or not 0.0 <= low_end_weight <= 1.0:
+        raise ValueError("Score low-end weight must be between 0 and 1")
+    if not math.isfinite(dip_weight) or dip_weight < 0.0:
+        raise ValueError("Score dip weight must be non-negative")
+    spl = np.asarray(spl_db, dtype=np.float64)
+    low_end = np.asarray(low_end_power, dtype=np.float64)
+    dip = np.asarray(dip_db, dtype=np.float64)
+    score = (1.0 - low_end_weight) * spl + low_end_weight * low_end - dip_weight * dip
+    return float(score) if score.ndim == 0 else score
+
+
 def _grid_ppo(frequencies: np.ndarray) -> float:
-    """Points-per-octave implied by a log-frequency grid's actual spacing."""
+    """Points per octave implied by a log-frequency grid's actual spacing."""
     if frequencies.size < 2:
         return 48.0
     steps = np.diff(np.log2(np.asarray(frequencies, dtype=np.float64)))
     return max(1.0, 1.0 / float(np.median(steps)))
-
-
-WIDE_DIP_MARGIN_OCTAVES = 1.0
-
-
-def _two_sided_wide_dip_db(magnitude_db: np.ndarray, frequencies: np.ndarray) -> np.ndarray:
-    """Dip below the higher of the best level well to the left AND well to the right.
-
-    A genuine cancellation dip, however wide, sits between normal-level
-    content on both sides and this flags it at close to its true depth. A
-    smooth monotonic rolloff never recovers on at least one side, so it
-    always scores zero here regardless of how much total range it spans:
-    that's the deliberate difference from a single global reference (a
-    percentile, a single wide trend), which cannot tell "sustained decline"
-    from "bounded dip" apart. The margin before a side starts counting keeps
-    this from just re-detecting narrow, already-``broad_trend_db``-covered
-    notches off their own immediate shoulders, and near the array's own
-    edges - where one side has no room left for a margin plus a reference -
-    it stays silent rather than guessing.
-    """
-    magnitude_db = np.asarray(magnitude_db, dtype=np.float64)
-    n = magnitude_db.shape[-1]
-    margin_bins = int(round(_grid_ppo(frequencies) * WIDE_DIP_MARGIN_OCTAVES))
-    if n <= margin_bins:
-        return np.zeros_like(magnitude_db)
-    left_reference = np.full_like(magnitude_db, -np.inf)
-    right_reference = np.full_like(magnitude_db, -np.inf)
-    left_cummax = np.maximum.accumulate(magnitude_db, axis=-1)
-    right_cummax = np.maximum.accumulate(magnitude_db[..., ::-1], axis=-1)[..., ::-1]
-    left_reference[..., margin_bins:] = left_cummax[..., : n - margin_bins]
-    right_reference[..., : n - margin_bins] = right_cummax[..., margin_bins:]
-    reference = np.minimum(left_reference, right_reference)
-    return np.maximum(0.0, reference - magnitude_db)
-
-
-def dip_below_trend_db(
-    magnitude_db: np.ndarray, trend_db: np.ndarray, frequencies: np.ndarray
-) -> np.ndarray:
-    """Per-frequency dip depth: below the narrow trend OR a two-sided wide check.
-
-    ``trend_db`` (see ``broad_trend_db``) is a ~1-octave smoothing of the
-    same curve it's compared against, so it is a good reference for narrow
-    comb-filtering nulls but a dip much wider than that window is largely
-    absorbed into the trend itself and under-reported (the trend just
-    follows it down). ``_two_sided_wide_dip_db`` catches that case without
-    the false positives a single global baseline gives on an ordinary
-    monotonic rolloff.
-    """
-    magnitude_db = np.asarray(magnitude_db, dtype=np.float64)
-    narrow_dip = np.maximum(0.0, np.asarray(trend_db, dtype=np.float64) - magnitude_db)
-    wide_dip = _two_sided_wide_dip_db(magnitude_db, frequencies)
-    return np.maximum(narrow_dip, wide_dip)
-
-
-def null_scores(
-    spectra: np.ndarray,
-    frequencies: np.ndarray,
-    ppo: int,
-    score_slice: slice | None = None,
-) -> np.ndarray:
-    """Max dip of magnitude below its one-octave trend or a wide two-sided check.
-
-    When ``score_slice`` is given, ``spectra``/``frequencies`` are assumed to
-    carry real spectral content beyond the reported band (see
-    ``AnalysisContext.trend_frequencies``) so neither the trend nor the wide
-    check in ``dip_below_trend_db`` are biased by edge-replicated or
-    edge-truncated data; the max-dip search itself is still restricted to
-    the reported band via the slice.
-    """
-    magnitude_db = db20(spectra)
-    trend = broad_trend_db(magnitude_db, ppo)
-    dip = dip_below_trend_db(magnitude_db, trend, frequencies)
-    if score_slice is not None:
-        dip = dip[..., score_slice]
-    return np.max(dip, axis=-1)
 
 
 LOW_END_POWER_UPPER_HZ = 100.0
@@ -177,7 +169,7 @@ def low_end_power_db(
     trend_db: np.ndarray,
     frequencies: np.ndarray,
     upper_hz: float = LOW_END_POWER_UPPER_HZ,
-) -> float:
+) -> np.ndarray | float:
     """Excursion-cost-weighted mean low-frequency pressure power.
 
     In the pistonic region, acoustic pressure is proportional to ``f**2``
@@ -202,11 +194,11 @@ def low_end_power_db(
     """
     frequencies = np.asarray(frequencies, dtype=np.float64)
     trend_db = np.asarray(trend_db, dtype=np.float64)
-    if frequencies.ndim != 1 or trend_db.ndim != 1:
-        raise ValueError("Low-end power inputs must be one-dimensional")
-    if frequencies.shape != trend_db.shape or frequencies.size == 0:
+    if frequencies.ndim != 1 or trend_db.ndim < 1:
+        raise ValueError("Low-end power frequencies must be one-dimensional")
+    if trend_db.shape[-1] != frequencies.size or frequencies.size == 0:
         raise ValueError(
-            "Low-end power frequencies and trend must have equal non-zero length"
+            "Low-end power frequencies must match the trend's non-empty final axis"
         )
     if np.any(frequencies <= 0.0) or np.any(np.diff(frequencies) <= 0.0):
         raise ValueError("Low-end power frequencies must be positive and increasing")
@@ -219,25 +211,24 @@ def low_end_power_db(
     if not np.any(mask):
         mask = np.ones(frequencies.shape, dtype=bool)
     used_frequencies = frequencies[mask]
-    used_trend_db = trend_db[mask]
+    used_trend_db = trend_db[..., mask]
     if used_frequencies.size == 1:
-        return float(used_trend_db[0])
+        result = used_trend_db[..., 0]
+        return float(result) if result.ndim == 0 else result
 
     # The reference frequency cancels between numerator and denominator; the
     # highest included frequency keeps the intermediate weights near unity.
     weights = (
         used_frequencies[-1] / used_frequencies
     ) ** EXCURSION_POWER_FREQUENCY_EXPONENT
-    peak_db = float(np.max(used_trend_db))
+    peak_db = np.max(used_trend_db, axis=-1, keepdims=True)
     relative_pressure_power = 10.0 ** ((used_trend_db - peak_db) / 10.0)
     log_frequencies = np.log(used_frequencies)
-    weighted_power = float(
-        np.trapezoid(relative_pressure_power * weights, x=log_frequencies)
-        / np.trapezoid(weights, x=log_frequencies)
-    )
-    return float(
-        peak_db + 10.0 * np.log10(max(weighted_power, EPS))
-    )
+    weighted_power = np.trapezoid(
+        relative_pressure_power * weights, x=log_frequencies, axis=-1
+    ) / float(np.trapezoid(weights, x=log_frequencies))
+    result = peak_db[..., 0] + 10.0 * np.log10(np.maximum(weighted_power, EPS))
+    return float(result) if result.ndim == 0 else result
 
 
 def peq_response(
@@ -393,79 +384,6 @@ def _excess_gd_authority(
         mode="nearest",
         truncate=3.0,
     )
-
-
-DIP_GD_SEVERITY_WEIGHT = 1.5  # up to +150% dip severity where excess GD is worst
-DSP_TARGET_MIN_PHASE_DIP_WEIGHT = 0.2  # 'dsp' target: minimum-phase dips barely count
-
-
-def gd_weighted_null_score(
-    magnitude_db: np.ndarray,
-    trend_db: np.ndarray,
-    frequencies: np.ndarray,
-    excess_group_delay_ms: np.ndarray,
-    dsp_target: bool = False,
-) -> float:
-    """Max magnitude dip below trend, scaled up where it coincides with excess GD.
-
-    Dip depth itself comes from ``dip_below_trend_db``: below the narrow
-    trend OR a two-sided wide check, so a dip much wider than the trend's
-    ~1-octave window is not missed. A plain magnitude dip is scored
-    the same whether it is a shallow, EQ-fixable amplitude ripple or a
-    genuine destructive-interference null (acoustically irreparable and
-    audible as smearing). This reuses the same excess-GD risk gate as the EQ
-    authority curve (``_excess_gd_authority``) to inflate dip severity where
-    it coincides with real excess group delay, so the reported/ranked score
-    reflects how *fixable* a dip is, not just how deep it looks in magnitude
-    alone. A dip with zero depth stays zero regardless of nearby group
-    delay; group-delay-only regions are already handled separately by the
-    EQ authority curve.
-
-    A magnitude peak above the trend is deliberately *not* scored as a dip
-    is, even at the same excess-GD risk: reinforcement adds output rather
-    than destructively cancelling it. But a peak that only exists because of
-    real excess group delay - not minimum-phase, i.e. not explained by its
-    own magnitude shape - is a resonance/ringing signature (comb reinforcement
-    with genuine energy storage), not a benign constructive bump, and is
-    scored the same way a dip's severity is inflated: proportional to
-    ``gd_risk`` alone, so a minimum-phase peak (``gd_risk`` near 0) still
-    scores exactly zero, and only a non-minimum-phase peak counts at all.
-
-    ``dsp_target=True`` (the ``'dsp'`` EQ target) is for placements that
-    will be corrected by a full-featured external DSP rather than subpair's
-    own conservative fitter: a *minimum-phase* dip is, by definition, fully
-    correctable by any minimum-phase EQ (a boost that follows the same
-    minimum-phase relationship exactly restores both magnitude and phase),
-    so it barely counts here at ``gd_risk`` near 0
-    (``DSP_TARGET_MIN_PHASE_DIP_WEIGHT`` instead of the usual full weight).
-    But a *non*-minimum-phase dip remains a genuine, DSP-unfixable
-    cancellation regardless of target, so both modes converge to the same
-    maximum severity as ``gd_risk`` rises to 1 - the ranking in ``dsp`` mode
-    ends up preferring flat excess group delay over flat raw magnitude, since
-    magnitude-only problems are assumed to be someone else's problem to fix
-    later. Peak scoring is unaffected by ``dsp_target``: minimum-phase peaks
-    already score zero in every mode.
-
-    This is deliberately not used inside the fast exhaustive delay/gain/
-    polarity search: true excess group delay needs a minimum-phase
-    extraction per candidate, which is too expensive to run over that whole
-    grid (and coarse-grid phase unwrapping is fragile exactly at deep
-    nulls). It is computed once per finalist instead.
-    """
-    magnitude_db = np.asarray(magnitude_db, dtype=np.float64)
-    trend_db = np.asarray(trend_db, dtype=np.float64)
-    dip_db = dip_below_trend_db(magnitude_db, trend_db, frequencies)
-    peak_db = np.maximum(0.0, magnitude_db - trend_db)
-    gd_risk = 1.0 - _excess_gd_authority(frequencies, excess_group_delay_ms)
-    max_dip_multiplier = 1.0 + DIP_GD_SEVERITY_WEIGHT
-    base_dip_multiplier = DSP_TARGET_MIN_PHASE_DIP_WEIGHT if dsp_target else 1.0
-    dip_multiplier = base_dip_multiplier + (max_dip_multiplier - base_dip_multiplier) * gd_risk
-    dip_severity_db = dip_db * dip_multiplier
-    peak_severity_db = peak_db * DIP_GD_SEVERITY_WEIGHT * gd_risk
-    severity_db = np.maximum(dip_severity_db, peak_severity_db)
-    if severity_db.size == 0:
-        return 0.0
-    return float(np.max(severity_db))
 
 
 def _denoised_residual(residual: np.ndarray, ppo: int) -> np.ndarray:
@@ -727,10 +645,8 @@ def fit_eq_filters(
     range_authority = _correction_range_authority(
         frequencies, correction_range, options.correction_slope_db_per_octave
     )
-    # Same excess-GD risk gate as gd_weighted_null_score, opposite use: there
-    # it inflates a dip's reported severity where GD is bad (it's a real,
-    # unfixable cancellation); here it shrinks the EQ target there (a filter
-    # can't repair phase-domain cancellation by boosting/cutting magnitude).
+    # Shrink the EQ target where excess GD indicates that a magnitude-only
+    # filter cannot repair the phase-domain cancellation.
     gd_authority = _excess_gd_authority(frequencies, excess_group_delay_ms)
     authority = range_authority * gd_authority
     desired *= authority
@@ -1040,7 +956,7 @@ def excess_group_delay(
     The minimum-phase transform and group-delay derivative use the complete
     supplied spectra and evaluation grid. When ``integration_range`` is set,
     only that frequency interval contributes to common-delay removal and the
-    scalar score used for ranking.
+    reported scalar diagnostic.
 
     A single constant - this curve's weighted median within
     ``integration_range`` - is treated as the arbitrary common time origin
@@ -1187,11 +1103,10 @@ def excess_gd_peak_ms(
     maximum filter, so a single noisy sample cannot set the reported peak by
     itself, and then a single global maximum.
 
-    This is a lexicographic tie-break placed after ``excess_gd_tail_ms``, not
-    a replacement for it: it exists to separate two placements whose smeared
-    *area* looks equally clean but where one has a single sharp, denoised-real
-    non-minimum-phase excursion the area-based tail metric alone would not
-    weight any differently from several mild, spread-out ones.
+    This complements rather than replaces ``excess_gd_tail_ms``: it exposes a
+    single sharp, denoised-real non-minimum-phase excursion which the
+    area-based diagnostic would weight like several mild, spread-out ones.
+    Neither value changes the usable-output ranking.
     """
     frequencies = np.asarray(frequencies, dtype=np.float64)
     values = np.abs(np.asarray(excess_group_delay_ms, dtype=np.float64))
@@ -1388,6 +1303,8 @@ def pair_diagnostics(
     include_decay: bool = False,
     eq_options: EqOptions | None = None,
     include_trends: bool = False,
+    score_low_end_weight: float = DEFAULT_SCORE_LOW_END_WEIGHT,
+    score_dip_weight: float = DEFAULT_SCORE_DIP_WEIGHT,
 ) -> dict[str, Any]:
     eq_options = eq_options or EqOptions(correction_range=context.band)
     grid_sum = context.sum_on_grid(first, second, polarity, delay_ms, gain_db)
@@ -1455,6 +1372,13 @@ def pair_diagnostics(
     trend_db = broad_trend_db(
         db20(normalized_trend_wide_sum), context.ppo
     )[context.trend_slice]
+    dip_db = float(
+        smoothed_dip_db(
+            db20(normalized_trend_wide_sum),
+            context.ppo,
+            score_slice=context.trend_slice,
+        )
+    )
     eq_trend_wide = filters_response(
         context.trend_frequencies, context.sample_rate, filters
     ) * _fitted_low_shelf_response(
@@ -1464,6 +1388,13 @@ def pair_diagnostics(
         trend_wide_sum * eq_trend_wide * post_eq_headroom_linear
     )
     post_trend_db = broad_trend_db(db20(post_trend_wide_sum), context.ppo)[context.trend_slice]
+    post_eq_dip_db = float(
+        smoothed_dip_db(
+            db20(post_trend_wide_sum),
+            context.ppo,
+            score_slice=context.trend_slice,
+        )
+    )
     post_excess_score, post_excess_curve = excess_group_delay(
         post_full,
         full_frequencies,
@@ -1472,13 +1403,35 @@ def pair_diagnostics(
         native_resolution_hz=context.native_resolution_hz,
         ppo=context.ppo,
     )
-    dsp_target = eq_options.target == "dsp"
+    spl_db = float(
+        10.0 * np.log10(max(np.mean(np.abs(normalized_grid_sum) ** 2), EPS))
+    )
+    post_eq_spl_db = float(
+        10.0 * np.log10(max(np.mean(np.abs(post_grid) ** 2), EPS))
+    )
+    raw_low_end_power_db = float(low_end_power_db(trend_db, context.frequencies))
+    post_eq_low_end_power_db = float(
+        low_end_power_db(post_trend_db, context.frequencies)
+    )
     result: dict[str, Any] = {
-        "null_score_db": gd_weighted_null_score(
-            magnitude_db, trend_db, context.frequencies, excess_curve, dsp_target=dsp_target
+        "dip_db": dip_db,
+        "sound_power_db": float(
+            usable_output_score_db(
+                spl_db,
+                raw_low_end_power_db,
+                0.0,
+                score_low_end_weight,
+                0.0,
+            )
         ),
-        "magnitude_only_null_score_db": float(
-            np.max(dip_below_trend_db(magnitude_db, trend_db, context.frequencies))
+        "score_db": float(
+            usable_output_score_db(
+                spl_db,
+                raw_low_end_power_db,
+                dip_db,
+                score_low_end_weight,
+                score_dip_weight,
+            )
         ),
         "excess_gd_ms": float(excess_score),
         "excess_gd_tail_ms": excess_gd_tail_ms(
@@ -1489,20 +1442,26 @@ def pair_diagnostics(
         ),
         "raw_tail_ms": float(np.max(raw_tail_by_band)),
         "raw_tail_by_band_ms": [round(float(value), 6) for value in raw_tail_by_band],
-        "low_end_power_db": low_end_power_db(
-            trend_db,
-            context.frequencies,
-        ),
+        "low_end_power_db": raw_low_end_power_db,
         "headroom_db": headroom_db,
-        "post_eq_null_score_db": gd_weighted_null_score(
-            post_magnitude_db,
-            post_trend_db,
-            context.frequencies,
-            post_excess_curve,
-            dsp_target=dsp_target,
+        "post_eq_dip_db": post_eq_dip_db,
+        "post_eq_sound_power_db": float(
+            usable_output_score_db(
+                post_eq_spl_db,
+                post_eq_low_end_power_db,
+                0.0,
+                score_low_end_weight,
+                0.0,
+            )
         ),
-        "post_eq_magnitude_only_null_score_db": float(
-            np.max(dip_below_trend_db(post_magnitude_db, post_trend_db, context.frequencies))
+        "post_eq_score_db": float(
+            usable_output_score_db(
+                post_eq_spl_db,
+                post_eq_low_end_power_db,
+                post_eq_dip_db,
+                score_low_end_weight,
+                score_dip_weight,
+            )
         ),
         "post_eq_excess_gd_ms": float(post_excess_score),
         "post_eq_excess_gd_tail_ms": excess_gd_tail_ms(
@@ -1513,10 +1472,7 @@ def pair_diagnostics(
         ),
         "post_eq_tail_ms": float(np.max(tail_by_band)),
         "tail_by_band_ms": [round(float(value), 6) for value in tail_by_band],
-        "post_eq_low_end_power_db": low_end_power_db(
-            post_trend_db,
-            context.frequencies,
-        ),
+        "post_eq_low_end_power_db": post_eq_low_end_power_db,
         "post_eq_headroom_db": post_eq_headroom_db,
         "filters": filters,
         "eq_target": eq_metadata["target"],
@@ -1526,12 +1482,8 @@ def pair_diagnostics(
         "eq_mean_authority": float(np.mean(eq_metadata["eq_authority"])),
         "eq_filter_count": int(eq_metadata["filter_count"]),
         "eq_shelf": dict(fitted_shelf),
-        "spl_db": float(
-            10.0 * np.log10(max(np.mean(np.abs(normalized_grid_sum) ** 2), EPS))
-        ),
-        "post_eq_spl_db": float(
-            10.0 * np.log10(max(np.mean(np.abs(post_grid) ** 2), EPS))
-        ),
+        "spl_db": spl_db,
+        "post_eq_spl_db": post_eq_spl_db,
     }
     if include_trends:
         # Keep broad trends opt-in so ordinary diagnostic results stay small.

@@ -29,7 +29,8 @@ SEARCH_ARGS=(
   --max-boost 6
   --max-cut 18
   --eq-bands 16
-  --tie-tolerance-db 2
+  --score-low-end-weight 0.5
+  --score-dip-weight 1
   --top 8
   --low-shelf on
 )

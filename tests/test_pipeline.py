@@ -24,13 +24,13 @@ from subpair.dsp import (
     fit_eq_filters,
     excess_group_delay,
     gd_smoothing_octaves,
-    gd_weighted_null_score,
     log_frequency_grid,
     low_end_power_db,
     low_shelf_response,
-    null_scores,
     pair_diagnostics,
     peq_response,
+    smoothed_dip_db,
+    usable_output_score_db,
 )
 from subpair.html_report import (
     _magnitude_figure,
@@ -61,6 +61,8 @@ class PipelineTests(unittest.TestCase):
                     "second": 2,
                     "rank": 1,
                     "eq_rank": 1,
+                    "relative_score_db": 0.0,
+                    "post_eq_relative_score_db": 0.0,
                     "first_name": "A",
                     "second_name": "B",
                 },
@@ -80,6 +82,8 @@ class PipelineTests(unittest.TestCase):
                     "second": 4,
                     "rank": 2,
                     "eq_rank": 2,
+                    "relative_score_db": -1.0,
+                    "post_eq_relative_score_db": -1.0,
                     "first_name": "C",
                     "second_name": "D",
                 },
@@ -157,16 +161,26 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(parser.parse_args(["report", "--limit", "24"]).limit, 24)
         self.assertTrue(parser.parse_args(["report", "--raw"]).raw)
 
-    def test_search_max_cut_and_tie_tolerance_arguments(self):
+    def test_search_score_weight_arguments(self):
         parser = _build_parser()
         defaults = parser.parse_args(["search"])
         self.assertEqual(defaults.max_cut, 18.0)
-        self.assertEqual(defaults.tie_tolerance_db, 0.0)
+        self.assertEqual(defaults.score_low_end_weight, 0.5)
+        self.assertEqual(defaults.score_dip_weight, 1.0)
         overridden = parser.parse_args(
-            ["search", "--max-cut", "24", "--tie-tolerance-db", "0.5"]
+            [
+                "search",
+                "--max-cut",
+                "24",
+                "--score-low-end-weight",
+                "0.75",
+                "--score-dip-weight",
+                "1.5",
+            ]
         )
         self.assertEqual(overridden.max_cut, 24.0)
-        self.assertEqual(overridden.tie_tolerance_db, 0.5)
+        self.assertEqual(overridden.score_low_end_weight, 0.75)
+        self.assertEqual(overridden.score_dip_weight, 1.5)
 
     def test_automatic_low_shelf_cli_flag_defaults_on_for_search_only(self):
         parser = _build_parser()
@@ -330,21 +344,59 @@ class PipelineTests(unittest.TestCase):
             places=6,
         )
 
+    def test_low_end_power_vectorizes_over_candidate_responses(self):
+        frequencies = log_frequency_grid(20.0, 200.0, 48)
+        responses = np.stack(
+            [np.zeros_like(frequencies), np.full_like(frequencies, 6.0)]
+        )
+        scores = low_end_power_db(responses, frequencies)
+        np.testing.assert_allclose(scores, [0.0, 6.0], atol=1e-9)
+
+    def test_smoothed_dip_finds_a_narrow_dip_but_ignores_log_linear_rolloff(self):
+        frequencies = log_frequency_grid(10.0, 400.0, 48)
+        rolloff = -18.0 * np.log2(frequencies / 80.0)
+        score_slice = slice(48, -48)
+        self.assertLess(
+            float(smoothed_dip_db(rolloff, 48, score_slice=score_slice)),
+            1e-6,
+        )
+        notched = rolloff.copy()
+        centre = int(np.argmin(np.abs(frequencies - 80.0)))
+        notched[centre] -= 9.0
+        self.assertGreater(
+            float(smoothed_dip_db(notched, 48, score_slice=score_slice)),
+            7.0,
+        )
+
+    def test_usable_output_score_blends_output_and_deducts_dip(self):
+        self.assertAlmostEqual(
+            usable_output_score_db(10.0, 6.0, 2.0),
+            6.0,
+        )
+        self.assertAlmostEqual(
+            usable_output_score_db(
+                10.0, 6.0, 2.0, low_end_weight=0.75, dip_weight=0.5
+            ),
+            6.0,
+        )
+
     def test_ranking_table_renders_relative_low_end_power(self):
         base = {
             "polarity": 1,
             "delay_ms": 0.0,
             "gain_db": 0.0,
             "headroom_db": -4.5,
-            "null_score_db": 1.0,
+            "dip_db": 1.0,
             "excess_gd_ms": 0.5,
             "raw_tail_ms": 10.0,
             "relative_spl_db": 0.0,
         }
         pairs = [
             {**base, "first": 1, "second": 2, "rank": 1,
+             "relative_score_db": 0.0,
              "relative_low_end_power_db": 1.25},
             {**base, "first": 3, "second": 4, "rank": 2,
+             "relative_score_db": -2.0,
              "relative_low_end_power_db": -2.5},
         ]
         table = _ranking_table(pairs, "raw", "ranking-raw", {"1-2", "3-4"})
@@ -355,22 +407,9 @@ class PipelineTests(unittest.TestCase):
         self.assertIn('data-value="1.25"', table)
         self.assertIn(">+1.25</td>", table)
         self.assertIn('data-value="-2.5"', table)
-
-    def test_banded_sort_key_is_identity_when_tolerance_is_zero(self):
-        from subpair.engine import _banded_sort_key
-
-        rows = [{"score": 1.234}, {"score": 1.235}, {"score": 5.0}]
-        self.assertEqual(
-            _banded_sort_key(rows, "score", 0.0), [1.234, 1.235, 5.0]
-        )
-
-    def test_banded_sort_key_groups_near_equal_scores(self):
-        from subpair.engine import _banded_sort_key
-
-        rows = [{"score": 1.0}, {"score": 1.05}, {"score": 1.3}]
-        bands = _banded_sort_key(rows, "score", 0.2)
-        self.assertEqual(bands[0], bands[1])
-        self.assertNotEqual(bands[1], bands[2])
+        self.assertIn("Score (dB)", table)
+        self.assertNotIn(">Rank</th>", table)
+        self.assertIn("Residual dip (dB)", table)
 
     def test_peq_is_a_local_cut_not_broadband_attenuation(self):
         frequencies = np.asarray([25.0, 80.0, 150.0])
@@ -550,135 +589,6 @@ class PipelineTests(unittest.TestCase):
         self.assertLess(narrow_authority, 0.5)
         self.assertLess(wide_authority, 0.5)
         self.assertLess(abs(narrow_authority - wide_authority), 0.2)
-
-    def test_null_scores_detects_a_wide_shelf_dip(self):
-        # A dip much wider than the ~1-octave trend window is largely
-        # absorbed into that trend (the trend just follows it down), so the
-        # narrow-only detector badly under-reports a real, sustained 10 dB
-        # departure from the rest of the band as roughly half that.
-        ppo = 48
-        frequencies = log_frequency_grid(20.0, 300.0, ppo)
-        magnitude_db = np.zeros_like(frequencies)
-        dip_low, dip_high = 40.0, 40.0 * 2.0 ** 2.5  # 2.5-octave-wide dip
-        mask = (frequencies >= dip_low) & (frequencies <= dip_high)
-        magnitude_db[mask] = -10.0
-        spectrum = 10.0 ** (magnitude_db / 20.0)
-        score = float(null_scores(spectrum[None, :], frequencies, ppo)[0])
-        self.assertGreater(score, 8.0)
-
-    def test_null_scores_does_not_flag_a_smooth_monotonic_rolloff(self):
-        # A plain rolloff has no "recovery" side, unlike a real bounded dip,
-        # and must not be scored as though its whole range were a null.
-        ppo = 48
-        frequencies = log_frequency_grid(25.0, 150.0, ppo)
-        magnitude_db = np.minimum(
-            -6.0 * np.log2(55.0 / np.maximum(frequencies, 1.0)), 0.0
-        )
-        total_range_db = float(magnitude_db.max() - magnitude_db.min())
-        spectrum = 10.0 ** (magnitude_db / 20.0)
-        score = float(null_scores(spectrum[None, :], frequencies, ppo)[0])
-        self.assertLess(score, 0.5 * total_range_db)
-
-    def test_gd_weighted_null_score_inflates_dips_with_real_excess_gd(self):
-        frequencies = log_frequency_grid(25.0, 150.0, 48)
-        magnitude_db = np.zeros_like(frequencies)
-        trend_db = np.zeros_like(frequencies)
-        centre = int(np.argmin(np.abs(frequencies - 65.0)))
-        magnitude_db[centre] = -6.0  # a 6 dB dip below the flat trend
-
-        benign_gd = np.zeros_like(frequencies)
-        severe_gd = np.zeros_like(frequencies)
-        severe_gd[centre - 1 : centre + 2] = 1000.0 / frequencies[
-            centre - 1 : centre + 2
-        ]
-
-        benign_score = gd_weighted_null_score(magnitude_db, trend_db, frequencies, benign_gd)
-        severe_score = gd_weighted_null_score(magnitude_db, trend_db, frequencies, severe_gd)
-
-        # No excess GD: the weighted score matches the plain magnitude dip.
-        self.assertAlmostEqual(benign_score, 6.0, places=3)
-        # Real excess GD at the same dip inflates its severity.
-        self.assertGreater(severe_score, benign_score)
-        self.assertGreater(severe_score, 6.0)
-
-        # Excess GD with no accompanying magnitude dip is not scored as one.
-        no_dip_magnitude = np.zeros_like(frequencies)
-        self.assertEqual(
-            gd_weighted_null_score(no_dip_magnitude, trend_db, frequencies, severe_gd),
-            0.0,
-        )
-
-    def test_gd_weighted_null_score_only_penalises_non_minimum_phase_peaks(self):
-        frequencies = log_frequency_grid(25.0, 150.0, 48)
-        trend_db = np.zeros_like(frequencies)
-        magnitude_db = np.zeros_like(frequencies)
-        centre = int(np.argmin(np.abs(frequencies - 65.0)))
-        magnitude_db[centre] = 6.0  # a 6 dB peak above the flat trend
-
-        benign_gd = np.zeros_like(frequencies)
-        severe_gd = np.zeros_like(frequencies)
-        severe_gd[centre - 1 : centre + 2] = 1000.0 / frequencies[
-            centre - 1 : centre + 2
-        ]
-
-        # A minimum-phase peak (no excess GD) is left alone entirely.
-        benign_score = gd_weighted_null_score(magnitude_db, trend_db, frequencies, benign_gd)
-        self.assertAlmostEqual(benign_score, 0.0, places=6)
-
-        # The same peak, but with real excess GD (non-minimum-phase, a
-        # resonance/ringing signature), is penalised.
-        severe_score = gd_weighted_null_score(magnitude_db, trend_db, frequencies, severe_gd)
-        self.assertGreater(severe_score, 0.0)
-
-    def test_gd_weighted_null_score_dsp_target_lightly_penalises_min_phase_dips(self):
-        frequencies = log_frequency_grid(25.0, 150.0, 48)
-        trend_db = np.zeros_like(frequencies)
-        dip_db = np.zeros_like(frequencies)
-        centre = int(np.argmin(np.abs(frequencies - 65.0)))
-        dip_db[centre] = -6.0  # a 6 dB minimum-phase dip
-
-        peak_db = np.zeros_like(frequencies)
-        peak_db[centre] = 6.0  # a 6 dB minimum-phase peak
-
-        benign_gd = np.zeros_like(frequencies)
-        severe_gd = np.zeros_like(frequencies)
-        severe_gd[centre - 1 : centre + 2] = 1000.0 / frequencies[
-            centre - 1 : centre + 2
-        ]
-
-        # A minimum-phase dip counts for its full depth normally, but only
-        # lightly under the 'dsp' target (assumed fully fixable by DSP).
-        normal_dip = gd_weighted_null_score(dip_db, trend_db, frequencies, benign_gd)
-        dsp_dip = gd_weighted_null_score(
-            dip_db, trend_db, frequencies, benign_gd, dsp_target=True
-        )
-        self.assertAlmostEqual(normal_dip, 6.0, places=3)
-        self.assertLess(dsp_dip, normal_dip)
-        self.assertGreater(dsp_dip, 0.0)
-
-        # A non-minimum-phase dip (real excess GD) still scores up to
-        # roughly the same severity in both targets: 'dsp' mode does not
-        # excuse a genuinely unfixable cancellation.
-        normal_severe = gd_weighted_null_score(dip_db, trend_db, frequencies, severe_gd)
-        dsp_severe = gd_weighted_null_score(
-            dip_db, trend_db, frequencies, severe_gd, dsp_target=True
-        )
-        self.assertLess(abs(normal_severe - dsp_severe) / normal_severe, 0.1)
-
-        # Minimum-phase and non-minimum-phase peaks are unaffected by
-        # dsp_target in either direction.
-        self.assertEqual(
-            gd_weighted_null_score(peak_db, trend_db, frequencies, benign_gd),
-            gd_weighted_null_score(
-                peak_db, trend_db, frequencies, benign_gd, dsp_target=True
-            ),
-        )
-        self.assertEqual(
-            gd_weighted_null_score(peak_db, trend_db, frequencies, severe_gd),
-            gd_weighted_null_score(
-                peak_db, trend_db, frequencies, severe_gd, dsp_target=True
-            ),
-        )
 
     def test_excess_gd_score_is_limited_to_integration_range(self):
         sample_rate = 4000.0
@@ -960,46 +870,32 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(
                 sorted(row["eq_rank"] for row in result["pairs"]), list(range(1, 7))
             )
-            raw_keys = [
-                (
-                    row["null_score_db"],
-                    row["excess_gd_ms"],
-                    row["excess_gd_tail_ms"],
-                    row["excess_gd_peak_ms"],
-                    row["raw_tail_ms"],
-                )
-                for row in result["pairs"]
-            ]
-            self.assertEqual(raw_keys, sorted(raw_keys))
-            eq_keys = [
-                (
-                    row["post_eq_null_score_db"],
-                    row["post_eq_excess_gd_ms"],
-                    row["post_eq_excess_gd_tail_ms"],
-                    row["post_eq_excess_gd_peak_ms"],
-                    row["post_eq_tail_ms"],
-                )
+            raw_scores = [row["score_db"] for row in result["pairs"]]
+            self.assertEqual(raw_scores, sorted(raw_scores, reverse=True))
+            eq_scores = [
+                row["post_eq_score_db"]
                 for row in sorted(result["pairs"], key=lambda row: row["eq_rank"])
             ]
-            self.assertEqual(eq_keys, sorted(eq_keys))
+            self.assertEqual(eq_scores, sorted(eq_scores, reverse=True))
             loaded = json.loads(results_path.read_text())
             self.assertEqual(
-                loaded["settings"]["ranking"]["raw"][0], "null_score_db"
+                loaded["settings"]["ranking"]["raw"][0], "score_db"
             )
             self.assertEqual(
                 loaded["settings"]["ranking"]["eq"][0],
-                "post_eq_null_score_db",
+                "post_eq_score_db",
             )
             self.assertEqual(
                 loaded["settings"]["ranking"]["excess_gd_range_hz"],
                 [25.0, 150.0],
             )
             self.assertEqual(loaded["settings"]["eq"]["max_filters"], 7)
-            self.assertEqual(
-                loaded["settings"]["ranking"]["magnitude_basis"],
-                "raw, unsmoothed",
+            score_settings = loaded["settings"]["ranking"]["score"]
+            self.assertEqual(score_settings["low_end_weight"], 0.5)
+            self.assertEqual(score_settings["dip_weight"], 1.0)
+            self.assertAlmostEqual(
+                score_settings["dip_smoothing_octaves_fwhm"], 1.0 / 3.0
             )
-            self.assertEqual(loaded["settings"]["ranking"]["tie_tolerance_db"], 0.0)
             self.assertIn("headroom", loaded["settings"]["ranking"])
             low_end_settings = loaded["settings"]["ranking"]["low_end_power"]
             self.assertIn("fields", low_end_settings)
@@ -1010,18 +906,6 @@ class PipelineTests(unittest.TestCase):
                 EXCURSION_POWER_DB_PER_OCTAVE,
             )
             self.assertIn("native_resolution", loaded["settings"])
-            # Low-end power is diagnostic-only: it must not appear in either
-            # ranking's declared sort-key field list.
-            self.assertNotIn(
-                "low_end_power_db", loaded["settings"]["ranking"]["raw"]
-            )
-            self.assertNotIn(
-                "post_eq_low_end_power_db", loaded["settings"]["ranking"]["eq"]
-            )
-            self.assertIn("excess_gd_peak_ms", loaded["settings"]["ranking"]["raw"])
-            self.assertIn(
-                "post_eq_excess_gd_peak_ms", loaded["settings"]["ranking"]["eq"]
-            )
             low_end_power_keys = (
                 "low_end_power_db",
                 "relative_low_end_power_db",
@@ -1029,11 +913,30 @@ class PipelineTests(unittest.TestCase):
                 "post_eq_relative_low_end_power_db",
             )
             for row in result["pairs"]:
-                self.assertIn("magnitude_only_null_score_db", row)
-                self.assertIn("post_eq_magnitude_only_null_score_db", row)
-                self.assertGreaterEqual(
-                    row["null_score_db"], row["magnitude_only_null_score_db"] - 1e-9
+                self.assertIn("dip_db", row)
+                self.assertIn("post_eq_dip_db", row)
+                self.assertIn("score_db", row)
+                self.assertIn("post_eq_score_db", row)
+                self.assertGreaterEqual(row["dip_db"], 0.0)
+                self.assertGreaterEqual(row["post_eq_dip_db"], 0.0)
+                self.assertAlmostEqual(
+                    row["sound_power_db"],
+                    0.5 * row["spl_db"] + 0.5 * row["low_end_power_db"],
                 )
+                self.assertAlmostEqual(
+                    row["score_db"], row["sound_power_db"] - row["dip_db"]
+                )
+                self.assertAlmostEqual(
+                    row["post_eq_sound_power_db"],
+                    0.5 * row["post_eq_spl_db"]
+                    + 0.5 * row["post_eq_low_end_power_db"],
+                )
+                self.assertAlmostEqual(
+                    row["post_eq_score_db"],
+                    row["post_eq_sound_power_db"] - row["post_eq_dip_db"],
+                )
+                self.assertNotIn("null_score_db", row)
+                self.assertNotIn("post_eq_null_score_db", row)
                 self.assertGreaterEqual(row["excess_gd_peak_ms"], 0.0)
                 self.assertGreaterEqual(row["post_eq_excess_gd_peak_ms"], 0.0)
                 self.assertGreaterEqual(row["delay_plateau_ms"], 0.0)
@@ -1054,7 +957,9 @@ class PipelineTests(unittest.TestCase):
             self.assertAlmostEqual(
                 result["pairs"][0]["relative_low_end_power_db"], 0.0
             )
+            self.assertAlmostEqual(result["pairs"][0]["relative_score_db"], 0.0)
             eq_first = min(result["pairs"], key=lambda row: row["eq_rank"])
+            self.assertAlmostEqual(eq_first["post_eq_relative_score_db"], 0.0)
             self.assertAlmostEqual(eq_first["post_eq_relative_low_end_power_db"], 0.0)
             for row in result["pairs"]:
                 self.assertAlmostEqual(
@@ -1191,7 +1096,7 @@ class PipelineTests(unittest.TestCase):
             visible_eq_pairs = sorted(
                 result["pairs"], key=lambda row: row["eq_rank"]
             )[:3]
-            expected_colored_metrics = 5 * len(visible_eq_pairs)
+            expected_colored_metrics = 6 * len(visible_eq_pairs)
             self.assertTrue(
                 all(
                     table.count("background:hsla(") == expected_colored_metrics
@@ -1207,7 +1112,10 @@ class PipelineTests(unittest.TestCase):
             self.assertNotIn("function revealPlots", page)
             self.assertNotIn("window.dispatchEvent(new Event('resize'))", page)
             self.assertIn("Low-end power", page)
-            self.assertIn("do not affect recommendation order", page)
+            self.assertIn("usable-output score", page)
+            self.assertIn("Residual dip (dB)", page)
+            self.assertIn("Score (dB)", page)
+            self.assertNotIn(">Rank</th>", page)
             self.assertIn("Fitted EQ filters", page)
             self.assertIn("Post-EQ excess GD", page)
             self.assertNotIn("Pre-EQ excess GD", page)

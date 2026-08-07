@@ -69,65 +69,33 @@ the real logic. Data flows strictly one-way through `.subpair-cache/`:
      measurement's `start_time_seconds`), and rejects caches whose relative
      start-time offset would wrap around the zero-padded FFT frame used for
      minimum-phase/CSD work (`__post_init__` raises `ValueError`).
-   - Two rankings are computed per pair — **raw** magnitude-only and
-     **EQ'd** (post-PEQ) — each a strict lexicographic tuple (never a
-     weighted blend): GD-weighted null score → excess GD → excess-GD tail →
-     excess-GD peak → decay tail. `excess_gd_peak_ms` is the width-invariant
-     counterpart to the area-based excess-GD tail: a denoised, plain maximum
-     of `|excess GD|`, so a narrow severe spike and a wide bump of equal peak
-     height score the same, breaking ties the area-based tail leaves exact.
-     `--tie-tolerance-db` only widens what counts as a tie in the *primary*
-     metric before falling through to the rest.
-   - `gd_weighted_null_score` inflates magnitude-dip severity (and scores
-     magnitude peaks) only where they coincide with real excess group delay,
-     using `_excess_gd_authority` as the shared risk gate — the same gate
-     also throttles PEQ correction authority in `fit_eq_filters`, so "how bad
-     is this dip" and "how much can EQ fix it" derive from one signal.
+   - Raw and post-EQ results use one higher-is-better usable-output score:
+     `(1-low_end_weight)*SPL + low_end_weight*low_end_power -
+     dip_weight*smoothed_dip`. Defaults are 0.5/1.0 and the CLI exposes both
+     weights. The displayed relative score sets the best pair to 0 dB.
+   - `smoothed_dip_db` is the worst negative deviation from a
+     one-third-octave-FWHM Gaussian smoothing, evaluated with real spectral
+     margin outside the scored band. It deliberately has no old wide-null
+     heuristic or group-delay multiplier.
+   - Low-end power is the one-octave broad response through 100 Hz weighted by
+     the `f^-4` excursion/amplifier cost (+12.04 dB/octave downward). Raw and
+     post-EQ headroom must already be present in every response before SPL,
+     low-end power, dip, or score is calculated.
+   - Excess GD, excess-GD tail/peak, and CSD decay remain diagnostics and still
+     gate unsafe EQ boost, but are not score terms or hidden tie-breakers.
    - `fit_eq_filters` is a bounded greedy RBJ-biquad fitter (constant-Q
      bells), constrained by `EqOptions` (`target` ∈ `trend`/`flat`/`dsp`,
-     boost/cut limits, correction range + slope, max filter count).
-   - Minimum-phase/excess-GD extraction is real-cepstrum-based and
-     deliberately only run once per finalist (not inside the fast grid
-     search) because it's too expensive to vectorize over the full
-     delay/gain/polarity grid.
-   - `excess_group_delay` is resolution-aware: `AnalysisContext.native_resolution_hz`
-     (`sample_rate / length` of the *unpadded* cache) sets how much of the
-     sub-bass a given capture can actually resolve, and `gd_smoothing_octaves`
-     + `_smooth_by_variable_octaves` progressively smooth the excess-GD curve
-     below that limit so ordinary measurement noise near DC doesn't read as
-     excess group delay. This feeds every downstream consumer of the curve
-     (`excess_gd_ms`/`excess_gd_tail_ms`, `_excess_gd_authority`,
-     `gd_weighted_null_score`, the report's excess-GD plot) from one place.
-   - `excess_group_delay` measures "excess" relative to a single
-     weighted-median constant, removed unconditionally. An earlier, opt-in
-     `--gd-baseline monotonic` mode (`SearchOptions.gd_baseline`) instead fit
-     a per-point baseline via weighted isotonic regression (PAVA),
-     constrained non-increasing in magnitude as frequency rose, modelling a
-     genuine low-end GD rise as normal rather than as excess. It was removed:
-     a non-increasing PAVA fit pools *any* later violation backward across
-     everything before it, so ordinary measurement ripple anywhere in the
-     curve could inflate the fitted baseline into an implausible, near-flat
-     plateau spanning nearly the whole band — confirmed on a real
-     measurement, several times taller than the curve's own genuine
-     excess-GD peak. The resolution-based smoothing above already covers the
-     measurement-reliability concern that motivated it. `excess_group_delay`
-     returns `(score, curve_ms)`.
-   - `low_end_extension_f3_hz`/`low_end_extension_f6_hz` (and their
-     `post_eq_` counterparts, from `low_end_extension_hz()`) are
-     diagnostic-only F3/F6-style extension estimates reported in
-     `search`/`report` tables. They are deliberately **not** part of either
-     ranking tuple — see "Key invariants" below. Search computes separate
-     raw and post-EQ shared scalar references: the strongest candidate's
-     mean broad-trend power over the analyzed range through 100 Hz, sampled
-     on the log grid (equal weight per octave). Because the cached solo
-     measurements share a drive level, this prevents a uniformly quieter
-     pair from looking more extended merely because its F3/F6 threshold was
-     normalized to its own lower peak. Do not replace the scalar with an
-     average or elementwise-best *curve* (which inherits the real subs'
-     frequency-dependent rolloff), or one modal maximum (which overstates
-     the nominal passband). The two-sided envelope still sees past isolated
-     recoverable notches; a pair that never reaches a shared threshold
-     reports `None`.
+     boost/cut limits, correction range + slope, max filter count). `dsp` is
+     now a descriptive alias of `flat`, with no score-specific exception.
+   - Minimum-phase/excess-GD extraction is real-cepstrum-based and run only for
+     shortlisted configurations, not every exhaustive grid point. Engine
+     retains up to eight highest raw-score and eight lowest-dip configurations
+     per pair, then selects the reported tuple by fitted post-EQ score.
+   - `excess_group_delay` remains resolution-aware via
+     `AnalysisContext.native_resolution_hz`,
+     `gd_smoothing_octaves`, and `_smooth_by_variable_octaves`; its
+     weighted-median common delay is removed before diagnostic output and EQ
+     authority gating.
    - `low_shelf_response` implements the RBJ LS biquad.
      `EqOptions.low_shelf` enables one automatic LS candidate by default;
      `cli.py` exposes only `--low-shelf on|off`. `fit_eq_filters` chooses the
@@ -141,19 +109,15 @@ the real logic. Data flows strictly one-way through `.subpair-cache/`:
      Raw diagnostics and physical-sum verification apply neither PK nor LS;
      every fitted band affects only `post_eq_*`.
    - Read the module-level docstrings before touching any scoring function —
-     most encode a specific, previously-debugged failure mode (e.g. why dip
-     detection uses a two-sided wide check in addition to the one-octave
-     trend, why the excess-GD gate uses a maximum filter instead of an
-     average, why the tail metric is shape-neutral). `PLAN.md` documents an
-     in-progress redesign to give `trend`/`flat`/`dsp` fully independent
-     scoring policies instead of sharing `gd_weighted_null_score` — check its
-     status before assuming the current shared-scorer behaviour is final.
+     they encode why score smoothing uses real frequency margins, why low-end
+     power is normalized, and why the excess-GD EQ gate uses a maximum filter
+     instead of an average.
 
 4. **`engine.py` (`run_search`)** — enumerates every measurement pair and,
    for each, exhaustively grid-searches polarity × delay × gain (vectorised
-   NumPy, magnitude-only for speed) to find the best raw candidate(s), then
-   runs the expensive per-finalist diagnostics (`dsp.pair_diagnostics`) only
-   on ties from that fast stage. Writes `search-results.json`
+   NumPy) to form the bounded high-score/low-dip shortlist, then runs the
+   expensive per-finalist diagnostics (`dsp.pair_diagnostics`) and selects by
+   post-EQ usable-output score. Writes `search-results.json`
    (`format_version` is bumped whenever the result schema changes — keep
    `verification.py`/`html_report.py` in sync with it).
 
@@ -174,16 +138,12 @@ the real logic. Data flows strictly one-way through `.subpair-cache/`:
 - **Determinism.** Same cache + same CLI options must produce byte-identical
   `search-results.json`. Avoid introducing unseeded randomness, dict-order
   dependence, or wall-clock-dependent output into `engine.py`/`dsp.py`.
-- **Lexicographic ranking only.** Don't collapse the ranking tuples in
-  `engine.py` into a single weighted score; each later metric exists
-  specifically to break ties in the one before it.
-- **Diagnostic-only fields stay out of ranking.** `low_end_extension_f3_hz`/
-  `low_end_extension_f6_hz` are deliberately excluded from every ranking
-  tuple in `engine.py`/`run_search` (the low-shelf is *not* one of these —
-  it is a scored `EqOptions` field, see above). If you add another
-  informational metric,
-  don't fold it into `raw_bands`/`eq_bands`'s sort keys without an explicit
-  decision to do so — the whole point of these two is that they summarize a
-  placement without being able to change which one wins.
+- **One documented scalar score.** Keep score components explicit in result
+  JSON and preserve the CLI weights. Do not reintroduce hidden lexicographic
+  tie-breakers or multiply visible dip depth by an unrelated phase metric.
+- **Equal-drive scoring.** Headroom must be applied to the complete response
+  before SPL, low-end power, residual dip, plots, and the final EQ sum are
+  derived. Low-end power and SPL are score components; excess-GD and CSD/tail
+  metrics are diagnostics and EQ-authority inputs only.
 - **Offline-first.** `search`, `report`, and the scoring/EQ logic in `dsp.py`
   must never require network access; only `fetch` and `verify` talk to REW.

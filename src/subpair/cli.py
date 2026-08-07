@@ -107,8 +107,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default="trend",
         help=(
             "EQ target: broad trend, aggressive flat response, or 'dsp' "
-            "(flat response; ranking barely penalises minimum-phase dips, "
-            "for placements an external DSP will correct)"
+            "(flat-response alias for an external-DSP workflow)"
         ),
     )
     search.add_argument(
@@ -152,13 +151,23 @@ def _build_parser() -> argparse.ArgumentParser:
         help="maximum automatic EQ band count (PK plus optional LS), 0..16 (default: 7)",
     )
     search.add_argument(
-        "--tie-tolerance-db",
-        type=_bounded_float(0.0, 3.0),
-        default=0.0,
-        metavar="DB",
+        "--score-low-end-weight",
+        type=_bounded_float(0.0, 1.0),
+        default=0.5,
+        metavar="WEIGHT",
         help=(
-            "treat null-score differences below this as ties before falling "
-            "back to excess-GD/tail, 0..3 dB (default: 0, strict lexicographic)"
+            "score output blend: 0 is full-band SPL only, 1 is excursion-weighted "
+            "low-end power only (default: 0.5)"
+        ),
+    )
+    search.add_argument(
+        "--score-dip-weight",
+        type=_bounded_float(0.0, 4.0),
+        default=1.0,
+        metavar="WEIGHT",
+        help=(
+            "score penalty per dB below the 1/3-octave smoothed response, "
+            "0..4 (default: 1)"
         ),
     )
     _add_shelf_arguments(search)
@@ -285,17 +294,18 @@ def _print_ranking(result: dict, top: int) -> None:
         label = "EQ'd" if eq else "Raw"
         print(f"\n{label} ranking")
         print(
-            "Rank  Pair     Pol   Delay ms  Gain dB  Headroom  Null dB  Excess ms  "
+            "Score dB  Pair     Pol   Delay ms  Gain dB  Headroom  Dip dB  Excess ms  "
             "Excess95 ms  Peak ms  Tail ms  LE power  Rel SPL"
         )
         for row in rows[:top]:
             pair = f"{row['first']}+{row['second']}"
             polarity = "+" if row["polarity"] > 0 else "-"
             print(
-                f"{row['eq_rank' if eq else 'rank']:>4}  {pair:<7}  {polarity:>3}  "
+                f"{row['post_eq_relative_score_db' if eq else 'relative_score_db']:>+8.2f}  "
+                f"{pair:<7}  {polarity:>3}  "
                 f"{row['delay_ms']:>+9.3f}  {row['gain_db']:>+7.2f}  "
                 f"{row['post_eq_headroom_db' if eq else 'headroom_db']:>+8.2f}  "
-                f"{row['post_eq_null_score_db' if eq else 'null_score_db']:>7.3f}  "
+                f"{row['post_eq_dip_db' if eq else 'dip_db']:>6.3f}  "
                 f"{row['post_eq_excess_gd_ms' if eq else 'excess_gd_ms']:>9.3f}  "
                 f"{row['post_eq_excess_gd_tail_ms' if eq else 'excess_gd_tail_ms']:>11.3f}  "
                 f"{row['post_eq_excess_gd_peak_ms' if eq else 'excess_gd_peak_ms']:>7.3f}  "
@@ -321,7 +331,8 @@ def _search(args: argparse.Namespace) -> int:
         max_boost_db=args.max_boost,
         max_cut_db=args.max_cut,
         eq_bands=args.eq_bands,
-        tie_tolerance_db=args.tie_tolerance_db,
+        score_low_end_weight=args.score_low_end_weight,
+        score_dip_weight=args.score_dip_weight,
         low_shelf=args.low_shelf == "on",
     )
 

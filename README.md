@@ -60,169 +60,80 @@ The first sub is the 0 dB reference; the second receives the reported gain,
 polarity, and delay. The grid includes both range endpoints when they lie on
 the requested step.
 
-Two rankings are calculated, both strictly lexicographic:
+Raw and EQ'd results are both rated with one scalar **usable-output
+score**. Higher is better, and the displayed score is relative to the best
+pair in that mode (best = 0 dB):
 
-1. **Raw:** an excess-GD-weighted maximum dip of the raw magnitude below a
-   one-octave broad trend or a wide two-sided check, energy-weighted mean
-   absolute excess group delay, the shape-neutral excess-GD tail integral,
-   then worst raw time-to-minus-20-dB across one-third-octave bands.
-2. **EQ'd:** the same measurements after applying the fitted EQ filters.
+```text
+sound power = (1 - low-end weight) × equal-drive full-band SPL
+            + low-end weight × excursion-weighted low-end power
+score       = sound power - dip weight × residual dip
+```
 
-The one-octave trend is itself a smoothing of the curve it's compared
-against, so a dip much wider than that window (a broadband suck-out from a
-large path-length difference between the two subs, say) is largely absorbed
-into the trend and under-reported. A second check catches this: at each
-frequency it looks for the best level well to the left *and* well to the
-right (past a one-octave margin so it isn't just re-detecting a narrow
-notch off its own shoulders); if both sides recover to a normal level, the
-gap between that and the current level counts as a dip, however wide. A
-plain monotonic rolloff — expected at a subwoofer's low end — never
-recovers on at least one side, so it is never flagged by this check
-regardless of its total range; only a single global reference (a
-percentile, a single very wide trend) would get that wrong.
+The defaults are a 0.5 low-end weight and a 1.0 dip weight. In other words,
+ordinary in-band pressure and low-frequency extension contribute equally in
+dB, and each dB of the worst remaining local dip costs one score dB.
+`--score-low-end-weight 0..1` moves the output term from full-band SPL to
+low-end power; `--score-dip-weight 0..4` controls how strongly response
+smoothness matters. A dip weight of zero rates output alone. The absolute
+`score_db` values retain the cache's arbitrary acoustic level reference, but
+subtracting the best value gives the stable, directly comparable
+`relative_score_db` shown as **Score** in the CLI and report.
 
-A magnitude dip that coincides with real excess group delay is a genuine
-destructive-interference null — acoustically irreparable and audible as
-smearing, not just a shallow, EQ-fixable amplitude ripple. The null-score
-metric scales dip severity up (by up to +150%) where it overlaps excess GD,
-using the same risk gate that reduces EQ authority there (see below); a dip
-with no excess GD nearby scores the same as before. The plain, unweighted
-dip depth is still reported separately as `magnitude_only_null_score_db` /
-`post_eq_magnitude_only_null_score_db`.
+The residual-dip component compares each raw or corrected response with a
+one-third-octave-FWHM Gaussian smoothing of that same response and takes only
+the largest negative deviation. Real measured response outside the analysis
+band is included as smoothing margin before the result is cropped back to the
+scored band. This makes the number visually auditable: a broad roll-off is
+followed by the smoothed reference, while a narrow notch remains visible.
+There is no two-sided null-recovery heuristic and no excess-group-delay
+multiplier, so a 3 dB feature cannot be reported as a 19 dB magnitude null.
 
-A magnitude peak above trend still scores nothing on its own — reinforcement
-adds output rather than destructively cancelling it, and isn't the kind of
-summing-position problem a null is. But a peak that only exists *with* real
-excess group delay is a resonance/ringing signature (comb reinforcement with
-genuine energy storage that its own magnitude doesn't explain), not a benign
-constructive bump, and is scored the same way a dip's severity is inflated:
-proportional to the excess-GD risk alone. A minimum-phase peak (negligible
-excess GD) still scores exactly zero; only a non-minimum-phase one counts.
+Excess group delay, its shape-neutral tail integral, its width-invariant peak,
+and CSD decay time remain in the result and report as diagnostics. They still
+gate unsafe automatic EQ boost, but they do not silently inflate the residual
+dip or act as score tie-breakers.
 
-This GD weighting (both the dip-severity boost and the peak penalty) is
-applied once per finalist, not inside the fast exhaustive delay/gain/polarity
-search itself:
-true excess GD needs a minimum-phase extraction per candidate, which is too
-expensive to run over that whole grid.
-
-The excess-GD scalar used by both rankings is normalized and integrated only
-over `--eq-range` (or the complete analysis band when `--eq-range` is not
-specified). Minimum-phase extraction and phase differentiation still use the
-full cached bandwidth and analysis grid so correction-range boundaries do not
-create Hilbert or numerical derivative artifacts.
-
-That scalar is an *energy-weighted* mean, so a badly smeared region that
-happens to sit in a magnitude dip or near a band edge (where SPL is
-naturally low) barely moves it — two sums can look equally clean on that
-metric while one is audibly ringing somewhere the ear doesn't need much
-level to notice it. `excess_gd_tail_ms`/`post_eq_excess_gd_tail_ms` — the
-third tie-break level in each ranking — integrates `|excess GD|` over
-log-frequency across the same range, with every frequency weighted equally
-regardless of level, using the same `np.trapezoid`-style integration as the
-energy-weighted scalar rather than a plain index-based average. It is
-deliberately *shape-neutral*: a narrow, severe spike and a wider, shallower
-bump of the same area (peak height times width) score the same, rather than
-a peak detector (which only sees the narrow one) or a percentile (which is
-blind to anything narrower than its own width cutoff, however severe, the
-opposite failure). It exists to catch a sum that looks flat and clean on
-magnitude but is smeary in phase somewhere — a case the energy-weighted
-mean and the null-score metric (which only look where magnitude itself is
-unusual) can both miss.
-
-`excess_gd_peak_ms`/`post_eq_excess_gd_peak_ms` — a fourth, final tie-break —
-is the deliberately *width-invariant* counterpart to the area-based tail
-metric above: the single worst denoised `|excess GD|` sample in the range,
-lightly pre-denoised the same way `_excess_gd_authority`'s own gate is (so
-one noisy sample cannot set it by itself), then a plain maximum. A maximum
-is unaffected by a feature's own width — a narrow spike and a wide plateau
-of the same height already score identically — so this only ever separates
-two placements whose smeared *area* ties but where one still has a single
-sharper, more severe excursion the area-based tail metric alone cannot see.
-It does not replace `excess_gd_tail_ms`; like every metric in this ranking,
-it only breaks ties the earlier ones leave exact.
-
-All four excess-GD-derived metrics above — the null-score GD weighting,
-`excess_gd_ms`, `excess_gd_tail_ms`, and `excess_gd_peak_ms` — measure
-"excess" relative to a single constant baseline (this curve's weighted
-median), so any frequency-dependent group delay at all counts as excess. An
-earlier, opt-in `--gd-baseline monotonic` mode instead fit a per-point
-baseline via weighted isotonic regression, constrained to be non-increasing
-in magnitude as frequency rose, modelling a genuine low-end group-delay rise
-as normal rather than as excess. It was removed after proving unreliable on
-real measurements: a non-increasing (pool-adjacent-violators) fit pools
-*any* later violation backward across everything before it, so a single
-local bump anywhere in the curve — ordinary measurement ripple, not
-necessarily a genuine feature — could inflate the fitted baseline into an
-implausible, near-flat plateau spanning nearly the whole band, several times
-taller than the curve's own genuine excess-GD peak. The resolution-aware
-smoothing described below already addresses the measurement-reliability
-concern that motivated it, so a single constant baseline is the only mode
-now.
-
-There is no weighted blend. Each later metric only breaks an exact tie in the
-earlier metrics. `--tie-tolerance-db` (0–3 dB, default 0) widens "tie" to any
-null-score difference within that many dB, so the fast-search's finalist
-tie-break and the raw/EQ'd pair rankings fall through to excess-GD and tail
-time between practically-indistinguishable null scores instead of a
-below-audibility difference deciding the winner outright. The default of 0
-preserves strict lexicographic behaviour, which means a null-score gap of a
-few tenths of a dB — well within the resolution/noise of the underlying
-measurements — can otherwise decide a pair outright over another candidate
-that is dramatically better on every other metric (excess GD, tail, SPL).
-A nonzero tolerance in roughly the 1–2 dB range is a reasonable starting
-point for real measurements; `generate-reports.sh` uses 1.5. Magnitude
-scoring and PEQ fitting
-use the raw log-grid samples without fractional-octave or variable
-smoothing. The one-octave trend is only the broad reference from which raw
-dips and the conservative target are measured. Both rankings use the same
-per-pair polarity, delay, and gain tuple selected by the exhaustive raw
-search; the EQ'd ranking answers which of those selected sums responds best
-to the requested correction.
+The exhaustive polarity/delay/gain grid uses the same equal-drive raw formula
+as a fast first pass. Full EQ fitting for every grid point would be
+prohibitively expensive, so each pair retains up to eight highest-raw-score
+configurations and eight lowest-residual-dip configurations. Fitted post-EQ
+score then selects the pair's reported polarity, delay, and gain tuple. This
+two-objective shortlist matters because a slightly quieter, smoother raw sum
+can require less attenuation and win after EQ. Raw and EQ'd tables report the
+same selected physical configuration so their before/after values remain
+comparable.
 
 Each pair also reports `delay_plateau_ms`/`gain_plateau_db`: how far delay
-or gain can drift from the chosen value while the raw magnitude null score
-stays within 0.5 dB of its optimum. A wide plateau is a forgiving setting;
-a narrow one is a razor's-edge optimum easily upset by real-world delay
-drift, temperature, or DSP quantization.
+or gain can drift while the raw score remains within 0.5 dB of its value at
+the selected configuration. A wide plateau is forgiving; a narrow one is
+more sensitive to real-world delay drift, temperature, or DSP quantization.
 
-Each pair also reports `low_end_power_db`/`relative_low_end_power_db` (and
-their `post_eq_` counterparts). This continuous diagnostic replaces F3/F6.
-It energy-averages the one-octave broad response over the analyzed range
-through 100 Hz, but weights every frequency by the approximate amplifier and
-excursion cost of producing pressure there.
-
-In the pistonic region, acoustic pressure is proportional to frequency
+Low-end power replaces the old F3/F6 thresholds. It energy-averages the
+one-octave broad response over the analyzed range through 100 Hz and weights
+each frequency by the approximate amplifier and excursion cost of producing
+pressure there. In the pistonic region, pressure is proportional to frequency
 squared times cone displacement. Holding pressure constant one octave lower
 therefore takes four times the displacement and, with the simple
 voltage-proportional-to-displacement model available without driver data,
-about sixteen times the amplifier power. Low-end power applies that `f^-4`
-weight (+12.04 dB per octave downward) on the log-frequency grid. A response
-that stays loud deep into its roll-off earns more than one which has the same
-ordinary mean SPL only higher in the band, without the discontinuities of a
-single -3 or -6 dB threshold crossing.
+about sixteen times the amplifier power. The resulting `f^-4` weight is
++12.04 dB per octave downward.
 
-The searched gain is included through `headroom_db`/`post_eq_headroom_db`, a
-negative gain applied to the actual compared response. The first sub is at
+The searched gain is included through `headroom_db`/`post_eq_headroom_db`,
+a negative gain applied to the actual compared response. The first sub is at
 0 dB and the second receives the reported relative gain, so raw headroom is
 the negative of any positive pair gain. Post-EQ headroom additionally removes
 the fitted EQ response's largest in-band boost. The hottest driver is
-consequently at 0 dB for every pair, swapping which sub is called first cannot
-create output headroom, and EQ boost cannot manufacture equal-drive
-capability.
-
-Headroom is applied once to the complete raw or post-EQ sum before calculating
-low-end power and Relative SPL. The report's overview/detail magnitude curves,
-combined EQ response, Headroom table column, and copyable `Preamp ... dB`
-setting all use that same value. Exact electrical watts or cone excursion
-would require driver impedance, motor, enclosure, limiter, and built-in DSP
-transfer data which an acoustic REW impulse response does not contain, so
-low-end power remains an excursion-cost proxy rather than a claim of absolute
+therefore at 0 dB for every pair, and EQ boost cannot manufacture equal-drive
 output capability.
 
-The relative raw and post-EQ values each reference rank 1 in their own
-ranking; higher is better. Low-end power remains informational: it is shown
-in `subpair report` and printed by `subpair search`, but is not a raw or EQ'd
-recommendation key. The null/excess-GD/tail tuple still decides the ranking.
+Headroom is applied once to the complete raw or post-EQ sum before calculating
+every scoring component, magnitude comparison, and final combined EQ
+response. The report's Headroom column and copyable `Preamp ... dB` setting
+use that same value. Exact electrical watts or cone excursion would require
+driver impedance, motor, enclosure, limiter, and built-in DSP transfer data
+which an acoustic REW impulse response does not contain, so low-end power is
+an excursion-cost proxy rather than a claim of absolute output capability.
 
 For minimum phase, subpair uses the real-cepstrum form of the Hilbert
 transform on the *full available 0-to-Nyquist magnitude*, not a brick-wall
@@ -276,18 +187,10 @@ flat in-range target; `--max-boost` permits 0–12 dB of *combined* boost.
 
 `--eq-target dsp` fits the same flat curve as `flat`, for placements you
 intend to correct with a full-featured external DSP rather than subpair's
-own conservative fitter. It changes *ranking*, not just the suggested PEQ:
-`null_score_db`/`post_eq_null_score_db` barely count a minimum-phase dip at
-low excess GD, since any minimum-phase EQ (which describes essentially all
-DSP/PEQ hardware) can restore both its magnitude and phase exactly, as long
-as the correction fits inside your own `--max-boost`/`--max-cut`. A
-non-minimum-phase dip — real excess group delay, a genuine destructive-
-interference null — still scores up to the same maximum severity as the
-other targets, since no amount of magnitude-only correction fixes that.
-Practically, `dsp` mode ends up preferring flat excess group delay over
-flat raw magnitude: with ordinary magnitude problems assumed fixable later,
-what's left to differentiate placements is largely what a DSP can't fix.
-Minimum-phase peaks already score zero in every target, `dsp` included.
+own conservative fitter. It is retained as a descriptive alias; unlike the
+retired null/GD ranking, usable-output scoring has no target-specific `dsp`
+exception, so `dsp` and `flat` produce the same numerical result for otherwise
+identical options.
 
 Boost filters are capped at Q 1 so the fitter cannot use a sharp resonant bell
 to fill a narrow cancellation. Cuts may use Q up to 10 for modal peaks. The
@@ -339,11 +242,12 @@ overshoot; there are no manual shelf-frequency, gain, or slope flags. A fitted
 shelf appears alongside the PK filters in the report as an `LS Fc ... Gain ...
 Slope ...` line and is included in every post-EQ plot and score.
 
-Relative SPL is reported, not ranked. It is the energy-mean in-band SPL after
-applying the corresponding raw or post-EQ headroom, so it compares equal
-maximum driver drive rather than nominal searched levels. Gains are referenced
-to an equal 1 kHz electrical drive; raw and EQ'd modes each reference their
-own rank 1.
+Relative SPL is the energy-mean in-band SPL after applying the corresponding
+raw or post-EQ headroom, so it compares equal maximum driver drive rather than
+nominal searched levels. It contributes to sound power according to
+`--score-low-end-weight`; the standalone table value is relative to the
+highest-scoring pair in that mode. Gains are referenced to an equal 1 kHz
+electrical drive.
 
 ### `subpair report`
 
@@ -375,9 +279,10 @@ frequency-dependent bends expose excess storage without relying on visual
 estimation of the heatmap ridge. CSD figures are static to avoid accidental
 zooming or panning and appear before the separate excess-group-delay graph.
 
-The ranking table also shows the applied Headroom gain and the colour-rated,
-informational low-end-power column described above. Low-end power uses
-higher-is-better colouring; neither column affects the recommendation order.
+The table is initially sorted by the computed Score rather than an ordinal
+Rank column. It also shows the score's residual-dip, low-end-power, and
+Relative-SPL components plus the applied Headroom gain. Low-end power and
+Score use higher-is-better colouring; residual dip uses lower-is-better.
 
 ### `subpair verify`
 

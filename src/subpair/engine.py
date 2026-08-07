@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import itertools
-import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -12,15 +11,23 @@ import numpy as np
 
 from .cache import load_cache, write_json
 from .dsp import (
+    DEFAULT_SCORE_DIP_WEIGHT,
+    DEFAULT_SCORE_LOW_END_WEIGHT,
+    EPS,
     EXCURSION_POWER_DB_PER_OCTAVE,
     EXCESS_GD_TAIL_POWER,
     LOW_END_POWER_UPPER_HZ,
     MIN_RELIABLE_NATIVE_BINS,
+    SCORE_DIP_SMOOTHING_OCTAVES,
     AnalysisContext,
     EqOptions,
+    broad_trend_db,
+    db20,
     inclusive_range,
-    null_scores,
+    low_end_power_db,
     pair_diagnostics,
+    smoothed_dip_db,
+    usable_output_score_db,
 )
 
 
@@ -36,11 +43,13 @@ class SearchOptions:
     max_boost_db: float = 0.0
     max_cut_db: float = 18.0
     eq_bands: int = 7
-    tie_tolerance_db: float = 0.0
+    score_low_end_weight: float = DEFAULT_SCORE_LOW_END_WEIGHT
+    score_dip_weight: float = DEFAULT_SCORE_DIP_WEIGHT
     low_shelf: bool = True
 
 
 PLATEAU_TOLERANCE_DB = 0.5
+SHORTLIST_PER_OBJECTIVE = 8
 
 
 def _plateau_width(scores_1d: np.ndarray, values: np.ndarray, index: int) -> float:
@@ -51,12 +60,12 @@ def _plateau_width(scores_1d: np.ndarray, values: np.ndarray, index: int) -> flo
     chosen delay/gain is robust to small real-world drift (quantization,
     temperature, cable length); a narrow one is a razor's-edge optimum.
     """
-    threshold = scores_1d[index] + PLATEAU_TOLERANCE_DB
+    threshold = scores_1d[index] - PLATEAU_TOLERANCE_DB
     left = index
-    while left > 0 and scores_1d[left - 1] <= threshold:
+    while left > 0 and scores_1d[left - 1] >= threshold:
         left -= 1
     right = index
-    while right < scores_1d.size - 1 and scores_1d[right + 1] <= threshold:
+    while right < scores_1d.size - 1 and scores_1d[right + 1] >= threshold:
         right += 1
     return float(values[right] - values[left])
 
@@ -67,6 +76,8 @@ def _best_configurations(
     second: int,
     delays: np.ndarray,
     gains: np.ndarray,
+    score_low_end_weight: float,
+    score_dip_weight: float,
 ) -> list[tuple[int, float, float, float, float, float]]:
     polarities = np.asarray([1.0, -1.0])
     gain_linear = 10.0 ** (gains / 20.0)
@@ -79,17 +90,41 @@ def _best_configurations(
         * gain_linear[None, None, :, None]
         * shifted[None, :, None, :]
     )
-    shape = candidates.shape[:-1]
-    scores = null_scores(
-        candidates.reshape((-1, candidates.shape[-1])),
-        context.trend_frequencies,
+    headroom_db = -np.maximum(gains, 0.0)
+    normalized = candidates * 10.0 ** (headroom_db[None, None, :, None] / 20.0)
+    magnitude_wide_db = db20(normalized)
+    trend_db = broad_trend_db(magnitude_wide_db, context.ppo)[..., context.trend_slice]
+    spl_db = 10.0 * np.log10(
+        np.maximum(
+            np.mean(np.abs(normalized[..., context.trend_slice]) ** 2, axis=-1),
+            EPS,
+        )
+    )
+    low_end_db = low_end_power_db(trend_db, context.frequencies)
+    dip_db = smoothed_dip_db(
+        magnitude_wide_db,
         context.ppo,
         score_slice=context.trend_slice,
-    ).reshape(shape)
-    minimum = float(np.min(scores))
-    # Preserve exact primary-score ties so the expensive second and third
-    # stages can resolve them without changing the lexicographic objective.
-    flat_indices = np.flatnonzero(scores.reshape(-1) == minimum)
+    )
+    scores = usable_output_score_db(
+        spl_db,
+        low_end_db,
+        dip_db,
+        score_low_end_weight,
+        score_dip_weight,
+    )
+    shape = candidates.shape[:-1]
+    flat_scores = np.asarray(scores).reshape(-1)
+    flat_dips = np.asarray(dip_db).reshape(-1)
+    count = min(SHORTLIST_PER_OBJECTIVE, flat_scores.size)
+    # Full EQ fitting is too expensive for every point in the exhaustive grid.
+    # Keep both the strongest raw usable-output candidates and the smoothest
+    # candidates: cuts and their required preamp can make a slightly quieter,
+    # smoother raw sum the best corrected result. Stable sorting plus sorted
+    # indices keeps the shortlist deterministic.
+    strongest = np.argsort(flat_scores, kind="stable")[-count:]
+    smoothest = np.argsort(flat_dips, kind="stable")[:count]
+    flat_indices = sorted(set(strongest.tolist() + smoothest.tolist()))
     result = []
     for flat_index in flat_indices:
         polarity_index, delay_index, gain_index = np.unravel_index(int(flat_index), shape)
@@ -104,30 +139,12 @@ def _best_configurations(
                 int(polarities[polarity_index]),
                 float(delays[delay_index]),
                 float(gains[gain_index]),
-                minimum,
+                float(scores[polarity_index, delay_index, gain_index]),
                 delay_plateau_ms,
                 gain_plateau_db,
             )
         )
     return result
-
-
-def _banded_sort_key(rows: list[dict], primary: str, tolerance_db: float) -> list[float]:
-    """Primary sort key, optionally binned into ``tolerance_db``-wide bands.
-
-    With ``tolerance_db <= 0`` (the default) this is just the raw metric,
-    giving byte-identical behaviour to strict lexicographic ranking. With a
-    positive tolerance, primary-metric differences smaller than the
-    tolerance are treated as ties so the secondary/tertiary metrics decide
-    between pairs that are indistinguishable in practice.
-    """
-    if tolerance_db <= 0.0:
-        return [float(row[primary]) for row in rows]
-    minimum = min(float(row[primary]) for row in rows)
-    return [
-        math.floor((float(row[primary]) - minimum) / tolerance_db + 1e-9)
-        for row in rows
-    ]
 
 
 def run_search(
@@ -159,14 +176,20 @@ def run_search(
     pairs: list[dict] = []
     for ordinal, (first, second) in enumerate(combinations, start=1):
         configurations = _best_configurations(
-            context, first, second, delays, gains
+            context,
+            first,
+            second,
+            delays,
+            gains,
+            options.score_low_end_weight,
+            options.score_dip_weight,
         )
         finalists = []
         for (
             polarity,
             delay_ms,
             gain_db,
-            _magnitude_null_score,
+            _fast_score_db,
             delay_plateau_ms,
             gain_plateau_db,
         ) in configurations:
@@ -180,24 +203,19 @@ def run_search(
                 include_decay=False,
                 include_trends=False,
                 eq_options=eq_options,
+                score_low_end_weight=options.score_low_end_weight,
+                score_dip_weight=options.score_dip_weight,
             )
-            # null_score_db (GD-weighted severity, from pair_diagnostics) now
-            # decides finalist ties, not the fast search's plain-magnitude
-            # minimum; that value survives as magnitude_only_null_score_db.
             diagnostics["delay_plateau_ms"] = delay_plateau_ms
             diagnostics["gain_plateau_db"] = gain_plateau_db
             finalists.append((polarity, delay_ms, gain_db, diagnostics))
-        polarity, delay_ms, gain_db, diagnostics = min(
+        polarity, delay_ms, gain_db, diagnostics = max(
             finalists,
             key=lambda item: (
-                item[3]["null_score_db"],
-                item[3]["excess_gd_ms"],
-                item[3]["excess_gd_tail_ms"],
-                item[3]["excess_gd_peak_ms"],
-                item[3]["raw_tail_ms"],
-                0 if item[0] > 0 else 1,
-                item[1],
-                item[2],
+                item[3]["post_eq_score_db"],
+                1 if item[0] > 0 else 0,
+                -item[1],
+                -item[2],
             ),
         )
         pair = {
@@ -214,15 +232,10 @@ def run_search(
         if progress:
             progress(ordinal, len(combinations), f"{first + 1}+{second + 1}")
 
-    raw_bands = _banded_sort_key(pairs, "null_score_db", options.tie_tolerance_db)
     raw_order = sorted(
         range(len(pairs)),
         key=lambda i: (
-            raw_bands[i],
-            pairs[i]["excess_gd_ms"],
-            pairs[i]["excess_gd_tail_ms"],
-            pairs[i]["excess_gd_peak_ms"],
-            pairs[i]["raw_tail_ms"],
+            -pairs[i]["score_db"],
             pairs[i]["first"],
             pairs[i]["second"],
         ),
@@ -230,21 +243,18 @@ def run_search(
     pairs = [pairs[i] for i in raw_order]
     reference_spl = pairs[0]["spl_db"]
     reference_low_end_power = pairs[0]["low_end_power_db"]
+    reference_score = pairs[0]["score_db"]
     for rank, row in enumerate(pairs, start=1):
         row["rank"] = rank
+        row["relative_score_db"] = float(row["score_db"] - reference_score)
         row["relative_spl_db"] = float(row["spl_db"] - reference_spl)
         row["relative_low_end_power_db"] = float(
             row["low_end_power_db"] - reference_low_end_power
         )
-    eq_bands = _banded_sort_key(pairs, "post_eq_null_score_db", options.tie_tolerance_db)
     eq_order = sorted(
         range(len(pairs)),
         key=lambda i: (
-            eq_bands[i],
-            pairs[i]["post_eq_excess_gd_ms"],
-            pairs[i]["post_eq_excess_gd_tail_ms"],
-            pairs[i]["post_eq_excess_gd_peak_ms"],
-            pairs[i]["post_eq_tail_ms"],
+            -pairs[i]["post_eq_score_db"],
             pairs[i]["first"],
             pairs[i]["second"],
         ),
@@ -252,8 +262,12 @@ def run_search(
     eq_pairs = [pairs[i] for i in eq_order]
     eq_reference_spl = eq_pairs[0]["post_eq_spl_db"]
     eq_reference_low_end_power = eq_pairs[0]["post_eq_low_end_power_db"]
+    eq_reference_score = eq_pairs[0]["post_eq_score_db"]
     for eq_rank, row in enumerate(eq_pairs, start=1):
         row["eq_rank"] = eq_rank
+        row["post_eq_relative_score_db"] = float(
+            row["post_eq_score_db"] - eq_reference_score
+        )
         row["post_eq_relative_spl_db"] = float(
             row["post_eq_spl_db"] - eq_reference_spl
         )
@@ -273,7 +287,7 @@ def run_search(
     ]
 
     result = {
-        "format_version": 19,
+        "format_version": 20,
         "measurement_count": len(measurements),
         "sample_rate": measurements[0].sample_rate,
         "response_length": measurements[0].impulse.size,
@@ -310,13 +324,10 @@ def run_search(
                 ),
                 "dsp_target": (
                     "the 'dsp' target uses the same flat curve as 'flat', "
-                    "but null_score_db/post_eq_null_score_db barely count a "
-                    "minimum-phase dip at low excess GD (it is fully "
-                    "correctable by any minimum-phase EQ); a non-minimum-"
-                    "phase dip still scores up to the same maximum as other "
-                    "targets, so ranking in 'dsp' mode favours flat excess "
-                    "group delay over flat raw magnitude. Minimum-phase "
-                    "peaks already score zero in every target."
+                    "retained as a descriptive alias for workflows that will "
+                    "apply the result in an external DSP. Scoring is now based "
+                    "only on equal-drive output and the smoothed-response dip, "
+                    "so 'dsp' has no target-specific scoring exception."
                 ),
             },
             "minimum_phase": {
@@ -350,23 +361,39 @@ def run_search(
                 ),
             },
             "ranking": {
-                "raw": [
-                    "null_score_db",
-                    "excess_gd_ms",
-                    "excess_gd_tail_ms",
-                    "excess_gd_peak_ms",
-                    "raw_tail_ms",
-                ],
-                "eq": [
-                    "post_eq_null_score_db",
-                    "post_eq_excess_gd_ms",
-                    "post_eq_excess_gd_tail_ms",
-                    "post_eq_excess_gd_peak_ms",
-                    "post_eq_tail_ms",
-                ],
+                "raw": ["score_db"],
+                "eq": ["post_eq_score_db"],
                 "excess_gd_range_hz": list(eq_range),
-                "magnitude_basis": "raw, unsmoothed",
-                "tie_tolerance_db": options.tie_tolerance_db,
+                "direction": "higher is better",
+                "score": {
+                    "fields": {
+                        "raw": "score_db / relative_score_db",
+                        "post_eq": "post_eq_score_db / post_eq_relative_score_db",
+                    },
+                    "formula": (
+                        "(1 - low_end_weight) * full-band SPL + "
+                        "low_end_weight * low-end power - dip_weight * "
+                        "worst smoothed dip; absolute fields use the cache's "
+                        "level reference and relative fields set the best pair "
+                        "to 0 dB"
+                    ),
+                    "low_end_weight": options.score_low_end_weight,
+                    "dip_weight": options.score_dip_weight,
+                    "dip_smoothing_octaves_fwhm": SCORE_DIP_SMOOTHING_OCTAVES,
+                    "dip_basis": (
+                        "largest negative deviation from a one-third-octave "
+                        "Gaussian-smoothed version of the same equal-drive "
+                        "response; no two-sided null heuristic or group-delay "
+                        "multiplier"
+                    ),
+                    "configuration_selection": (
+                        f"the exhaustive raw pass shortlists up to "
+                        f"{SHORTLIST_PER_OBJECTIVE} highest-score and "
+                        f"{SHORTLIST_PER_OBJECTIVE} lowest-dip configurations "
+                        "per pair; fitted post-EQ score selects the reported "
+                        "polarity/delay/gain tuple"
+                    ),
+                },
                 "headroom": {
                     "fields": {
                         "raw": "headroom_db",
@@ -382,25 +409,14 @@ def run_search(
                         "this gain"
                     ),
                 },
-                "null_score_gd_weighting": (
-                    "null_score_db/post_eq_null_score_db scale magnitude dips up, "
-                    "and score magnitude peaks that only exist alongside it, "
-                    "where they coincide with excess group delay (destructive-"
-                    "interference nulls or non-minimum-phase resonance, not just "
-                    "amplitude ripple or benign reinforcement); the plain "
-                    "magnitude-only dip value survives as "
-                    "magnitude_only_null_score_db/post_eq_magnitude_only_null_score_db. "
-                    "The fast delay/gain/polarity search itself stays "
-                    "magnitude-only for speed."
-                ),
                 "excess_gd_tail": (
                     "excess_gd_tail_ms/post_eq_excess_gd_tail_ms are |excess GD| "
                     f"integrated over log-frequency (power={EXCESS_GD_TAIL_POWER:g}) "
                     "across the same range as excess_gd_ms, unweighted by level "
                     "(unlike the energy-weighted mean) and by shape (a narrow "
                     "severe spike and a wider shallower bump of the same area "
-                    "score the same), so a sum that is flat on magnitude but "
-                    "smeary in phase somewhere quiet is still caught"
+                    "score the same). This is a reported diagnostic and does "
+                    "not change the usable-output score"
                 ),
                 "excess_gd_peak": (
                     "excess_gd_peak_ms/post_eq_excess_gd_peak_ms are the single "
@@ -408,13 +424,13 @@ def run_search(
                     "width-invariant rather than area-based (unlike "
                     "excess_gd_tail_ms, a narrow severe spike and a wide bump of "
                     "the same area do not score the same here - only their peak "
-                    "heights matter). It is a tie-break after excess_gd_tail_ms, "
-                    "so it only ever separates placements whose tail already ties"
+                    "heights matter). This is a reported diagnostic and does "
+                    "not change the usable-output score"
                 ),
                 "plateau_diagnostics": (
                     "delay_plateau_ms/gain_plateau_db report how far delay/gain "
-                    f"can drift from the chosen value while the raw magnitude "
-                    f"null score stays within {PLATEAU_TOLERANCE_DB:g} dB of its "
+                    f"can drift from the chosen value while the raw usable-output "
+                    f"score stays within {PLATEAU_TOLERANCE_DB:g} dB of its "
                     "optimum; wider is more robust to real-world drift"
                 ),
                 "low_end_power": {
@@ -442,9 +458,9 @@ def run_search(
                         "comparisons. Exact watts/excursion require "
                         "driver impedance, motor, enclosure, and protection/DSP "
                         "data absent from REW impulse responses. Relative fields "
-                        "reference rank 1 in the corresponding raw or EQ'd "
-                        "ranking; higher is better. Diagnostic only, never a "
-                        "recommendation sort key"
+                        "reference the highest-scoring pair in the corresponding "
+                        "raw or EQ'd comparison; higher is better. Low-end power "
+                        "is one component of the usable-output score"
                     ),
                 },
             },

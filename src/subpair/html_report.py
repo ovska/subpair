@@ -278,6 +278,7 @@ def _overview_figure(
 ) -> go.Figure:
     figure = go.Figure()
     eq = mode == "eq"
+    score_key = "post_eq_relative_score_db" if eq else "relative_score_db"
     for index, (pair, data) in enumerate(rows):
         key = f"{int(pair['first'])}-{int(pair['second'])}"
         figure.add_trace(
@@ -285,7 +286,7 @@ def _overview_figure(
                 x=data["frequencies"],
                 y=data["post_eq_db" if eq else "sum_db"],
                 name=(
-                    f"#{pair['eq_rank' if eq else 'rank']} · "
+                    f"Score {pair[score_key]:+.2f} dB · "
                     f"{pair['first']}+{pair['second']} — "
                     f"{pair['first_name']} + {pair['second_name']}"
                 ),
@@ -335,6 +336,7 @@ def _overview_excess_figure(
 ) -> go.Figure:
     figure = go.Figure()
     eq = mode == "eq"
+    score_key = "post_eq_relative_score_db" if eq else "relative_score_db"
     for index, (pair, data) in enumerate(rows):
         key = f"{int(pair['first'])}-{int(pair['second'])}"
         figure.add_trace(
@@ -342,7 +344,7 @@ def _overview_excess_figure(
                 x=data["frequencies"],
                 y=data["post_eq_excess_curve_ms" if eq else "excess_curve_ms"],
                 name=(
-                    f"#{pair['eq_rank' if eq else 'rank']} · "
+                    f"Score {pair[score_key]:+.2f} dB · "
                     f"{pair['first']}+{pair['second']} — "
                     f"{pair['first_name']} + {pair['second_name']}"
                 ),
@@ -427,7 +429,7 @@ def _excess_figure(
     if y_range is not None:
         yaxis["range"] = y_range
     layout = {
-        "title": f"{label} excess group delay (display spline; raw data used for score)",
+        "title": f"{label} excess group delay (display spline; diagnostic only)",
         "xaxis": {"type": "log", "title": "Frequency (Hz)"},
         "yaxis": yaxis,
         "margin": {"l": 62, "r": 24, "t": 52, "b": 55},
@@ -520,8 +522,8 @@ def _ranking_table(
     selected_keys: set[str],
 ) -> str:
     eq = mode == "eq"
-    rank_key = "eq_rank" if eq else "rank"
-    null_key = "post_eq_null_score_db" if eq else "null_score_db"
+    score_key = "post_eq_relative_score_db" if eq else "relative_score_db"
+    dip_key = "post_eq_dip_db" if eq else "dip_db"
     excess_key = "post_eq_excess_gd_ms" if eq else "excess_gd_ms"
     tail_key = "post_eq_tail_ms" if eq else "raw_tail_ms"
     headroom_key = "post_eq_headroom_db" if eq else "headroom_db"
@@ -530,13 +532,13 @@ def _ranking_table(
     )
     spl_key = "post_eq_relative_spl_db" if eq else "relative_spl_db"
     columns = [
-        (rank_key, "Rank", "number"),
+        (score_key, "Score (dB)", "number"),
         ("pair", "Pair", "text"),
         ("polarity", "Pol 2", "number"),
         ("delay_ms", "Delay 2 (ms)", "number"),
         ("gain_db", "Gain 2 (dB)", "number"),
         (headroom_key, "Headroom (dB)", "number"),
-        (null_key, "Worst null (dB)", "number"),
+        (dip_key, "Residual dip (dB)", "number"),
         (excess_key, "Excess GD (ms)", "number"),
         (tail_key, "Tail (ms)", "number"),
         (low_end_power_key, "Low-end power (dB)", "number"),
@@ -548,7 +550,8 @@ def _ranking_table(
         for index, (key, label, kind) in enumerate(columns)
     )
     metric_directions = {
-        null_key: "low",
+        score_key: "high",
+        dip_key: "low",
         excess_key: "low",
         tail_key: "low",
         low_end_power_key: "high",
@@ -581,7 +584,7 @@ def _ranking_table(
         key_value = f"{int(pair['first'])}-{int(pair['second'])}"
 
         values: dict[str, tuple[str, str]] = {
-            rank_key: (str(pair[rank_key]), str(pair[rank_key])),
+            score_key: (f"{pair[score_key]:+.2f}", str(pair[score_key])),
             "pair": (
                 f"{pair['first']} + {pair['second']}",
                 f"{pair['first']:04d}-{pair['second']:04d}",
@@ -593,7 +596,7 @@ def _ranking_table(
                 f"{pair[headroom_key]:+.2f}",
                 str(pair[headroom_key]),
             ),
-            null_key: (f"{pair[null_key]:.3f}", str(pair[null_key])),
+            dip_key: (f"{pair[dip_key]:.3f}", str(pair[dip_key])),
             excess_key: (f"{pair[excess_key]:.3f}", str(pair[excess_key])),
             tail_key: (f"{pair[tail_key]:.1f}", str(pair[tail_key])),
             low_end_power_key: (
@@ -663,8 +666,13 @@ def build_report(
     required_ranking_fields = {
         "rank",
         "eq_rank",
+        "score_db",
+        "relative_score_db",
+        "post_eq_score_db",
+        "post_eq_relative_score_db",
+        "dip_db",
+        "post_eq_dip_db",
         "raw_tail_ms",
-        "post_eq_null_score_db",
         "post_eq_excess_gd_ms",
         "post_eq_relative_spl_db",
         "eq_filter_count",
@@ -711,6 +719,11 @@ def build_report(
             "Search results predate response-wide headroom normalization; "
             "run 'subpair search' again"
         )
+    if int(results.get("format_version", 0)) < 20:
+        raise ReportError(
+            "Search results predate usable-output scoring; "
+            "run 'subpair search' again"
+        )
     if any(
         not required_ranking_fields.issubset(pair)
         for pair in results["pairs"]
@@ -722,7 +735,11 @@ def build_report(
     mode = "raw" if raw else "eq"
     mode_label = "Raw" if raw else "EQ’d"
     rank_key = "rank" if raw else "eq_rank"
-    pairs = sorted(results["pairs"], key=lambda pair: int(pair[rank_key]))[:limit]
+    score_key = "relative_score_db" if raw else "post_eq_relative_score_db"
+    pairs = sorted(results["pairs"], key=lambda pair: -float(pair[score_key]))[:limit]
+    score_settings = settings.get("ranking", {}).get("score", {})
+    score_low_end_weight = float(score_settings.get("low_end_weight", 0.5))
+    score_dip_weight = float(score_settings.get("dip_weight", 1.0))
 
     def pair_key(pair: dict[str, Any]) -> str:
         return f"{int(pair['first'])}-{int(pair['second'])}"
@@ -741,6 +758,8 @@ def build_report(
             float(pair["gain_db"]),
             include_decay=True,
             eq_options=eq_options,
+            score_low_end_weight=score_low_end_weight,
+            score_dip_weight=score_dip_weight,
         )
 
     overview = [(pair, diagnostic_by_key[pair_key(pair)]) for pair in pairs]
@@ -769,13 +788,15 @@ def build_report(
             "pair-detail" if key == initial_active_key else "pair-detail is-inactive"
         )
         metric_summary = (
-            f"Raw: null {pair['null_score_db']:.3f} dB · "
+            f"Raw score {pair['relative_score_db']:+.2f} dB · "
+            f"residual dip {pair['dip_db']:.3f} dB · "
             f"excess GD {pair['excess_gd_ms']:.3f} ms · "
             f"peak {pair['excess_gd_peak_ms']:.2f} ms · "
             f"tail {pair['raw_tail_ms']:.1f} ms"
             if raw
             else (
-                f"EQ’d: null {pair['post_eq_null_score_db']:.3f} dB · "
+                f"EQ’d score {pair['post_eq_relative_score_db']:+.2f} dB · "
+                f"residual dip {pair['post_eq_dip_db']:.3f} dB · "
                 f"excess GD {pair['post_eq_excess_gd_ms']:.3f} ms · "
                 f"peak {pair['post_eq_excess_gd_peak_ms']:.2f} ms · "
                 f"tail {pair['post_eq_tail_ms']:.1f} ms"
@@ -812,7 +833,7 @@ def build_report(
             <section class="{detail_class}" data-pair-key="{key}"
               data-pair-label="{pair['first']}+{pair['second']}"
               data-rank="{pair[rank_key]}"{axis_attributes}>
-              <h2>#{pair[rank_key]} {mode_label}:
+              <h2>{mode_label} score {pair[score_key]:+.2f} dB:
                 {html.escape(pair['first_name'])} + {html.escape(pair['second_name'])}</h2>
               <p class="configuration">Sub 2: {'normal' if pair['polarity'] > 0 else 'inverted'},
                 delay {pair['delay_ms']:+.3f} ms, gain {pair['gain_db']:+.2f} dB,
@@ -883,7 +904,7 @@ details {{ margin:22px 0; }} details pre {{ overflow:auto; color:var(--muted); }
 </head>
 <body><main>
 <h1>subpair ranking</h1>
-<p class="lede">{results['measurement_count']} positions · {band[0]:g}–{band[1]:g} Hz · {settings['ppo']} points/octave · {mode_label} lexicographic ranking · showing up to {limit} pairs</p>
+<p class="lede">{results['measurement_count']} positions · {band[0]:g}–{band[1]:g} Hz · {settings['ppo']} points/octave · {mode_label} usable-output score · showing up to {limit} pairs</p>
 <p class="note">Check table rows to choose comparison pairs. The top {default_count} start selected; the pair tabs below the table open one full diagnostic at a time. Hotkeys 1–9 open the first nine selected tabs.</p>
 <div class="chart-tabs" role="tablist" aria-label="{mode_label} overview chart">
   <button class="chart-tab active" data-overview-view="magnitude" role="tab" aria-selected="true" onclick="setOverviewView('magnitude')">Magnitude</button>
@@ -903,10 +924,10 @@ details {{ margin:22px 0; }} details pre {{ overflow:auto; color:var(--muted); }
     )}
   </div>
 </div>
-<p class="note">{('Raw ranking: raw-magnitude null depth, raw excess group delay, then raw tail.' if raw else 'EQ’d ranking: post-EQ raw-magnitude null depth, post-EQ excess group delay, then post-EQ tail.')}</p>
+<p class="note">{('Raw score' if raw else 'EQ’d score')}: {(1.0 - score_low_end_weight):g} × full-band equal-drive SPL + {score_low_end_weight:g} × excursion-weighted low-end power − {score_dip_weight:g} × worst dip below the one-third-octave smoothed response. Higher is better; the best pair is 0 dB.</p>
 <div class="table-wrap">{_ranking_table(pairs, mode, f'ranking-{mode}', default_keys)}</div>
 <div class="pair-tabs" data-pair-tabs role="tablist" aria-label="Selected {mode_label} pairs"></div>
-<p class="note">Click a table heading to sort. Metric cells run from green (best) to red (worst); lower is better for null, excess GD, and tail; higher is better for low-end power and Relative SPL. Both relative level metrics reference this ranking’s rank 1. Headroom is the negative global gain which removes positive pair gain—and, post-EQ, the fitted response’s maximum boost—so every pair uses the same maximum driver drive. It is already applied to the magnitude comparisons, final summed response, Low-end power, and Relative SPL. Low-end power additionally weights the broad response through 100 Hz by the amplifier/excursion cost of producing pressure at each frequency (+12.04 dB per octave downward). Headroom and Low-end power are informational and do not affect recommendation order.</p>
+<p class="note">The table is ordered by Score, and clicking any heading re-sorts it. Metric cells run from green (best) to red (worst); higher is better for Score, low-end power, and Relative SPL, while lower is better for residual dip, excess GD, and tail. Headroom is the negative global gain which removes positive pair gain—and, post-EQ, the fitted response’s maximum boost—so every pair uses the same maximum driver drive. It is applied to the magnitude comparisons, final summed response, scoring inputs, low-end power, and Relative SPL. Low-end power weights the broad response through 100 Hz by the amplifier/excursion cost of producing pressure at each frequency (+12.04 dB per octave downward). Excess GD and tail remain diagnostics; they do not alter Score.</p>
 <div id="pair-details">{''.join(detail_sections)}</div>
 <details><summary>Analysis settings and minimum-phase convention</summary><pre>{settings_json}</pre></details>
 </main>
