@@ -13,7 +13,7 @@ from plotly.offline import get_plotlyjs
 from plotly.subplots import make_subplots
 
 from .cache import load_cache
-from .dsp import AnalysisContext, EqOptions, pair_diagnostics
+from .dsp import AnalysisContext, EqOptions, ShelfOptions, db20, pair_diagnostics
 
 
 class ReportError(RuntimeError):
@@ -94,6 +94,16 @@ def _magnitude_figure(pair: dict[str, Any], data: dict[str, Any]) -> go.Figure:
             yaxis="y2",
         )
     )
+    if "post_eq_shelf_db" in data:
+        figure.add_trace(
+            go.Scatter(
+                x=f,
+                y=data["post_eq_shelf_db"],
+                name="Post-EQ + low shelf (tonal, not scored)",
+                line={"color": "#fdba74", "width": 1.7},
+                visible="legendonly",
+            )
+        )
     figure.update_layout(
         title="Magnitude: solos and optimised sum",
         xaxis={"type": "log", "title": "Frequency (Hz)"},
@@ -309,13 +319,20 @@ def _decay_figure(data: dict[str, Any]) -> go.Figure:
     return figure
 
 
-def _peq_text(filters: list[dict[str, float]]) -> str:
-    if not filters:
-        return "No filters fitted"
-    return "\n".join(
+def _peq_text(filters: list[dict[str, float]], shelf: ShelfOptions | None = None) -> str:
+    lines = [
         f"PK Fc {item['fc_hz']:.1f} Hz  Gain {item['gain_db']:.1f} dB  Q {item['q']:.3f}"
         for item in filters
-    )
+    ]
+    if not lines:
+        lines.append("No filters fitted")
+    if shelf is not None and shelf.active:
+        lines.append("")
+        lines.append(
+            f"LS Fc {shelf.freq_hz:.1f} Hz  Gain {shelf.gain_db:+.1f} dB  "
+            f"Slope {shelf.slope:.2f}  (tonal, not scored)"
+        )
+    return "\n".join(lines)
 
 
 def _ranking_table(
@@ -329,6 +346,7 @@ def _ranking_table(
     null_key = "post_eq_null_score_db" if eq else "null_score_db"
     excess_key = "post_eq_excess_gd_ms" if eq else "excess_gd_ms"
     tail_key = "post_eq_tail_ms" if eq else "raw_tail_ms"
+    extension_key = "post_eq_low_end_extension_hz" if eq else "low_end_extension_hz"
     spl_key = "post_eq_relative_spl_db" if eq else "relative_spl_db"
     columns = [
         (rank_key, "Rank", "number"),
@@ -339,6 +357,7 @@ def _ranking_table(
         (null_key, "Worst null (dB)", "number"),
         (excess_key, "Excess GD (ms)", "number"),
         (tail_key, "Tail (ms)", "number"),
+        (extension_key, "Extension −3dB (Hz)", "number"),
         (spl_key, "Relative SPL (dB)", "number"),
     ]
     heading = '<th class="selection-heading">Show</th>' + "".join(
@@ -387,6 +406,7 @@ def _ranking_table(
             null_key: (f"{pair[null_key]:.3f}", str(pair[null_key])),
             excess_key: (f"{pair[excess_key]:.3f}", str(pair[excess_key])),
             tail_key: (f"{pair[tail_key]:.1f}", str(pair[tail_key])),
+            extension_key: (f"{pair[extension_key]:.1f}", str(pair[extension_key])),
             spl_key: (f"{pair[spl_key]:+.2f}", str(pair[spl_key])),
         }
         cells = []
@@ -418,9 +438,11 @@ def build_report(
     output_path: Path,
     top: int = 5,
     limit: int = 15,
+    shelf: ShelfOptions | None = None,
 ) -> Path:
     if limit < 1:
         raise ReportError("Report result limit must be at least 1")
+    shelf = shelf or ShelfOptions()
     results = load_results(results_path)
     measurements, _ = load_cache(cache_dir)
     if len(measurements) != int(results.get("measurement_count", -1)):
@@ -446,11 +468,13 @@ def build_report(
         "post_eq_null_score_db",
         "post_eq_excess_gd_ms",
         "post_eq_relative_spl_db",
+        "low_end_extension_hz",
+        "post_eq_low_end_extension_hz",
     }
-    if int(results.get("format_version", 0)) < 4:
+    if int(results.get("format_version", 0)) < 5:
         raise ReportError(
-            "Search results predate raw-magnitude scoring and configurable EQ bands; "
-            "run 'subpair search' again"
+            "Search results predate resolution-aware excess-GD smoothing and "
+            "low-end extension diagnostics; run 'subpair search' again"
         )
     if any(
         not required_ranking_fields.issubset(pair)
@@ -492,8 +516,11 @@ def build_report(
             eq_options=eq_options,
         )
         key = pair_key(pair)
+        if shelf.active:
+            shelf_response = shelf.response(context.frequencies, context.sample_rate)
+            data["post_eq_shelf_db"] = np.asarray(data["post_eq_db"]) + db20(shelf_response)
         diagnostic_by_key[key] = data
-        peq = _peq_text(data["filters"])
+        peq = _peq_text(data["filters"], shelf)
         detail_sections.append(
             f"""
             <section class="pair-detail" data-pair-key="{key}"
@@ -512,6 +539,7 @@ def build_report(
                 {eq_options.correction_slope_db_per_octave:g} dB/oct curtain,
                 max boost {eq_options.max_boost_db:g} dB, up to
                 {eq_options.max_filters} PEQ bands; excess-GD guarded.<br>
+                {f'Low shelf: {shelf.gain_db:+.1f} dB at {shelf.freq_hz:g} Hz, slope {shelf.slope:.2f} — a fixed tonal control, not reflected in the ranking metrics above.<br>' if shelf.active else ''}
                 CSD overlay: excess GD with common delay removed; a vertical line is frequency-independent delay.</p>
               {_plot_html(_magnitude_figure(pair, data), f'magnitude-{key}')}
               {_plot_html(_excess_figure(data), f'excess-{key}')}
@@ -610,7 +638,7 @@ details {{ margin:22px 0; }} details pre {{ overflow:auto; color:var(--muted); }
   <div class="table-wrap">{_ranking_table(eq_pairs, 'eq', 'ranking-eq', eq_default_keys)}</div>
   <div class="pair-tabs" data-pair-tabs="eq" role="tablist" aria-label="Selected EQ’d pairs"></div>
 </div>
-<p class="note">Click a table heading to sort. Metric cells run from green (best) to red (worst); lower is better except relative SPL, where higher is better. Each mode references its own rank 1 for relative SPL.</p>
+<p class="note">Click a table heading to sort. Metric cells run from green (best) to red (worst); lower is better except relative SPL, where higher is better. Each mode references its own rank 1 for relative SPL. Extension is an uncolored, informational F3-style estimate (lower is more extended) and is not part of the ranking.</p>
 <div id="pair-details">{''.join(detail_sections)}</div>
 <details><summary>Analysis settings and minimum-phase convention</summary><pre>{settings_json}</pre></details>
 </main>

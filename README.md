@@ -149,6 +149,15 @@ stays within 0.5 dB of its optimum. A wide plateau is a forgiving setting;
 a narrow one is a razor's-edge optimum easily upset by real-world delay
 drift, temperature, or DSP quantization.
 
+Each pair also reports `low_end_extension_hz`/`post_eq_low_end_extension_hz`:
+an in-band, F3-style diagnostic giving the lowest frequency the broad trend
+reaches, scanning down from its own value at the top of the analysis band,
+before permanently falling 3 dB below that reference (a transient dip on the
+way down still marks the limit, even if the response recovers further below
+it). Lower is more extended. This is purely informational — it is shown in
+`subpair report`'s tables and printed by `subpair search`, but it is not a
+raw or EQ'd ranking key, so it never changes which placement wins.
+
 For minimum phase, subpair uses the real-cepstrum form of the Hilbert
 transform on the *full available 0-to-Nyquist magnitude*, not a brick-wall
 copy of the scoring band. The impulse is zero-padded by 4x for this transform,
@@ -157,6 +166,24 @@ Hilbert/cepstral wrap while making the bandwidth convention explicit. The
 energy-weighted constant component of excess delay is removed: it represents
 the arbitrary common timing offset, while relative arrival time remains in
 the complex sum.
+
+The cached impulse's own length sets a native frequency resolution
+(`sample_rate / length`) that zero-padding cannot improve — it can only
+interpolate smoothly between what that capture actually resolved. Near DC
+that native resolution covers a large fraction of an octave, so a short
+sweep leaves few genuinely independent samples per octave in the sub-bass;
+differentiating an interpolated phase there amplifies ordinary measurement
+noise into large, sign-flipping excess-group-delay swings that have nothing
+to do with the placement itself. `excess_gd_ms`/`post_eq_excess_gd_ms`,
+`excess_gd_tail_ms`/`post_eq_excess_gd_tail_ms`, the excess-GD authority
+gate, and the report's excess-GD plot are therefore progressively smoothed
+below roughly six times the cache's native resolution per octave — negligible
+for a long sweep or well above the sub-bass, and strongest right where a
+short sweep's own resolution runs out. A genuine, resolution-supported
+low-frequency excess-GD feature (a real reflection or port resonance) is
+unaffected; only noise narrower than the cache can actually resolve is
+suppressed. The cache's native resolution and this threshold are recorded in
+`search-results.json`'s `settings.native_resolution` block.
 
 The PEQ simulator uses constrained greedy target matching with RBJ constant-Q
 bells: it evaluates the largest raw-magnitude target errors and retains the
@@ -242,6 +269,29 @@ estimation of the heatmap ridge. Pre- and post-EQ overlays use the same colour
 for direct shape comparison, and CSD figures are static to avoid accidental
 zooming or panning.
 
+Each ranking table also shows an uncoloured, informational
+`low_end_extension_hz`/`post_eq_low_end_extension_hz` column (see above); it
+is diagnostic only and does not affect sorting or which pairs are recommended.
+
+#### Low shelf
+
+`--low-shelf-freq HZ --low-shelf-gain DB [--low-shelf-slope S]` adds a fixed,
+broad RBJ low-shelf boost or cut on top of the fitted PEQ bank, for people who
+want a general tonality control (more or less sub-bass) rather than — or in
+addition to — corrective EQ. `--low-shelf-gain` is required to be nonzero for
+the shelf to take effect (-15..15 dB); `--low-shelf-freq` alone is inert.
+`--low-shelf-slope` is the RBJ "S" shelf-slope parameter (0.1..1, default 1,
+the steepest transition without gain overshoot).
+
+The shelf is deliberately independent of `fit_eq_filters`'s bounded bell
+fitter: it is never counted against `--eq-bands`/`--max-boost`/`--max-cut`/
+`--eq-range`, and it never reaches `subpair search` or any ranking key —
+placement selection stays purely about acoustic correctness, and a tonal
+preference can never change which pair wins. In the report it appears as a
+separate, clearly labelled trace ("Post-EQ + low shelf (tonal, not scored)")
+and PEQ-text block (`LS Fc ... Gain ... Slope ...`), left out of every scored
+metric and out of the ranking tables entirely.
+
 ### `subpair verify`
 
 After physically measuring one selected sum, leave that new measurement in
@@ -257,6 +307,12 @@ checks sample rate and length, overlays measured versus predicted magnitude,
 and prints the maximum in-band deviation. The comparison removes only one
 constant level offset by default (`--keep-level` disables that); it does not
 hide frequency-dependent mutual-coupling error.
+
+`verify` accepts the same `--low-shelf-freq`/`--low-shelf-gain`/
+`--low-shelf-slope` flags as `report`. Unlike `report`, `verify` applies the
+shelf to the *predicted* curve before computing the deviation — pass it when
+the physical measurement being checked already has that shelf applied
+(e.g. on an external DSP), so the comparison stays meaningful.
 
 ## Important assumptions
 

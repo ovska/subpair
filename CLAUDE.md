@@ -86,6 +86,23 @@ the real logic. Data flows strictly one-way through `.subpair-cache/`:
      deliberately only run once per finalist (not inside the fast grid
      search) because it's too expensive to vectorize over the full
      delay/gain/polarity grid.
+   - `excess_group_delay` is resolution-aware: `AnalysisContext.native_resolution_hz`
+     (`sample_rate / length` of the *unpadded* cache) sets how much of the
+     sub-bass a given capture can actually resolve, and `gd_smoothing_octaves`
+     + `_smooth_by_variable_octaves` progressively smooth the excess-GD curve
+     below that limit so ordinary measurement noise near DC doesn't read as
+     excess group delay. This feeds every downstream consumer of the curve
+     (`excess_gd_ms`/`excess_gd_tail_ms`, `_excess_gd_authority`,
+     `gd_weighted_null_score`, the report's excess-GD plot) from one place.
+   - `low_end_extension_hz`/`post_eq_low_end_extension_hz` (from
+     `low_end_extension_hz()`) are a diagnostic-only, F3-style extension
+     estimate reported in `search`/`report` tables. They are deliberately
+     **not** part of either ranking tuple — see "Key invariants" below.
+   - `ShelfOptions`/`low_shelf_response` add a fixed, user-specified broad
+     low-shelf tonal control. It is wired through `report`/`verify` only
+     (`cli.py`'s `--low-shelf-*` flags), never through `search`,
+     `SearchOptions`, or `EqOptions` — a tonal preference must never change
+     which placement wins.
    - Read the module-level docstrings before touching any scoring function —
      most encode a specific, previously-debugged failure mode (e.g. why dip
      detection uses a two-sided wide check in addition to the one-octave
@@ -107,7 +124,11 @@ the real logic. Data flows strictly one-way through `.subpair-cache/`:
    `search-results.json` (+ cache) to produce self-contained HTML (Plotly
    inlined, no CDN/network at view time). `verification.py` additionally
    talks to `RewClient` once, to fetch the one new physical measurement being
-   checked against a predicted sum.
+   checked against a predicted sum. Both accept an optional `ShelfOptions`
+   (see above): `build_report` overlays it as a separate, clearly-labeled
+   trace/PEQ-text block that never touches the ranking tables;
+   `run_verification` applies it to the *predicted* curve before computing
+   deviation, since verification is about one fully-specified configuration.
 
 ### Key invariants to preserve
 
@@ -120,5 +141,11 @@ the real logic. Data flows strictly one-way through `.subpair-cache/`:
 - **Lexicographic ranking only.** Don't collapse the ranking tuples in
   `engine.py` into a single weighted score; each later metric exists
   specifically to break ties in the one before it.
+- **Diagnostic-only fields stay out of ranking.** `low_end_extension_hz` and
+  the low-shelf overlay are deliberately excluded from every ranking tuple
+  in `engine.py`/`run_search`. If you add another informational metric,
+  don't fold it into `raw_bands`/`eq_bands`'s sort keys without an explicit
+  decision to do so — the whole point of these two is that they summarize a
+  placement without being able to change which one wins.
 - **Offline-first.** `search`, `report`, and the scoring/EQ logic in `dsp.py`
   must never require network access; only `fetch` and `verify` talk to REW.
