@@ -12,7 +12,7 @@ import plotly.graph_objects as go
 from plotly.offline import get_plotlyjs
 
 from .cache import load_cache
-from .dsp import AnalysisContext, EqOptions, ShelfOptions, pair_diagnostics
+from .dsp import AnalysisContext, EqOptions, pair_diagnostics
 
 
 # Hover tooltip number formats, shared across every chart: dB/ms values get
@@ -193,7 +193,7 @@ def _magnitude_figure(
             go.Scatter(
                 x=f,
                 y=np.asarray(data["post_eq_db"]) - np.asarray(data["sum_db"]),
-                name="Combined PEQ response (all bands)",
+                name="Combined EQ response (all bands)",
                 line={"color": "#c4b5fd", "width": 1.7},
                 visible="legendonly",
                 yaxis="y2",
@@ -216,7 +216,7 @@ def _magnitude_figure(
     }
     if not raw:
         layout["yaxis2"] = {
-            "title": "Combined PEQ gain (dB)",
+            "title": "Combined EQ gain (dB)",
             "overlaying": "y",
             "side": "right",
             "showgrid": False,
@@ -454,14 +454,14 @@ def _peq_text(filters: list[dict[str, float]], shelf: dict[str, Any] | None = No
         f"PK Fc {item['fc_hz']:.1f} Hz  Gain {item['gain_db']:.1f} dB  Q {item['q']:.3f}"
         for item in filters
     ]
-    if not lines:
-        lines.append("No filters fitted")
-    if shelf is not None and shelf.get("active"):
-        lines.append("")
+    shelf_active = shelf is not None and shelf.get("active")
+    if shelf_active:
         lines.append(
             f"LS Fc {shelf['freq_hz']:.1f} Hz  Gain {shelf['gain_db']:+.1f} dB  "
-            f"Slope {shelf['slope']:.2f}  (fixed tonal control, part of the score)"
+            f"Slope {shelf['slope']:.2f}  (automatically fitted EQ band)"
         )
+    if not lines:
+        lines.append("No filters fitted")
     return "\n".join(lines)
 
 
@@ -608,11 +608,6 @@ def build_report(
     eq_settings = settings.get("eq", {})
     eq_range = tuple(float(value) for value in eq_settings.get("correction_range_hz", band))
     shelf_settings = eq_settings.get("shelf", {})
-    shelf = ShelfOptions(
-        freq_hz=shelf_settings.get("freq_hz"),
-        gain_db=float(shelf_settings.get("gain_db", 0.0)),
-        slope=float(shelf_settings.get("slope", 1.0)),
-    )
     eq_options = EqOptions(
         target=str(eq_settings.get("target", "trend")),
         correction_range=eq_range,
@@ -622,7 +617,7 @@ def build_report(
         max_boost_db=float(eq_settings.get("max_boost_db", 0.0)),
         max_cut_db=float(eq_settings.get("max_cut_db", 18.0)),
         max_filters=int(eq_settings.get("max_filters", 7)),
-        shelf=shelf,
+        low_shelf=bool(shelf_settings.get("enabled", True)),
     )
     required_ranking_fields = {
         "rank",
@@ -631,6 +626,8 @@ def build_report(
         "post_eq_null_score_db",
         "post_eq_excess_gd_ms",
         "post_eq_relative_spl_db",
+        "eq_filter_count",
+        "eq_shelf",
         "low_end_extension_f3_hz",
         "low_end_extension_f6_hz",
         "post_eq_low_end_extension_f3_hz",
@@ -650,6 +647,11 @@ def build_report(
         raise ReportError(
             "Search results predate removal of the monotonic GD baseline "
             "mode; run 'subpair search' again"
+        )
+    if int(results.get("format_version", 0)) < 16:
+        raise ReportError(
+            "Search results predate automatic low-shelf EQ fitting; "
+            "run 'subpair search' again"
         )
     if any(
         not required_ranking_fields.issubset(pair)
@@ -729,18 +731,17 @@ def build_report(
                 f"{eq_range[0]:g}–{eq_range[1]:g} Hz, "
                 f"{eq_options.correction_slope_db_per_octave:g} dB/oct curtain, "
                 f"max boost {eq_options.max_boost_db:g} dB, up to "
-                f"{eq_options.max_filters} PEQ bands; excess-GD guarded.<br>"
+                f"{eq_options.max_filters} EQ bands; excess-GD guarded.<br>"
             )
-            if shelf.active:
+            if eq_options.low_shelf:
                 eq_description += (
-                    f"Low shelf: {shelf.gain_db:+.1f} dB at {shelf.freq_hz:g} Hz, "
-                    f"slope {shelf.slope:.2f} — a fixed tonal control, fitted "
-                    "unaware of the PEQ bank above but folded into every "
-                    "post-EQ metric here, exactly like max boost/PEQ bands.<br>"
+                    "Automatic low shelf enabled: its corner and gain/cut "
+                    "compete with PK filters and consume one EQ-band slot "
+                    "when selected.<br>"
                 )
             peq = _peq_text(data["filters"], data.get("eq_shelf"))
             peq_html = (
-                '<div class="peq"><h3>Fitted PEQ filters</h3>'
+                '<div class="peq"><h3>Fitted EQ filters</h3>'
                 '<button onclick="copyPeq(this)">Copy</button>'
                 f"<pre>{html.escape(peq)}</pre></div>"
             )
@@ -774,7 +775,7 @@ def build_report(
 document.querySelectorAll('.pair-detail .plotly-graph-div[id^="magnitude-"]').forEach(plot=>{
   plot.on('plotly_legendclick',event=>{
     const trace=plot.data[event.curveNumber];
-    if(trace && trace.name==='Combined PEQ response (all bands)') {
+    if(trace && trace.name==='Combined EQ response (all bands)') {
       const willShow=trace.visible==='legendonly';
       Plotly.relayout(plot,{'yaxis2.visible':willShow});
     }

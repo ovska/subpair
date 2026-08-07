@@ -22,17 +22,16 @@ SEARCH_ARGS=(
   --cache "${SUBPAIR_CACHE_DIR}"
   --band 25 150
   --delay-range -10 10 0.1
-  --gain-range -3 3 0.5
-  --ppo 48
+  --gain-range -6 0 0.1
+  --ppo 64
   --eq-range 30 150
   --eq-range-slope 24
   --max-boost 6
   --max-cut 18
   --eq-bands 10
   --tie-tolerance-db 1.5
-  --top 10
-  --low-shelf-freq 40
-  --low-shelf-gain 3
+  --top 8
+  --low-shelf on
 )
 
 generate_report() {

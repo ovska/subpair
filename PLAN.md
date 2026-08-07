@@ -598,6 +598,13 @@ scoring was to let it. The rest of Section B.1 is left as a historical
 record of the reasoning behind the design that was later superseded, not as
 a description of current behaviour.
 
+**Section B.2 update: the fixed shelf was superseded again in format 16.**
+The current shelf is an automatic `fit_eq_filters` candidate, enabled by
+`--low-shelf on|off` (default `on`). Its corner and boost/cut are fitted per
+pair, it competes with PK candidates against the same objective and limits,
+and it consumes one `--eq-bands` slot when selected. The manual frequency,
+gain, and slope flags described in the historical plan below no longer exist.
+
 Code review after the initial implementation found the docs overclaimed that
 genuine low-frequency GD features are "unaffected" by the smoothing (Risk #3
 below); they were corrected to say the smoothing *preferentially preserves*

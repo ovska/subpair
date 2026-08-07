@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Sequence
 
 import numpy as np
-from scipy import ndimage, signal
+from scipy import ndimage, optimize, signal
 from scipy.fft import next_fast_len
 
 from .cache import CachedMeasurement
@@ -310,9 +310,8 @@ def low_shelf_response(
     ``slope`` is the RBJ "S" shelf-slope parameter, ``0 < S <= 1``; ``S = 1``
     is the steepest transition available without gain overshoot. Unlike
     ``peq_response``'s constant-Q bell, this approaches ``gain_db`` well
-    below ``fc`` and 0 dB well above it, by design: it is a broad tonal
-    control, not a corrective filter, and is deliberately not fitted by
-    ``fit_eq_filters`` (see ``ShelfOptions``).
+    below ``fc`` and 0 dB well above it. ``fit_eq_filters`` may fit one such
+    shelf automatically as part of the same correction bank as its PK bands.
     """
     f = np.asarray(frequencies, dtype=np.float64)
     omega = 2.0 * np.pi * f / sample_rate
@@ -338,49 +337,6 @@ def low_shelf_response(
 
 
 @dataclass(frozen=True)
-class ShelfOptions:
-    """A fixed, user-specified low-shelf tonal control.
-
-    Set via ``EqOptions.shelf`` and ``cli.py``'s ``search`` subcommand's
-    ``--low-shelf-*`` flags, exactly like ``max_boost_db``/``max_filters``:
-    a search-time EQ configuration choice, fitted into the post-EQ response
-    every ranking-relevant score is computed from (see ``fit_eq_filters``).
-    Changing it means re-running ``search``, the same as changing any other
-    ``EqOptions`` field - ``report``/``verify`` read whichever shelf a given
-    ``search-results.json`` was generated with and cannot override it.
-    Unlike the bounded, corrective bell bank ``fit_eq_filters`` greedily
-    fits, this is a broad tonality preference set directly by the user
-    (more/less sub-bass): the bells are fitted completely unaware of it (see
-    ``fit_eq_filters``'s docstring), so a deliberate tonal tilt is not
-    fought/cancelled by the corrective fitter the way a genuine response
-    defect at the same frequencies would be.
-    """
-
-    freq_hz: float | None = None
-    gain_db: float = 0.0
-    slope: float = 1.0
-
-    def __post_init__(self) -> None:
-        if self.gain_db != 0.0 and self.freq_hz is None:
-            raise ValueError("A nonzero low-shelf gain requires a low-shelf frequency")
-        if self.freq_hz is not None and self.freq_hz <= 0.0:
-            raise ValueError("Low-shelf frequency must be positive")
-        if not -15.0 <= self.gain_db <= 15.0:
-            raise ValueError("Low-shelf gain must be between -15 and 15 dB")
-        if not 0.1 <= self.slope <= 1.0:
-            raise ValueError("Low-shelf slope must be between 0.1 and 1.0")
-
-    @property
-    def active(self) -> bool:
-        return self.gain_db != 0.0 and self.freq_hz is not None
-
-    def response(self, frequencies: np.ndarray, sample_rate: float) -> np.ndarray:
-        if not self.active:
-            return np.ones_like(np.asarray(frequencies, dtype=np.float64), dtype=np.complex128)
-        return low_shelf_response(frequencies, sample_rate, self.freq_hz, self.gain_db, self.slope)
-
-
-@dataclass(frozen=True)
 class EqOptions:
     target: str = "trend"
     correction_range: tuple[float, float] | None = None
@@ -388,7 +344,7 @@ class EqOptions:
     max_boost_db: float = 0.0
     max_cut_db: float = 18.0
     max_filters: int = 7
-    shelf: ShelfOptions = ShelfOptions()
+    low_shelf: bool = True
 
     def __post_init__(self) -> None:
         if self.target not in {"trend", "flat", "dsp"}:
@@ -560,6 +516,190 @@ def _denoised_residual(residual: np.ndarray, ppo: int) -> np.ndarray:
     )
 
 
+def _fitted_low_shelf_response(
+    frequencies: np.ndarray,
+    sample_rate: float,
+    shelf: dict[str, Any] | None,
+) -> np.ndarray:
+    if not shelf or not shelf.get("active"):
+        return np.ones_like(
+            np.asarray(frequencies, dtype=np.float64), dtype=np.complex128
+        )
+    return low_shelf_response(
+        frequencies,
+        sample_rate,
+        float(shelf["freq_hz"]),
+        float(shelf["gain_db"]),
+        float(shelf.get("slope", 1.0)),
+    )
+
+
+def _low_shelf_bases(
+    frequencies: np.ndarray,
+    sample_rate: float,
+    ppo: int,
+    in_range: np.ndarray,
+) -> list[tuple[float, np.ndarray]]:
+    """Return automatic shelf corners at roughly 12 points per octave."""
+
+    indices = np.flatnonzero(in_range)
+    if not indices.size:
+        return []
+    step = max(1, int(round(ppo / 12.0)))
+    candidates = np.unique(np.append(indices[::step], indices[-1]))
+    return [
+        (
+            float(frequencies[index]),
+            db20(
+                low_shelf_response(
+                    frequencies,
+                    sample_rate,
+                    float(frequencies[index]),
+                    1.0,
+                )
+            ),
+        )
+        for index in candidates
+    ]
+
+
+def _best_low_shelf(
+    frequencies: np.ndarray,
+    sample_rate: float,
+    total: np.ndarray,
+    residual: np.ndarray,
+    objective_weights: np.ndarray,
+    bases: list[tuple[float, np.ndarray]],
+    options: EqOptions,
+    threshold_db: float,
+    current_error: float,
+) -> tuple[float, np.ndarray, dict[str, Any]] | None:
+    """Fit one broad LS candidate against the same objective as PK bands."""
+
+    minimum_gain = -options.max_cut_db
+    maximum_gain = options.max_boost_db
+    if minimum_gain == 0.0 and maximum_gain == 0.0:
+        return None
+
+    total_db = db20(total)
+    coarse_best: tuple[float, float, float] | None = None
+    for fc, unit_db in bases:
+        denominator = float(np.sum(objective_weights * unit_db**2))
+        if denominator <= EPS:
+            continue
+        gain_db = float(
+            np.clip(
+                np.sum(objective_weights * unit_db * residual) / denominator,
+                minimum_gain,
+                maximum_gain,
+            )
+        )
+        if abs(gain_db) < threshold_db:
+            continue
+        trial = total * low_shelf_response(
+            frequencies, sample_rate, fc, gain_db
+        )
+        trial_db = db20(trial)
+        if gain_db > 0.0 and float(np.max(trial_db)) > maximum_gain + 1e-9:
+            low_gain, high_gain = 0.0, gain_db
+            for _ in range(24):
+                mid_gain = 0.5 * (low_gain + high_gain)
+                mid_db = db20(
+                    total
+                    * low_shelf_response(
+                        frequencies, sample_rate, fc, mid_gain
+                    )
+                )
+                if float(np.max(mid_db)) <= maximum_gain + 1e-9:
+                    low_gain = mid_gain
+                else:
+                    high_gain = mid_gain
+            gain_db = low_gain
+            if abs(gain_db) < threshold_db:
+                continue
+            trial = total * low_shelf_response(
+                frequencies, sample_rate, fc, gain_db
+            )
+            trial_db = db20(trial)
+        trial_error = float(
+            np.mean(objective_weights * (residual - (trial_db - total_db)) ** 2)
+        )
+        if coarse_best is None or trial_error < coarse_best[0]:
+            coarse_best = (trial_error, fc, gain_db)
+
+    if coarse_best is None:
+        return None
+    _, fc, coarse_gain = coarse_best
+
+    # Refine the gain continuously at the best broad corner. The coarse pass
+    # above keeps this to one scalar optimization per EQ iteration rather than
+    # one optimization per possible corner.
+    maximum_allowed_gain = maximum_gain
+    if maximum_allowed_gain > 0.0:
+        at_limit = db20(
+            total
+            * low_shelf_response(
+                frequencies, sample_rate, fc, maximum_allowed_gain
+            )
+        )
+        if float(np.max(at_limit)) > maximum_gain + 1e-9:
+            low_gain, high_gain = 0.0, maximum_allowed_gain
+            for _ in range(24):
+                mid_gain = 0.5 * (low_gain + high_gain)
+                mid_db = db20(
+                    total
+                    * low_shelf_response(
+                        frequencies, sample_rate, fc, mid_gain
+                    )
+                )
+                if float(np.max(mid_db)) <= maximum_gain + 1e-9:
+                    low_gain = mid_gain
+                else:
+                    high_gain = mid_gain
+            maximum_allowed_gain = low_gain
+
+    if maximum_allowed_gain <= minimum_gain + 1e-9:
+        return None
+
+    def error_for_gain(gain_db: float) -> float:
+        trial_db = db20(
+            total
+            * low_shelf_response(frequencies, sample_rate, fc, gain_db)
+        )
+        return float(
+            np.mean(objective_weights * (residual - (trial_db - total_db)) ** 2)
+        )
+
+    refined = optimize.minimize_scalar(
+        error_for_gain,
+        bounds=(minimum_gain, maximum_allowed_gain),
+        method="bounded",
+        options={"xatol": 5e-4},
+    )
+    gain_db = float(refined.x if refined.success else coarse_gain)
+    if abs(gain_db) < threshold_db:
+        return None
+    gain_db = (
+        math.floor(gain_db * 1000.0) / 1000.0
+        if gain_db > 0.0
+        else round(gain_db, 3)
+    )
+    fc = round(fc, 3)
+    trial = total * low_shelf_response(frequencies, sample_rate, fc, gain_db)
+    trial_error = float(
+        np.mean(objective_weights * (residual - (db20(trial) - total_db)) ** 2)
+    )
+    if trial_error >= current_error - 1e-6:
+        return None
+    shelf = {
+        "active": True,
+        "freq_hz": fc,
+        "gain_db": gain_db,
+        "slope": 1.0,
+    }
+    return trial_error, trial, shelf
+
+
 def fit_eq_filters(
     spectrum: np.ndarray,
     frequencies: np.ndarray,
@@ -570,7 +710,14 @@ def fit_eq_filters(
     margin_spectrum: np.ndarray | None = None,
     margin_slice: slice | None = None,
 ) -> tuple[list[dict[str, float]], np.ndarray, dict[str, Any]]:
-    """Fit a bounded PEQ bank toward a range- and excess-GD-aware target.
+    """Fit a bounded EQ bank toward a range- and excess-GD-aware target.
+
+    PK candidates and, when ``options.low_shelf`` is true, one automatic LS
+    candidate compete against the same weighted residual. The LS corner and
+    boost/cut are fitted per response and a selected shelf consumes one of
+    ``max_filters``'s slots. ``filters`` contains the PK bands for backward
+    compatibility; the fitted LS parameters are returned in
+    ``metadata["shelf"]`` and are already included in the returned response.
 
     ``margin_spectrum``/``margin_slice`` are an optional wider companion to
     ``spectrum``/``frequencies`` (see ``margin_frequencies``) used only to
@@ -623,6 +770,17 @@ def fit_eq_filters(
 
     total = np.ones_like(spectrum, dtype=np.complex128)
     filters: list[dict[str, float]] = []
+    fitted_shelf: dict[str, Any] = {
+        "active": False,
+        "freq_hz": None,
+        "gain_db": 0.0,
+        "slope": 1.0,
+    }
+    shelf_bases = (
+        _low_shelf_bases(frequencies, sample_rate, ppo, in_range)
+        if options.low_shelf
+        else []
+    )
     threshold_db = 0.35 if options.target in ("flat", "dsp") else 0.75
     objective_weights = np.maximum(0.15, gd_authority)
     for _ in range(options.max_filters):
@@ -651,7 +809,7 @@ def fit_eq_filters(
         extrema = np.unique(np.append(extrema, int(np.argmax(candidate_score))))
         ordered = extrema[np.argsort(candidate_score[extrema], kind="stable")][::-1]
         ordered = ordered[:32]
-        best: tuple[float, np.ndarray, dict[str, float]] | None = None
+        best: tuple[float, np.ndarray, dict[str, Any], bool] | None = None
         for peak_index in ordered:
             correction_db = float(smoothed_residual[peak_index])
             if abs(correction_db) < threshold_db:
@@ -713,22 +871,30 @@ def fit_eq_filters(
                 continue
             current = {"fc_hz": fc, "gain_db": gain_db, "q": q}
             if best is None or trial_error < best[0]:
-                best = (trial_error, trial, current)
+                best = (trial_error, trial, current, False)
+        if shelf_bases and not fitted_shelf["active"]:
+            shelf_candidate = _best_low_shelf(
+                frequencies,
+                sample_rate,
+                total,
+                residual,
+                objective_weights,
+                shelf_bases,
+                options,
+                threshold_db,
+                current_error,
+            )
+            if shelf_candidate is not None and (
+                best is None or shelf_candidate[0] < best[0]
+            ):
+                best = (*shelf_candidate, True)
         if best is None:
             break
-        _, total, current = best
-        filters.append(current)
-    # The shelf is deliberately applied *after* the bell-fitting loop above,
-    # not folded into `desired`/`residual`: the bells there still target the
-    # raw, unshelved response exactly as if the shelf were inactive, so a
-    # deliberate tonal tilt is never fought/cancelled by the corrective
-    # fitter as if it were a defect at the same frequencies. `filters`
-    # itself stays a pure PK-bell list (the shelf isn't a peaking biquad and
-    # has no fc/gain/q representation in that schema); callers reconstructing
-    # a full EQ'd response from `filters` via `filters_response()` must also
-    # multiply in `options.shelf.response(...)` at their own frequency grid
-    # to stay consistent with the `total` returned here.
-    total = total * options.shelf.response(frequencies, sample_rate)
+        _, total, current, is_shelf = best
+        if is_shelf:
+            fitted_shelf = current
+        else:
+            filters.append(current)
     metadata: dict[str, Any] = {
         "target": options.target,
         "target_level_db": target_level,
@@ -738,7 +904,8 @@ def fit_eq_filters(
         "effective_target_db": effective_target,
         "nominal_target_db": nominal_target,
         "eq_authority": authority,
-        "shelf": options.shelf,
+        "shelf": fitted_shelf,
+        "filter_count": len(filters) + int(bool(fitted_shelf["active"])),
     }
     return filters, total, metadata
 
@@ -757,7 +924,7 @@ def fit_cut_filters(
         sample_rate,
         ppo,
         np.zeros_like(frequencies),
-        EqOptions(max_filters=maximum),
+        EqOptions(max_filters=maximum, low_shelf=False),
     )
     return filters, total
 
@@ -1282,14 +1449,15 @@ def pair_diagnostics(
         margin_spectrum=trend_wide_sum,
         margin_slice=context.trend_slice,
     )
-    # filters_response() only reconstructs the fitted PK bells; the shelf
-    # (already folded into eq_grid by fit_eq_filters) must be multiplied in
-    # again here to stay consistent, since eq_full/eq_trend_wide are
-    # reconstructed from `filters` on different frequency grids, not derived
-    # from eq_grid itself.
+    # filters_response() reconstructs only the fitted PK bands. The automatic
+    # shelf chosen by the same fitter must be evaluated on these companion
+    # grids as well; all of them together still respect max_filters.
+    fitted_shelf = eq_metadata["shelf"]
     eq_full = filters_response(
         full_frequencies, context.sample_rate, filters
-    ) * eq_options.shelf.response(full_frequencies, context.sample_rate)
+    ) * _fitted_low_shelf_response(
+        full_frequencies, context.sample_rate, fitted_shelf
+    )
     n_fft = 2 * (full_sum.size - 1)
     pre_ir = np.fft.irfft(full_sum, n=n_fft)
     post_full = full_sum * eq_full
@@ -1304,7 +1472,9 @@ def pair_diagnostics(
     post_magnitude_db = db20(post_grid)
     eq_trend_wide = filters_response(
         context.trend_frequencies, context.sample_rate, filters
-    ) * eq_options.shelf.response(context.trend_frequencies, context.sample_rate)
+    ) * _fitted_low_shelf_response(
+        context.trend_frequencies, context.sample_rate, fitted_shelf
+    )
     post_trend_wide_sum = trend_wide_sum * eq_trend_wide
     post_trend_db = broad_trend_db(db20(post_trend_wide_sum), context.ppo)[context.trend_slice]
     post_excess_score, post_excess_curve = excess_group_delay(
@@ -1367,12 +1537,8 @@ def pair_diagnostics(
         "eq_target": eq_metadata["target"],
         "eq_target_level_db": float(eq_metadata["target_level_db"]),
         "eq_mean_authority": float(np.mean(eq_metadata["eq_authority"])),
-        "eq_shelf": {
-            "freq_hz": eq_options.shelf.freq_hz,
-            "gain_db": eq_options.shelf.gain_db,
-            "slope": eq_options.shelf.slope,
-            "active": eq_options.shelf.active,
-        },
+        "eq_filter_count": int(eq_metadata["filter_count"]),
+        "eq_shelf": dict(fitted_shelf),
         "spl_db": float(10.0 * np.log10(max(np.mean(np.abs(grid_sum) ** 2), EPS))),
         "post_eq_spl_db": float(
             10.0 * np.log10(max(np.mean(np.abs(post_grid) ** 2), EPS))

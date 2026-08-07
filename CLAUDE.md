@@ -136,26 +136,18 @@ the real logic. Data flows strictly one-way through `.subpair-cache/`:
      a trivial "fully extended" (25 Hz) answer under both the average- and
      best-curve designs. Cross-pair absolute SPL is a different, legitimate
      question already answered by `relative_spl_db`/`post_eq_relative_spl_db`.
-   - `ShelfOptions`/`low_shelf_response` add a fixed, user-specified broad
-     low-shelf tonal control. It is a `search`-time `EqOptions.shelf` field
-     (`cli.py`'s `--low-shelf-*` flags live on the `search` subcommand),
-     exactly like `max_boost_db`/`max_filters` — it *can* change which
-     placement wins, since it's folded into every post-EQ score. `report`/
-     `verify` no longer take `--low-shelf-*`; they read whichever shelf a
-     given `search-results.json` already has baked into `settings.eq.shelf`.
-     `fit_eq_filters`'s greedy PK-bell loop is fitted completely unaware of
-     the shelf (targets the raw, unshelved response exactly as if it were
-     inactive) and the shelf is multiplied into the returned response only
-     at the very end, so a deliberate tonal tilt is never fought/cancelled
-     by the corrective fitter as if it were a defect at the same
-     frequencies. `filters_response()` only ever reconstructs the PK-bell
-     list (the shelf has no fc/gain/q representation there); every site
-     that reconstructs a full EQ'd response from `filters` — `eq_full`/
-     `eq_trend_wide` in `pair_diagnostics` — must also multiply in
-     `eq_options.shelf.response(...)` at its own frequency grid to stay
-     consistent with `fit_eq_filters`'s own returned `total`. Raw (pre-EQ)
-     diagnostics are untouched by the shelf, exactly like every other
-     `EqOptions` field only affecting `post_eq_*`.
+   - `low_shelf_response` implements the RBJ LS biquad.
+     `EqOptions.low_shelf` enables one automatic LS candidate by default;
+     `cli.py` exposes only `--low-shelf on|off`. `fit_eq_filters` chooses the
+     shelf corner and boost/cut per pair inside the same greedy loop and
+     objective as PK filters. A selected shelf obeys the EQ gain/range/GD
+     constraints and consumes one `max_filters` slot. The returned `filters`
+     list remains PK-only, while `metadata["shelf"]`/the persisted
+     per-pair `eq_shelf` dict hold the fitted LS parameters. Any companion
+     frequency grid reconstructed in `pair_diagnostics` must multiply
+     `_fitted_low_shelf_response(...)` alongside `filters_response(...)`.
+     Raw diagnostics and physical-sum verification apply neither PK nor LS;
+     every fitted band affects only `post_eq_*`.
    - Read the module-level docstrings before touching any scoring function —
      most encode a specific, previously-debugged failure mode (e.g. why dip
      detection uses a two-sided wide check in addition to the one-octave
@@ -177,12 +169,10 @@ the real logic. Data flows strictly one-way through `.subpair-cache/`:
    `search-results.json` (+ cache) to produce self-contained HTML (Plotly
    inlined, no CDN/network at view time). `verification.py` additionally
    talks to `RewClient` once, to fetch the one new physical measurement being
-   checked against a predicted sum. Neither takes its own shelf flags; both
-   reconstruct `ShelfOptions` from the loaded `search-results.json`'s
-   `settings.eq.shelf` (see above) and pass it through `EqOptions.shelf` -
-   `build_report` via `pair_diagnostics`, `run_verification` by applying it
-   to the *predicted* curve before computing deviation, matching whatever
-   was actually scored.
+   checked against a predicted sum. Neither takes its own shelf flag.
+   `build_report` reads the search-time automatic-shelf enablement and reruns
+   `pair_diagnostics`; `run_verification` compares the unequalized physical
+   and predicted sums, applying neither PK nor LS filters.
 
 ### Key invariants to preserve
 

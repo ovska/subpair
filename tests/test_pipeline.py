@@ -14,7 +14,6 @@ from subpair.engine import SearchOptions, run_search
 from subpair.dsp import (
     EqOptions,
     LOW_END_EXTENSION_F3_THRESHOLD_DB,
-    ShelfOptions,
     _denoised_residual,
     _excess_gd_authority,
     _smooth_by_variable_octaves,
@@ -35,6 +34,7 @@ from subpair.dsp import (
 from subpair.html_report import (
     _overview_excess_figure,
     _overview_figure,
+    _peq_text,
     _ranking_table,
     _selected_axis_ranges,
     build_report,
@@ -125,39 +125,24 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(overridden.max_cut, 24.0)
         self.assertEqual(overridden.tie_tolerance_db, 0.5)
 
-    def test_low_shelf_cli_arguments_on_search_only(self):
-        # The shelf is a search-time EQ setting, like --max-boost/--eq-bands
-        # - report/verify read whatever a given search-results.json already
-        # has baked in and don't take their own --low-shelf-* overrides.
+    def test_automatic_low_shelf_cli_flag_defaults_on_for_search_only(self):
         parser = _build_parser()
         defaults = parser.parse_args(["search"])
-        self.assertIsNone(defaults.low_shelf_freq)
-        self.assertEqual(defaults.low_shelf_gain, 0.0)
-        self.assertEqual(defaults.low_shelf_slope, 1.0)
-        overridden = parser.parse_args(
-            ["search", "--low-shelf-freq", "40", "--low-shelf-gain", "-4.5"]
+        self.assertEqual(defaults.low_shelf, "on")
+        self.assertTrue(SearchOptions().low_shelf)
+        self.assertTrue(EqOptions().low_shelf)
+        self.assertEqual(
+            parser.parse_args(["search", "--low-shelf", "off"]).low_shelf,
+            "off",
         )
-        self.assertEqual(overridden.low_shelf_freq, 40.0)
-        self.assertEqual(overridden.low_shelf_gain, -4.5)
         with self.assertRaises(SystemExit):
-            parser.parse_args(["search", "--low-shelf-gain", "20"])
+            parser.parse_args(["search", "--low-shelf", "maybe"])
+        for removed in ("--low-shelf-freq", "--low-shelf-gain", "--low-shelf-slope"):
+            with self.assertRaises(SystemExit):
+                parser.parse_args(["search", removed, "40"])
         for command in ("report", "verify"):
             with self.assertRaises(SystemExit):
-                parser.parse_args([command, "--low-shelf-freq", "40"])
-
-    def test_shelf_options_requires_frequency_when_gain_is_nonzero(self):
-        with self.assertRaisesRegex(ValueError, "requires a low-shelf frequency"):
-            ShelfOptions(gain_db=3.0)
-        ShelfOptions()  # inactive default is valid
-        ShelfOptions(freq_hz=40.0, gain_db=0.0)  # frequency without gain is inert, not an error
-
-    def test_shelf_options_inactive_response_is_flat(self):
-        frequencies = log_frequency_grid(20.0, 150.0, 48)
-        response = ShelfOptions().response(frequencies, 4000.0)
-        np.testing.assert_allclose(response, 1.0)
-        self.assertFalse(ShelfOptions().active)
-        self.assertFalse(ShelfOptions(freq_hz=40.0).active)
-        self.assertTrue(ShelfOptions(freq_hz=40.0, gain_db=3.0).active)
+                parser.parse_args([command, "--low-shelf", "off"])
 
     def test_low_shelf_response_reaches_target_gain_at_dc_and_zero_up_high(self):
         frequencies = np.array([1.0, 640.0, 1000.0])
@@ -172,6 +157,92 @@ class PipelineTests(unittest.TestCase):
         dense = np.geomspace(1.0, 1000.0, 500)
         response_db = db20(low_shelf_response(dense, 4000.0, 40.0, 6.0, slope=1.0))
         self.assertTrue(np.all(np.diff(response_db) <= 1e-9))
+
+    def test_automatic_low_shelf_fits_corner_and_boost_or_cut_as_an_eq_band(self):
+        frequencies = log_frequency_grid(20.0, 200.0, 48)
+        fitted_corners = []
+        for source_corner in (35.0, 90.0):
+            spectrum = low_shelf_response(
+                frequencies, 4000.0, source_corner, 6.0
+            )
+            filters, response, metadata = fit_eq_filters(
+                spectrum,
+                frequencies,
+                4000.0,
+                48,
+                np.zeros_like(frequencies),
+                EqOptions(
+                    target="flat",
+                    correction_range=(20.0, 200.0),
+                    max_boost_db=0.0,
+                    max_cut_db=12.0,
+                    max_filters=1,
+                    low_shelf=True,
+                ),
+            )
+            shelf = metadata["shelf"]
+            self.assertEqual(filters, [])
+            self.assertTrue(shelf["active"])
+            self.assertEqual(metadata["filter_count"], 1)
+            self.assertLess(shelf["gain_db"], 0.0)
+            self.assertLess(
+                float(np.std(db20(spectrum * response))),
+                0.6 * float(np.std(db20(spectrum))),
+            )
+            fitted_corners.append(shelf["freq_hz"])
+        self.assertGreater(fitted_corners[1], 1.5 * fitted_corners[0])
+
+        rolled_off = low_shelf_response(frequencies, 4000.0, 55.0, -6.0)
+        _, _, boosted_metadata = fit_eq_filters(
+            rolled_off,
+            frequencies,
+            4000.0,
+            48,
+            np.zeros_like(frequencies),
+            EqOptions(
+                target="flat",
+                correction_range=(20.0, 200.0),
+                max_boost_db=6.0,
+                max_cut_db=12.0,
+                max_filters=2,
+                low_shelf=True,
+            ),
+        )
+        self.assertTrue(boosted_metadata["shelf"]["active"])
+        self.assertGreater(boosted_metadata["shelf"]["gain_db"], 0.0)
+        self.assertEqual(boosted_metadata["filter_count"], 2)
+
+    def test_automatic_low_shelf_can_be_disabled(self):
+        frequencies = log_frequency_grid(20.0, 200.0, 48)
+        spectrum = low_shelf_response(frequencies, 4000.0, 50.0, 6.0)
+        _, _, metadata = fit_eq_filters(
+            spectrum,
+            frequencies,
+            4000.0,
+            48,
+            np.zeros_like(frequencies),
+            EqOptions(
+                target="flat",
+                correction_range=(20.0, 200.0),
+                max_filters=1,
+                low_shelf=False,
+            ),
+        )
+        self.assertFalse(metadata["shelf"]["active"])
+
+    def test_automatic_low_shelf_is_rendered_as_an_eq_filter(self):
+        text = _peq_text(
+            [],
+            {
+                "active": True,
+                "freq_hz": 42.0,
+                "gain_db": -3.5,
+                "slope": 1.0,
+            },
+        )
+        self.assertIn("LS Fc 42.0 Hz  Gain -3.5 dB", text)
+        self.assertIn("automatically fitted EQ band", text)
+        self.assertNotIn("No filters fitted", text)
 
     def test_low_end_extension_hz_reports_band_edge_when_fully_extended(self):
         frequencies = log_frequency_grid(25.0, 150.0, 48)
@@ -328,6 +399,7 @@ class PipelineTests(unittest.TestCase):
             correction_range=(30.0, 90.0),
             correction_slope_db_per_octave=48.0,
             max_boost_db=6.0,
+            low_shelf=False,
         )
         filters, response, metadata = fit_eq_filters(
             spectrum,
@@ -975,49 +1047,47 @@ class PipelineTests(unittest.TestCase):
                     if row[key] is not None:
                         self.assertGreaterEqual(row[key], 25.0)
                         self.assertLessEqual(row[key], 150.0)
-            # The shelf is a search-time EQ setting, exactly like max_boost/
-            # eq_bands: a different shelf means a different search, and its
-            # effect is expected to show up in the post-EQ scores themselves,
-            # not just as an unscored report-time overlay.
-            shelf_results_path = cache / "search-results-shelf.json"
-            shelf_result = run_search(
+            self.assertEqual(
+                result["settings"]["eq"]["shelf"],
+                {
+                    "enabled": True,
+                    "automatic": True,
+                    "counts_toward_max_filters": True,
+                    "note": result["settings"]["eq"]["shelf"]["note"],
+                },
+            )
+            self.assertTrue(
+                all(
+                    row["eq_filter_count"]
+                    == len(row["filters"]) + int(row["eq_shelf"]["active"])
+                    <= result["settings"]["eq"]["max_filters"]
+                    for row in result["pairs"]
+                )
+            )
+
+            no_shelf_results_path = cache / "search-results-no-shelf.json"
+            no_shelf_result = run_search(
                 cache,
-                shelf_results_path,
+                no_shelf_results_path,
                 SearchOptions(
                     band=(25.0, 150.0),
                     delay_range_ms=(-2.0, 2.0, 1.0),
                     gain_range_db=(-1.0, 1.0, 1.0),
                     ppo=24,
-                    low_shelf_freq_hz=40.0,
-                    low_shelf_gain_db=4.0,
+                    low_shelf=False,
                 ),
             )
-            no_shelf_spl = {
-                (row["first"], row["second"]): row["post_eq_spl_db"]
-                for row in result["pairs"]
-            }
-            shelf_spl = {
-                (row["first"], row["second"]): row["post_eq_spl_db"]
-                for row in shelf_result["pairs"]
-            }
+            self.assertFalse(no_shelf_result["settings"]["eq"]["shelf"]["enabled"])
             self.assertTrue(
-                all(shelf_spl[key] > no_shelf_spl[key] + 0.2 for key in no_shelf_spl)
-            )
-            self.assertEqual(
-                shelf_result["settings"]["eq"]["shelf"],
-                {
-                    "active": True,
-                    "freq_hz": 40.0,
-                    "gain_db": 4.0,
-                    "slope": 1.0,
-                    "note": shelf_result["settings"]["eq"]["shelf"]["note"],
-                },
+                all(not row["eq_shelf"]["active"] for row in no_shelf_result["pairs"])
             )
 
             no_shelf_report = root / "report-no-shelf.html"
             shelf_report = root / "report-shelf.html"
-            build_report(cache, results_path, no_shelf_report, top=2, limit=3)
-            build_report(cache, shelf_results_path, shelf_report, top=2, limit=3)
+            build_report(
+                cache, no_shelf_results_path, no_shelf_report, top=2, limit=3
+            )
+            build_report(cache, results_path, shelf_report, top=2, limit=3)
             no_shelf_page = no_shelf_report.read_text()
             shelf_page = shelf_report.read_text()
 
@@ -1028,8 +1098,7 @@ class PipelineTests(unittest.TestCase):
 
             self.assertEqual(len(ranking_tables(no_shelf_page)), 1)
             self.assertNotIn("LS Fc", no_shelf_page)
-            self.assertIn("LS Fc 40.0 Hz  Gain +4.0 dB", shelf_page)
-            self.assertIn("part of the score", shelf_page)
+            self.assertIn("Automatic low shelf enabled", shelf_page)
 
             report = root / "report.html"
             build_report(cache, results_path, report, top=2, limit=3)
@@ -1076,7 +1145,7 @@ class PipelineTests(unittest.TestCase):
             self.assertNotIn("Nominal flat target", page)
             self.assertNotIn("1-oct trend", page)
             self.assertIn("peak ", page)
-            self.assertIn("Combined PEQ response (all bands)", page)
+            self.assertIn("Combined EQ response (all bands)", page)
             self.assertIn('"shape":"spline"', page)
             self.assertIn("EQ authority", page)
             self.assertIn("background:hsla(", page)
@@ -1093,7 +1162,7 @@ class PipelineTests(unittest.TestCase):
             self.assertNotIn("window.dispatchEvent(new Event('resize'))", page)
             self.assertIn("Extension", page)
             self.assertIn("not part of the ranking", page)
-            self.assertIn("Fitted PEQ filters", page)
+            self.assertIn("Fitted EQ filters", page)
             self.assertIn("Post-EQ excess GD", page)
             self.assertNotIn("Pre-EQ excess GD", page)
             self.assertIn("zero-referenced excess-GD overlay", page)
@@ -1110,8 +1179,8 @@ class PipelineTests(unittest.TestCase):
             self.assertIn('id="ranking-raw"', raw_page)
             self.assertNotIn('id="ranking-eq"', raw_page)
             self.assertIn('id="selected-pairs-magnitude-raw"', raw_page)
-            self.assertNotIn("Fitted PEQ filters", raw_page)
-            self.assertNotIn("Combined PEQ response (all bands)", raw_page)
+            self.assertNotIn("Fitted EQ filters", raw_page)
+            self.assertNotIn("Combined EQ response (all bands)", raw_page)
             self.assertNotIn("EQ authority", raw_page)
             self.assertIn("Raw CSD-style decay", raw_page)
             self.assertNotIn("Post-EQ CSD-style decay", raw_page)

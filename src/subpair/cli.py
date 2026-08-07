@@ -106,7 +106,7 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=("trend", "flat", "dsp"),
         default="trend",
         help=(
-            "PEQ target: broad trend, aggressive flat response, or 'dsp' "
+            "EQ target: broad trend, aggressive flat response, or 'dsp' "
             "(flat response; ranking barely penalises minimum-phase dips, "
             "for placements an external DSP will correct)"
         ),
@@ -121,7 +121,7 @@ def _build_parser() -> argparse.ArgumentParser:
         nargs=2,
         type=float,
         metavar=("LOW_HZ", "HIGH_HZ"),
-        help="frequency range in which PEQ centres may be fitted (default: analysis band)",
+        help="frequency range in which EQ band centres may be fitted (default: analysis band)",
     )
     search.add_argument(
         "--eq-range-slope",
@@ -135,21 +135,21 @@ def _build_parser() -> argparse.ArgumentParser:
         type=_bounded_float(0.0, 12.0),
         default=0.0,
         metavar="DB",
-        help="maximum combined PEQ boost, 0..12 dB (default: 0)",
+        help="maximum combined EQ boost, 0..12 dB (default: 0)",
     )
     search.add_argument(
         "--max-cut",
         type=_bounded_float(0.0, 30.0),
         default=18.0,
         metavar="DB",
-        help="maximum single-filter PEQ cut, 0..30 dB (default: 18)",
+        help="maximum single-filter EQ cut, 0..30 dB (default: 18)",
     )
     search.add_argument(
         "--eq-bands",
         type=_bounded_int(0, 16),
         default=7,
         metavar="COUNT",
-        help="maximum PEQ band count, 0..16 (default: 7)",
+        help="maximum automatic EQ band count (PK plus optional LS), 0..16 (default: 7)",
     )
     search.add_argument(
         "--tie-tolerance-db",
@@ -200,35 +200,17 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _add_shelf_arguments(subparser: argparse.ArgumentParser) -> None:
-    """A fixed, broad low-shelf tonal control, independent of the fitted PEQ bank.
+    """Enable or disable the automatic low-shelf EQ candidate."""
 
-    A ``search``-time EQ configuration choice, exactly like ``--max-boost``/
-    ``--eq-bands``: it is folded into every post-EQ score, so it can change
-    which placement wins if a deliberate tonal tilt makes one placement's
-    corrected response meaningfully better or worse than another's. Not
-    available on ``report``/``verify`` - those read whichever shelf the
-    loaded ``search-results.json`` already has baked in (see
-    ``dsp.ShelfOptions``).
-    """
     subparser.add_argument(
-        "--low-shelf-freq",
-        type=_bounded_float(1.0, 20000.0),
-        default=None,
-        metavar="HZ",
-        help="low-shelf corner frequency; required if --low-shelf-gain is nonzero",
-    )
-    subparser.add_argument(
-        "--low-shelf-gain",
-        type=_bounded_float(-15.0, 15.0),
-        default=0.0,
-        metavar="DB",
-        help="low-shelf boost/cut, -15..15 dB (default: 0, disabled)",
-    )
-    subparser.add_argument(
-        "--low-shelf-slope",
-        type=_bounded_float(0.1, 1.0),
-        default=1.0,
-        help=argparse.SUPPRESS,
+        "--low-shelf",
+        choices=("on", "off"),
+        default="on",
+        help=(
+            "allow one automatically fitted low-shelf EQ band; its corner and "
+            "gain are chosen by the fitter and count toward --eq-bands "
+            "(default: on)"
+        ),
     )
 
 
@@ -346,9 +328,7 @@ def _search(args: argparse.Namespace) -> int:
         max_cut_db=args.max_cut,
         eq_bands=args.eq_bands,
         tie_tolerance_db=args.tie_tolerance_db,
-        low_shelf_freq_hz=args.low_shelf_freq,
-        low_shelf_gain_db=args.low_shelf_gain,
-        low_shelf_slope=args.low_shelf_slope,
+        low_shelf=args.low_shelf == "on",
     )
 
     def progress(done: int, total: int, pair: str) -> None:

@@ -66,7 +66,7 @@ Two rankings are calculated, both strictly lexicographic:
    one-octave broad trend or a wide two-sided check, energy-weighted mean
    absolute excess group delay, the shape-neutral excess-GD tail integral,
    then worst raw time-to-minus-20-dB across one-third-octave bands.
-2. **EQ'd:** the same three measurements after applying the fitted PEQs.
+2. **EQ'd:** the same measurements after applying the fitted EQ filters.
 
 The one-octave trend is itself a smoothing of the curve it's compared
 against, so a dip much wider than that window (a broadband suck-out from a
@@ -269,9 +269,10 @@ matter for an ordinarily-wide feature. The cache's native resolution and
 this threshold are recorded in `search-results.json`'s
 `settings.native_resolution` block.
 
-The PEQ simulator uses constrained greedy target matching with RBJ constant-Q
-bells: it evaluates the largest raw-magnitude target errors and retains the
-candidate that most reduces the weighted global error. `--eq-bands COUNT`
+The automatic EQ simulator uses constrained greedy target matching with RBJ
+constant-Q PK filters and the optional automatic low shelf. It evaluates the
+largest raw-magnitude target errors and retains the PK or LS candidate that
+most reduces the weighted global error. `--eq-bands COUNT`
 allows 0–16 bands and defaults to 7; zero cleanly disables EQ. The default
 `--eq-target trend` follows the broad response and `--max-boost 0` preserves
 cuts-only behaviour. `--eq-target flat` or `--aggressive-correction` uses a
@@ -302,7 +303,7 @@ and [miniDSP room-EQ guidance](https://www.minidsp.com/applications/home-theater
 
 `--eq-range LOW HIGH` constrains filter centres. The target correction is
 attenuated outside that range by `--eq-range-slope` (0–48 dB/oct); zero means
-a hard target curtain. The fitted PEQs may still have their natural skirts
+a hard target curtain. The fitted EQ bands may still have their natural skirts
 outside the range.
 
 EQ authority is reduced where absolute excess group delay is large relative
@@ -329,34 +330,19 @@ a room RT60 measurement.
 
 #### Low shelf
 
-`--low-shelf-freq HZ --low-shelf-gain DB [--low-shelf-slope S]` adds a fixed,
-broad RBJ low-shelf boost or cut, for people who want a general tonality
-control (more or less sub-bass) alongside — or instead of relying entirely
-on — corrective EQ. `--low-shelf-gain` is required to be nonzero for the
-shelf to take effect (-15..15 dB); `--low-shelf-freq` alone is inert.
-`--low-shelf-slope` is the RBJ "S" shelf-slope parameter (0.1..1, default 1,
-the steepest transition without gain overshoot).
+`--low-shelf on|off` controls whether the automatic EQ fitter may use one RBJ
+low-shelf band; it defaults to `on`. When enabled, the fitter chooses both the
+corner frequency and the boost or attenuation independently for every pair.
+The shelf competes directly with PK candidates against the same correction
+target, obeys `--max-boost`, `--max-cut`, `--eq-range`, and the excess-GD-aware
+objective, and consumes one of the slots allowed by `--eq-bands` when chosen.
 
-This is a `search`-time EQ setting, exactly like `--max-boost`/`--eq-bands`:
-it is folded into every post-EQ score (`post_eq_null_score_db`,
-`post_eq_spl_db`, ranking, everything), so a deliberate tonal choice *can*
-change which placement wins — changing it means re-running `search`, not a
-report-time toggle. `report`/`verify` no longer take their own
-`--low-shelf-*` flags; they display and predict whatever shelf the loaded
-`search-results.json` was generated with.
-
-The shelf is still deliberately independent of `fit_eq_filters`'s bounded
-bell fitter in one specific sense: the greedy PK-bell loop is fitted
-completely unaware of it, targeting the raw, unshelved response exactly as
-if the shelf were inactive, so a deliberate tonal tilt is never fought or
-cancelled by the corrective fitter the way a genuine response defect at the
-same frequencies would be. It is applied once, multiplicatively, after the
-bell bank is chosen — not counted against `--eq-bands`/`--max-boost`/
-`--max-cut`/`--eq-range` — closer to how a fixed hardware shelf ahead of an
-adaptive room-correction DSP behaves than to another corrective filter
-competing for the same budget. In the report it appears in the fitted-PEQ
-text block as a separate `LS Fc ... Gain ... Slope ...` line, clearly marked
-apart from the `PK` bell lines above it.
+`on` enables the candidate but does not force a shelf when it cannot improve
+the fit. `off` leaves the entire band budget available to PK filters. The RBJ
+slope is fixed internally at 1, the steepest transition without gain
+overshoot; there are no manual shelf-frequency, gain, or slope flags. A fitted
+shelf appears alongside the PK filters in the report as an `LS Fc ... Gain ...
+Slope ...` line and is included in every post-EQ plot and score.
 
 Relative SPL is reported, not ranked. It is the energy-mean in-band SPL at the
 searched gain settings (gains are referenced to an equal 1 kHz electrical
@@ -365,9 +351,9 @@ drive). Raw and EQ'd modes each reference their own rank 1.
 ### `subpair report`
 
 Produces one HTML file containing Plotly itself, the sortable EQ'd ranking,
-top-pair response diagnostics, post-EQ CSD heatmaps, and copyable PEQ text.
+top-pair response diagnostics, post-EQ CSD heatmaps, and copyable EQ text.
 Pass `--raw` to show the raw ranking and raw diagnostics instead, omitting the
-EQ-specific plots and PEQ controls entirely. The table has selection checkboxes
+EQ-specific plots and filter controls entirely. The table has selection checkboxes
 (its top five are checked by default); the selected pairs feed the combined
 overview and appear as pair tabs below the table for fast one-at-a-time
 diagnostics. The overview switches between magnitude and excess group delay.
@@ -410,12 +396,10 @@ and prints the maximum in-band deviation. The comparison removes only one
 constant level offset by default (`--keep-level` disables that); it does not
 hide frequency-dependent mutual-coupling error.
 
-If the loaded `search-results.json` was generated with a low shelf active
-(see `subpair search`'s Low shelf section above), `verify` automatically
-applies it to the *predicted* curve before computing the deviation, since
-verification is about checking one fully-specified, already-scored
-configuration — no separate `--low-shelf-*` flags are needed or accepted
-here.
+Verification compares the physical sum with the unequalized prediction. It
+therefore does not apply PK filters or the automatically fitted low shelf;
+the shelf now follows exactly the same verification semantics as every other
+EQ band.
 
 ## Important assumptions
 

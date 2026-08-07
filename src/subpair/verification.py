@@ -12,7 +12,7 @@ from plotly.offline import get_plotlyjs
 
 from .api import RewClient
 from .cache import CachedMeasurement, load_cache
-from .dsp import AnalysisContext, ShelfOptions, db20
+from .dsp import AnalysisContext, db20
 from .html_report import _HOVER_HZ_DB, load_results
 
 
@@ -68,15 +68,6 @@ def run_verification(
 ) -> dict[str, Any]:
     cached, _ = load_cache(cache_dir)
     results = load_results(results_path)
-    # The shelf is a search-time EQ setting (see EqOptions.shelf), not a
-    # verify-time override: whatever search-results.json was generated with
-    # is what's being verified, exactly like max_boost_db/max_filters.
-    shelf_settings = results["settings"].get("eq", {}).get("shelf", {})
-    shelf = ShelfOptions(
-        freq_hz=shelf_settings.get("freq_hz"),
-        gain_db=float(shelf_settings.get("gain_db", 0.0)),
-        slope=float(shelf_settings.get("slope", 1.0)),
-    )
     matches = [row for row in results["pairs"] if int(row["rank"]) == rank]
     if len(matches) != 1:
         raise VerificationError(f"Rank {rank} is not present in {results_path}")
@@ -108,8 +99,6 @@ def run_verification(
         float(pair["delay_ms"]),
         float(pair["gain_db"]),
     )
-    if shelf.active:
-        predicted = predicted * shelf.response(context.frequencies, context.sample_rate)
     bins = np.fft.rfftfreq(impulse.size, 1.0 / sample_rate)
     measured_fft = np.fft.rfft(impulse)
     measured = np.interp(context.frequencies, bins, measured_fft.real) + 1j * np.interp(
@@ -165,12 +154,6 @@ def run_verification(
         div_id="verification-plot",
     )
     title = client.measurement_title(selected)
-    shelf_line = (
-        f"Low shelf applied to prediction: {shelf.gain_db:+.1f} dB at "
-        f"{shelf.freq_hz:g} Hz, slope {shelf.slope:.2f}<br>"
-        if shelf.active
-        else ""
-    )
     document = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>subpair verification</title>
 <style>body{{margin:2rem auto;max-width:1200px;background:#07111f;color:#e5edf8;font:15px/1.5 system-ui,sans-serif}}
@@ -178,7 +161,7 @@ def run_verification(
 <script>{get_plotlyjs()}</script></head><body><h1>subpair verification</h1>
 <div class="summary"><strong>{html.escape(title)}</strong><br>Maximum absolute deviation in band:
 {max_deviation:.3f} dB · constant measured-level offset: {level_offset:+.3f} dB<br>
-{shelf_line}API routes discovered from {html.escape(routes.spec_url)}</div>{plot}</body></html>"""
+API routes discovered from {html.escape(routes.spec_url)}</div>{plot}</body></html>"""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(document, encoding="utf-8")
     return {
