@@ -36,17 +36,19 @@ SEARCH_ARGS=(
 )
 
 generate_report() {
-  local target="$1"
-  local results_path="${SUBPAIR_CACHE_DIR}/search-results-${target}.json"
-  local report_path="${REPO_ROOT}/subpair-report-${target}.html"
+  local label="$1"
+  shift
+  local results_path="${SUBPAIR_CACHE_DIR}/search-results-${label}.json"
+  local report_path="${REPO_ROOT}/subpair-report-${label}.html"
 
-  printf '\nGenerating %s search results...\n' "${target}"
+  printf '\nGenerating %s search results...\n' "${label}"
   "${SUBPAIR_EXE}" search \
     "${SEARCH_ARGS[@]}" \
-    --eq-target "${target}" \
+    --eq-target dsp \
+    "$@" \
     --results "${results_path}"
 
-  printf 'Building %s report...\n' "${target}"
+  printf 'Building %s report...\n' "${label}"
   "${SUBPAIR_EXE}" report \
     --cache "${SUBPAIR_CACHE_DIR}" \
     --results "${results_path}" \
@@ -55,9 +57,9 @@ generate_report() {
     --limit 15
 }
 
-# generate_report flat
 generate_report dsp
+generate_report no-eq --eq-bands 0
 
 printf '\nReports generated:\n'
-# printf '  %s\n' "${REPO_ROOT}/subpair-report-flat.html"
 printf '  %s\n' "${REPO_ROOT}/subpair-report-dsp.html"
+printf '  %s\n' "${REPO_ROOT}/subpair-report-no-eq.html"
