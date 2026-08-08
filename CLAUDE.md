@@ -42,6 +42,15 @@ subpair report --top 5 --limit 15 --output subpair-report.html
 subpair verify --rank 1 --output verification.html
 ```
 
+## Workflow
+
+Commit after each self-contained change, with a clear message describing
+what changed and why — don't batch unrelated changes into one commit, and
+don't leave a commit that couldn't be checked out on its own without
+something broken or unfinished (failing tests, a half-done refactor, dead
+imports). If a change can't yet stand on its own, keep going rather than
+committing a broken intermediate state.
+
 ## Architecture
 
 Four pipeline stages, each a thin CLI wrapper (`cli.py`) around a module with
