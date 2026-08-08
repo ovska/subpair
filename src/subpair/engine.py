@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import itertools
+import os
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 import numpy as np
 
@@ -147,6 +149,84 @@ def _best_configurations(
     return result
 
 
+_worker_state: dict[str, Any] = {}
+
+
+def _init_pair_worker(
+    context: AnalysisContext,
+    delays: np.ndarray,
+    gains: np.ndarray,
+    eq_options: EqOptions,
+    score_low_end_weight: float,
+    score_dip_weight: float,
+) -> None:
+    """Stash shared read-only search state once per worker process.
+
+    Avoids re-pickling ``context`` (spectra for every cached measurement)
+    on every one of the C(n,2) pair tasks; each worker process receives it
+    exactly once, at pool startup.
+    """
+    _worker_state.update(
+        context=context,
+        delays=delays,
+        gains=gains,
+        eq_options=eq_options,
+        score_low_end_weight=score_low_end_weight,
+        score_dip_weight=score_dip_weight,
+    )
+
+
+def _compute_pair(
+    indices: tuple[int, int],
+) -> tuple[int, int, int, float, float, dict]:
+    first, second = indices
+    context = _worker_state["context"]
+    delays = _worker_state["delays"]
+    gains = _worker_state["gains"]
+    eq_options = _worker_state["eq_options"]
+    score_low_end_weight = _worker_state["score_low_end_weight"]
+    score_dip_weight = _worker_state["score_dip_weight"]
+
+    configurations = _best_configurations(
+        context, first, second, delays, gains, score_low_end_weight, score_dip_weight
+    )
+    finalists = []
+    for (
+        polarity,
+        delay_ms,
+        gain_db,
+        _fast_score_db,
+        delay_plateau_ms,
+        gain_plateau_db,
+    ) in configurations:
+        diagnostics = pair_diagnostics(
+            context,
+            first,
+            second,
+            polarity,
+            delay_ms,
+            gain_db,
+            include_decay=False,
+            include_trends=False,
+            eq_options=eq_options,
+            score_low_end_weight=score_low_end_weight,
+            score_dip_weight=score_dip_weight,
+        )
+        diagnostics["delay_plateau_ms"] = delay_plateau_ms
+        diagnostics["gain_plateau_db"] = gain_plateau_db
+        finalists.append((polarity, delay_ms, gain_db, diagnostics))
+    polarity, delay_ms, gain_db, diagnostics = max(
+        finalists,
+        key=lambda item: (
+            item[3]["post_eq_score_db"],
+            1 if item[0] > 0 else 0,
+            -item[1],
+            -item[2],
+        ),
+    )
+    return first, second, polarity, delay_ms, gain_db, diagnostics
+
+
 def run_search(
     cache_dir: Path,
     output_path: Path,
@@ -173,64 +253,36 @@ def run_search(
         low_shelf=options.low_shelf,
     )
     combinations = list(itertools.combinations(range(len(measurements)), 2))
+    worker_count = max(1, min((os.cpu_count() or 1) // 4, 8, len(combinations)))
     pairs: list[dict] = []
-    for ordinal, (first, second) in enumerate(combinations, start=1):
-        configurations = _best_configurations(
+    with ProcessPoolExecutor(
+        max_workers=worker_count,
+        initializer=_init_pair_worker,
+        initargs=(
             context,
-            first,
-            second,
             delays,
             gains,
+            eq_options,
             options.score_low_end_weight,
             options.score_dip_weight,
-        )
-        finalists = []
-        for (
-            polarity,
-            delay_ms,
-            gain_db,
-            _fast_score_db,
-            delay_plateau_ms,
-            gain_plateau_db,
-        ) in configurations:
-            diagnostics = pair_diagnostics(
-                context,
-                first,
-                second,
-                polarity,
-                delay_ms,
-                gain_db,
-                include_decay=False,
-                include_trends=False,
-                eq_options=eq_options,
-                score_low_end_weight=options.score_low_end_weight,
-                score_dip_weight=options.score_dip_weight,
-            )
-            diagnostics["delay_plateau_ms"] = delay_plateau_ms
-            diagnostics["gain_plateau_db"] = gain_plateau_db
-            finalists.append((polarity, delay_ms, gain_db, diagnostics))
-        polarity, delay_ms, gain_db, diagnostics = max(
-            finalists,
-            key=lambda item: (
-                item[3]["post_eq_score_db"],
-                1 if item[0] > 0 else 0,
-                -item[1],
-                -item[2],
-            ),
-        )
-        pair = {
-            "first": first + 1,
-            "second": second + 1,
-            "first_name": measurements[first].title,
-            "second_name": measurements[second].title,
-            "polarity": polarity,
-            "delay_ms": delay_ms,
-            "gain_db": gain_db,
-            **diagnostics,
-        }
-        pairs.append(pair)
-        if progress:
-            progress(ordinal, len(combinations), f"{first + 1}+{second + 1}")
+        ),
+    ) as executor:
+        for ordinal, (first, second, polarity, delay_ms, gain_db, diagnostics) in enumerate(
+            executor.map(_compute_pair, combinations), start=1
+        ):
+            pair = {
+                "first": first + 1,
+                "second": second + 1,
+                "first_name": measurements[first].title,
+                "second_name": measurements[second].title,
+                "polarity": polarity,
+                "delay_ms": delay_ms,
+                "gain_db": gain_db,
+                **diagnostics,
+            }
+            pairs.append(pair)
+            if progress:
+                progress(ordinal, len(combinations), f"{first + 1}+{second + 1}")
 
     raw_order = sorted(
         range(len(pairs)),
