@@ -520,6 +520,8 @@ def _ranking_table(
     mode: str,
     table_id: str,
     selected_keys: set[str],
+    *,
+    show_headroom: bool = True,
 ) -> str:
     eq = mode == "eq"
     score_key = "post_eq_relative_score_db" if eq else "relative_score_db"
@@ -537,13 +539,16 @@ def _ranking_table(
         ("polarity", "Pol 2", "number"),
         ("delay_ms", "Delay 2 (ms)", "number"),
         ("gain_db", "Gain 2 (dB)", "number"),
-        (headroom_key, "Headroom (dB)", "number"),
+    ]
+    if show_headroom:
+        columns.append((headroom_key, "Headroom (dB)", "number"))
+    columns.extend([
         (dip_key, "Residual dip (dB)", "number"),
         (excess_key, "Excess GD (ms)", "number"),
         (tail_key, "Tail (ms)", "number"),
         (low_end_power_key, "Low-end power (dB)", "number"),
         (spl_key, "Relative SPL (dB)", "number"),
-    ]
+    ])
     heading = '<th class="selection-heading">Show</th>' + "".join(
         f'<th data-key="{key}" data-type="{kind}" data-column-index="{index + 1}">'
         f'{html.escape(label)}</th>'
@@ -663,6 +668,8 @@ def build_report(
         max_filters=int(eq_settings.get("max_filters", 7)),
         low_shelf=bool(shelf_settings.get("enabled", True)),
     )
+    eq_possible = eq_options.max_filters > 0
+    raw = raw or not eq_possible
     required_ranking_fields = {
         "rank",
         "eq_rank",
@@ -788,6 +795,14 @@ def build_report(
         f"full-band equal-drive SPL + {score_low_end_weight:g} × excursion-weighted "
         f"low-end power − {score_dip_weight:g} × worst dip below the one-third-octave "
         "smoothed response. Higher is better; the best pair is 0 dB."
+    )
+    headroom_note = (
+        "Headroom is the negative global gain which removes positive pair "
+        "gain"
+        + ("—and, post-EQ, the fitted response’s maximum boost—" if eq_possible else ", ")
+        + "so every pair uses the same maximum driver drive. It is applied "
+        "to the magnitude comparisons, final summed response, scoring "
+        "inputs, low-end power, and Relative SPL."
     )
     detail_sections = []
     for pair in pairs:
@@ -939,12 +954,12 @@ details {{ margin:22px 0; }} details pre {{ overflow:auto; color:var(--muted); }
   <button type="button" onclick="selectTopN(3)">Top 3</button>
   <button type="button" onclick="selectTopN(5)">Top 5</button>
 </div>
-<div class="table-wrap">{_ranking_table(pairs, mode, f'ranking-{mode}', default_keys)}</div>
+<div class="table-wrap">{_ranking_table(pairs, mode, f'ranking-{mode}', default_keys, show_headroom=eq_possible)}</div>
 <div class="pair-tabs" data-pair-tabs role="tablist" aria-label="Selected {mode_label} pairs"></div>
 <div id="pair-details">{''.join(detail_sections)}</div>
-<details><summary>Score, metric &amp; EQ notes</summary><div class="glossary">
+<details><summary>{'Score, metric &amp; EQ notes' if eq_possible else 'Score &amp; metric notes'}</summary><div class="glossary">
 <p>{score_formula_note}</p>
-<p>Headroom is the negative global gain which removes positive pair gain—and, post-EQ, the fitted response’s maximum boost—so every pair uses the same maximum driver drive. It is applied to the magnitude comparisons, final summed response, scoring inputs, low-end power, and Relative SPL.</p>
+<p>{headroom_note}</p>
 <p>Low-end power weights the broad response through 100 Hz by the amplifier/excursion cost of producing pressure at each frequency (+12.04 dB per octave downward). Excess GD and tail remain diagnostics; they do not alter Score.</p>
 {f'<p>{eq_notes}</p>' if eq_notes else ''}
 <p>CSD overlay (in each pair's excess-GD and decay charts): excess GD with common delay removed; a vertical line is frequency-independent delay.</p>
