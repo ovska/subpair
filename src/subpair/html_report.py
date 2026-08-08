@@ -768,6 +768,27 @@ def build_report(
         raw=raw,
         selected_keys=default_keys,
     )
+    eq_notes = ""
+    if not raw:
+        eq_notes = (
+            f"EQ: {html.escape(eq_options.target)} target, "
+            f"{eq_range[0]:g}–{eq_range[1]:g} Hz, "
+            f"{eq_options.correction_slope_db_per_octave:g} dB/oct curtain, "
+            f"max boost {eq_options.max_boost_db:g} dB, up to "
+            f"{eq_options.max_filters} EQ bands; excess-GD guarded."
+        )
+        if eq_options.low_shelf:
+            eq_notes += (
+                " Automatic low shelf enabled: its corner and gain/cut "
+                "compete with PK filters and consume one EQ-band slot "
+                "when selected."
+            )
+    score_formula_note = (
+        f"{'Raw score' if raw else 'EQ’d score'}: {(1.0 - score_low_end_weight):g} × "
+        f"full-band equal-drive SPL + {score_low_end_weight:g} × excursion-weighted "
+        f"low-end power − {score_dip_weight:g} × worst dip below the one-third-octave "
+        "smoothed response. Higher is better; the best pair is 0 dB."
+    )
     detail_sections = []
     for pair in pairs:
         key = pair_key(pair)
@@ -802,22 +823,8 @@ def build_report(
                 f"tail {pair['post_eq_tail_ms']:.1f} ms"
             )
         )
-        eq_description = ""
         peq_html = ""
         if not raw:
-            eq_description = (
-                f"EQ: {html.escape(eq_options.target)} target, "
-                f"{eq_range[0]:g}–{eq_range[1]:g} Hz, "
-                f"{eq_options.correction_slope_db_per_octave:g} dB/oct curtain, "
-                f"max boost {eq_options.max_boost_db:g} dB, up to "
-                f"{eq_options.max_filters} EQ bands; excess-GD guarded.<br>"
-            )
-            if eq_options.low_shelf:
-                eq_description += (
-                    "Automatic low shelf enabled: its corner and gain/cut "
-                    "compete with PK filters and consume one EQ-band slot "
-                    "when selected.<br>"
-                )
             peq = _peq_text(
                 data["filters"],
                 data.get("eq_shelf"),
@@ -838,9 +845,7 @@ def build_report(
               <p class="configuration">Sub 2: {'normal' if pair['polarity'] > 0 else 'inverted'},
                 delay {pair['delay_ms']:+.3f} ms, gain {pair['gain_db']:+.2f} dB,
                 headroom {pair['post_eq_headroom_db' if not raw else 'headroom_db']:+.2f} dB<br>
-                {metric_summary}<br>
-                {eq_description}
-                CSD overlay: excess GD with common delay removed; a vertical line is frequency-independent delay.</p>
+                {metric_summary}</p>
               {_plot_html(
                   _magnitude_figure(pair, data, raw=raw, y_range=magnitude_range),
                   f'magnitude-{key}',
@@ -884,6 +889,9 @@ h1 {{ font-size:2.2rem; margin:0 0 4px; }} h2 {{ margin-top:0; }}
 .overview-panels,#pair-details {{ position:relative; }}
 .overview-panel,.pair-detail {{ width:100%; }}
 .overview-panel.is-inactive,.pair-detail.is-inactive {{ position:absolute; inset:0; visibility:hidden; pointer-events:none; }}
+.table-controls {{ display:flex; gap:8px; margin:14px 0; }}
+.table-controls button {{ border:1px solid #3b506d; border-radius:7px; padding:7px 13px; color:var(--muted); background:#101e31; cursor:pointer; font-weight:650; }}
+.table-controls button:hover {{ background:#1b2d48; color:var(--text); }}
 .table-wrap {{ overflow:auto; border:1px solid var(--line); border-radius:12px; background:var(--card); }}
 table {{ width:100%; border-collapse:collapse; white-space:nowrap; }}
 th,td {{ padding:10px 13px; text-align:right; border-bottom:1px solid var(--line); }}
@@ -899,6 +907,7 @@ th:hover {{ background:#1b2d48; }} tbody tr:hover {{ background:#132238; }}
 .peq h3 {{ margin:0 0 10px; }} .peq pre {{ margin:0; white-space:pre-wrap; color:#a7f3d0; }}
 .peq button {{ position:absolute; right:14px; top:14px; border:1px solid #49607e; border-radius:6px; padding:6px 11px; color:var(--text); background:#1c2d47; cursor:pointer; }}
 details {{ margin:22px 0; }} details pre {{ overflow:auto; color:var(--muted); }}
+.glossary p {{ margin:0 0 10px; color:var(--muted); }} .glossary p:last-child {{ margin-bottom:0; }}
 </style>
 <script>{get_plotlyjs()}</script>
 </head>
@@ -924,11 +933,22 @@ details {{ margin:22px 0; }} details pre {{ overflow:auto; color:var(--muted); }
     )}
   </div>
 </div>
-<p class="note">{('Raw score' if raw else 'EQ’d score')}: {(1.0 - score_low_end_weight):g} × full-band equal-drive SPL + {score_low_end_weight:g} × excursion-weighted low-end power − {score_dip_weight:g} × worst dip below the one-third-octave smoothed response. Higher is better; the best pair is 0 dB.</p>
+<p class="note">Score: higher is better, best pair is 0 dB. Click a heading to sort; cells run green (best) to red (worst).</p>
+<div class="table-controls">
+  <button type="button" onclick="selectTopN(0)">Clear</button>
+  <button type="button" onclick="selectTopN(3)">Top 3</button>
+  <button type="button" onclick="selectTopN(5)">Top 5</button>
+</div>
 <div class="table-wrap">{_ranking_table(pairs, mode, f'ranking-{mode}', default_keys)}</div>
 <div class="pair-tabs" data-pair-tabs role="tablist" aria-label="Selected {mode_label} pairs"></div>
-<p class="note">The table is ordered by Score, and clicking any heading re-sorts it. Metric cells run from green (best) to red (worst); higher is better for Score, low-end power, and Relative SPL, while lower is better for residual dip, excess GD, and tail. Headroom is the negative global gain which removes positive pair gain—and, post-EQ, the fitted response’s maximum boost—so every pair uses the same maximum driver drive. It is applied to the magnitude comparisons, final summed response, scoring inputs, low-end power, and Relative SPL. Low-end power weights the broad response through 100 Hz by the amplifier/excursion cost of producing pressure at each frequency (+12.04 dB per octave downward). Excess GD and tail remain diagnostics; they do not alter Score.</p>
 <div id="pair-details">{''.join(detail_sections)}</div>
+<details><summary>Score, metric &amp; EQ notes</summary><div class="glossary">
+<p>{score_formula_note}</p>
+<p>Headroom is the negative global gain which removes positive pair gain—and, post-EQ, the fitted response’s maximum boost—so every pair uses the same maximum driver drive. It is applied to the magnitude comparisons, final summed response, scoring inputs, low-end power, and Relative SPL.</p>
+<p>Low-end power weights the broad response through 100 Hz by the amplifier/excursion cost of producing pressure at each frequency (+12.04 dB per octave downward). Excess GD and tail remain diagnostics; they do not alter Score.</p>
+{f'<p>{eq_notes}</p>' if eq_notes else ''}
+<p>CSD overlay (in each pair's excess-GD and decay charts): excess GD with common delay removed; a vertical line is frequency-independent delay.</p>
+</div></details>
 <details><summary>Analysis settings and minimum-phase convention</summary><pre>{settings_json}</pre></details>
 </main>
 <script>
@@ -1052,6 +1072,20 @@ function renderPairTabs() {{
     button.addEventListener('click',()=>activatePair(key));
     strip.appendChild(button);
   }});
+}}
+function selectTopN(n) {{
+  const table=document.getElementById('ranking-'+reportMode);
+  const rows=Array.from(table.querySelectorAll('tbody tr'));
+  selectedPairs.clear();
+  rows.forEach((row,index)=>{{
+    const checkbox=row.querySelector('.pair-select');
+    const select=index<n;
+    checkbox.checked=select;
+    if(select) selectedPairs.add(row.dataset.pairKey);
+  }});
+  renderPairTabs();
+  updateOverview();
+  renderActiveDetail();
 }}
 document.querySelectorAll('.pair-select').forEach(checkbox=>{{
   checkbox.addEventListener('change',()=>{{
