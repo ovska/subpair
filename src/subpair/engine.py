@@ -237,12 +237,18 @@ def run_search(
     delays = inclusive_range(*options.delay_range_ms)
     gains = inclusive_range(*options.gain_range_db)
     context = AnalysisContext(measurements, options.band, options.ppo)
-    eq_range = options.eq_range_hz or options.band
-    if eq_range[0] < options.band[0] or eq_range[1] > options.band[1]:
-        raise ValueError(
-            f"EQ range {eq_range[0]:g}..{eq_range[1]:g} Hz must lie within "
-            f"analysis band {options.band[0]:g}..{options.band[1]:g} Hz"
-        )
+    # With no EQ bands to fit, the correction range has nothing to scope: score,
+    # excess GD, and every other diagnostic should see the full analysis band
+    # rather than a possibly narrower --eq-range left over from another run.
+    if options.eq_bands > 0:
+        eq_range = options.eq_range_hz or options.band
+        if eq_range[0] < options.band[0] or eq_range[1] > options.band[1]:
+            raise ValueError(
+                f"EQ range {eq_range[0]:g}..{eq_range[1]:g} Hz must lie within "
+                f"analysis band {options.band[0]:g}..{options.band[1]:g} Hz"
+            )
+    else:
+        eq_range = options.band
     eq_options = EqOptions(
         target=options.eq_target,
         correction_range=eq_range,

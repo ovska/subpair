@@ -202,7 +202,13 @@ and [miniDSP room-EQ guidance](https://www.minidsp.com/applications/home-theater
 `--eq-range LOW HIGH` constrains filter centres. The target correction is
 attenuated outside that range by `--eq-range-slope` (0–48 dB/oct); zero means
 a hard target curtain. The fitted EQ bands may still have their natural skirts
-outside the range.
+outside the range. Excess GD (`excess_gd_ms`/`excess_gd_tail_ms`/
+`excess_gd_peak_ms` and their post-EQ counterparts) is integrated over this
+same range, since it doubles as the EQ authority gate. `--eq-bands 0`
+disables fitting entirely, and in that case the range has nothing left to
+scope: it falls back to the full analysis `--band` regardless of any
+`--eq-range` also passed, so a leftover narrower `--eq-range` from another
+run cannot silently shrink the diagnostics of an un-EQ'd search.
 
 EQ authority is reduced where absolute excess group delay is large relative
 to the local period. Subpair lightly denoises delay on the log-frequency
