@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -29,9 +30,107 @@ _HOVER_MS_HZ_DB = "%{x:.1f} ms<br>%{y:.0f} Hz<br>%{z:.1f} dB<extra></extra>"
 _HOVER_HZ_MS_OVERLAY = "%{y:.0f} Hz · %{x:.1f} ms<extra></extra>"
 _EXCESS_GD_LOWER_LIMIT_MS = -20.0
 
+SPEED_OF_SOUND_M_PER_S = 343.0
+
+_ROOM_MODE_LINE_STYLE = {
+    "axial": {"color": "#e2e8f0", "dash": "solid", "width": 1.3},
+    "tangential": {"color": "#94a3b8", "dash": "dash", "width": 1.0},
+    "oblique": {"color": "#64748b", "dash": "dot", "width": 0.9},
+}
+
 
 class ReportError(RuntimeError):
     pass
+
+
+def room_mode_frequencies(
+    dimensions_cm: tuple[float, float, float], max_frequency_hz: float
+) -> list[dict[str, Any]]:
+    """Axial/tangential/oblique rigid-rectangular-room eigenfrequencies, <= a limit.
+
+    ``f(nx,ny,nz) = (c/2) * sqrt((nx/Lx)^2 + (ny/Ly)^2 + (nz/Lz)^2)`` is the
+    standard rigid rectangular-room mode formula (Lx/Ly/Lz in metres, one
+    integer index per axis). A mode is axial when exactly one index is
+    nonzero (energy bouncing between one pair of parallel walls), tangential
+    when two are, oblique when all three are. This is a purely geometric
+    visual reference for a perfectly rigid box -- not a substitute for the
+    measured poles in ``modal.py``: a real room's absorption, non-rigid
+    boundaries, furniture, and non-rectangular geometry all shift and damp
+    its actual modes away from this idealization.
+    """
+    length_m, width_m, height_m = (value / 100.0 for value in dimensions_cm)
+    if min(length_m, width_m, height_m) <= 0.0:
+        raise ValueError("Room dimensions must be positive")
+    if not math.isfinite(max_frequency_hz) or max_frequency_hz <= 0.0:
+        raise ValueError("Room mode frequency limit must be positive")
+    axis_limits = tuple(
+        max(0, math.floor(2.0 * max_frequency_hz * dimension / SPEED_OF_SOUND_M_PER_S))
+        for dimension in (length_m, width_m, height_m)
+    )
+    modes: list[dict[str, Any]] = []
+    for nx in range(axis_limits[0] + 1):
+        for ny in range(axis_limits[1] + 1):
+            for nz in range(axis_limits[2] + 1):
+                if nx == ny == nz == 0:
+                    continue
+                frequency = 0.5 * SPEED_OF_SOUND_M_PER_S * math.sqrt(
+                    (nx / length_m) ** 2 + (ny / width_m) ** 2 + (nz / height_m) ** 2
+                )
+                if frequency > max_frequency_hz:
+                    continue
+                nonzero = (nx > 0) + (ny > 0) + (nz > 0)
+                mode_type = {1: "axial", 2: "tangential", 3: "oblique"}[nonzero]
+                modes.append(
+                    {"frequency_hz": frequency, "type": mode_type, "indices": (nx, ny, nz)}
+                )
+    modes.sort(key=lambda mode: mode["frequency_hz"])
+    return modes
+
+
+def _room_mode_traces(
+    modes: list[dict[str, Any]] | None,
+    span: tuple[float, float] | None,
+    orientation: str,
+) -> list[go.Scatter]:
+    """One legend-toggleable line trace per mode type, across ``span``.
+
+    ``orientation="vertical"`` draws a line at each mode's frequency on the
+    x-axis (frequency/excess-GD charts); ``"horizontal"`` draws it on the
+    y-axis (the CSD heatmap, whose y-axis is frequency). Each trace packs
+    every mode of one type into a single multi-segment line (``None``-
+    separated), so toggling one legend entry shows/hides every mode of that
+    type together rather than needing one entry per mode.
+    """
+    if not modes or span is None:
+        return []
+    low, high = span
+    traces = []
+    for mode_type, style in _ROOM_MODE_LINE_STYLE.items():
+        frequencies = [mode["frequency_hz"] for mode in modes if mode["type"] == mode_type]
+        if not frequencies:
+            continue
+        xs: list[float | None] = []
+        ys: list[float | None] = []
+        for frequency in frequencies:
+            if orientation == "vertical":
+                xs.extend([frequency, frequency, None])
+                ys.extend([low, high, None])
+            else:
+                xs.extend([low, high, None])
+                ys.extend([frequency, frequency, None])
+        traces.append(
+            go.Scatter(
+                x=xs,
+                y=ys,
+                mode="lines",
+                line={"color": style["color"], "width": style["width"], "dash": style["dash"]},
+                opacity=0.55,
+                name=f"Room mode: {mode_type}",
+                legendgroup=f"room-mode-{mode_type}",
+                hoverinfo="skip",
+            )
+        )
+    return traces
 
 
 def _eq_band_points(
@@ -166,6 +265,7 @@ def _magnitude_figure(
     *,
     raw: bool = False,
     y_range: tuple[float, float] | None = None,
+    room_modes: list[dict[str, Any]] | None = None,
 ) -> go.Figure:
     f = data["frequencies"]
     figure = go.Figure()
@@ -248,6 +348,14 @@ def _magnitude_figure(
                     hovertemplate=_HOVER_EQ_BAND,
                 )
             )
+    resolved_y_range = y_range
+    if resolved_y_range is None:
+        resolved_y_range = _finite_axis_range(
+            [data["solo_first_db"], data["solo_second_db"], data["sum_db" if raw else "post_eq_db"]],
+            include_zero=not raw,
+        )
+    for trace in _room_mode_traces(room_modes, resolved_y_range, "vertical"):
+        figure.add_trace(trace)
     yaxis: dict[str, Any] = {"title": "Level (dB; cache reference)"}
     if y_range is not None:
         yaxis["range"] = y_range
@@ -275,6 +383,7 @@ def _overview_figure(
     mode: str,
     selected_keys: set[str],
     y_range: tuple[float, float] | None = None,
+    room_modes: list[dict[str, Any]] | None = None,
 ) -> go.Figure:
     figure = go.Figure()
     eq = mode == "eq"
@@ -307,6 +416,8 @@ def _overview_figure(
                 if f"{int(pair['first'])}-{int(pair['second'])}" in selected_keys
             ]
         )
+    for trace in _room_mode_traces(room_modes, y_range, "vertical"):
+        figure.add_trace(trace)
     yaxis: dict[str, Any] = {
         "title": (
             "Post-EQ summed level (dB; cache reference)"
@@ -333,6 +444,7 @@ def _overview_excess_figure(
     mode: str,
     selected_keys: set[str],
     y_range: tuple[float, float] | None = None,
+    room_modes: list[dict[str, Any]] | None = None,
 ) -> go.Figure:
     figure = go.Figure()
     eq = mode == "eq"
@@ -370,6 +482,8 @@ def _overview_excess_figure(
             lower_limit=_EXCESS_GD_LOWER_LIMIT_MS,
             include_zero=True,
         )
+    for trace in _room_mode_traces(room_modes, y_range, "vertical"):
+        figure.add_trace(trace)
     yaxis: dict[str, Any] = {
         "title": "Excess GD (ms)",
         "minallowed": _EXCESS_GD_LOWER_LIMIT_MS,
@@ -397,6 +511,7 @@ def _excess_figure(
     *,
     raw: bool = False,
     y_range: tuple[float, float] | None = None,
+    room_modes: list[dict[str, Any]] | None = None,
 ) -> go.Figure:
     figure = go.Figure()
     prefix = "" if raw else "post_eq_"
@@ -422,6 +537,15 @@ def _excess_figure(
             )
         )
     figure.add_hline(y=0.0, line={"color": "#64748b", "width": 1})
+    resolved_y_range = y_range
+    if resolved_y_range is None:
+        resolved_y_range = _finite_axis_range(
+            [data[f"{prefix}excess_curve_ms"]],
+            lower_limit=_EXCESS_GD_LOWER_LIMIT_MS,
+            include_zero=True,
+        )
+    for trace in _room_mode_traces(room_modes, resolved_y_range, "vertical"):
+        figure.add_trace(trace)
     yaxis: dict[str, Any] = {
         "title": "Excess GD (ms)",
         "minallowed": _EXCESS_GD_LOWER_LIMIT_MS,
@@ -447,7 +571,12 @@ def _excess_figure(
     return figure
 
 
-def _decay_figure(data: dict[str, Any], *, raw: bool = False) -> go.Figure:
+def _decay_figure(
+    data: dict[str, Any],
+    *,
+    raw: bool = False,
+    room_modes: list[dict[str, Any]] | None = None,
+) -> go.Figure:
     figure = go.Figure()
     label = "Raw" if raw else "Post-EQ"
     figure.add_trace(
@@ -483,8 +612,17 @@ def _decay_figure(data: dict[str, Any], *, raw: bool = False) -> go.Figure:
         ),
     )
     figure.add_vline(x=0.0, line={"color": "#94a3b8", "width": 1})
-    figure.update_xaxes(title_text="Time from sum peak (ms)")
-    figure.update_yaxes(type="log", title_text="Frequency (Hz)")
+    times_ms = 1000.0 * np.asarray(data["decay_times"])
+    x_span = (float(np.min(times_ms)), float(np.max(times_ms)))
+    for trace in _room_mode_traces(room_modes, x_span, "horizontal"):
+        figure.add_trace(trace)
+    # fixedrange (not the blunter staticPlot config option) is what actually
+    # keeps this from being nudged into an accidental zoom/pan; it does not
+    # by itself disable hover or legend clicks, which room-mode toggling
+    # needs -- see this figure's call site in build_report for when the
+    # staticPlot config is skipped so those clicks can land.
+    figure.update_xaxes(title_text="Time from sum peak (ms)", fixedrange=True)
+    figure.update_yaxes(type="log", title_text="Frequency (Hz)", fixedrange=True)
     figure.update_layout(
         title=f"{label} CSD-style decay with zero-referenced excess-GD overlay",
         template="plotly_dark",
@@ -780,6 +918,7 @@ def build_report(
     top: int = 5,
     limit: int = 15,
     raw: bool = False,
+    room_dimensions_cm: tuple[float, float, float] | None = None,
 ) -> Path:
     if limit < 1:
         raise ReportError("Report result limit must be at least 1")
@@ -789,6 +928,11 @@ def build_report(
         raise ReportError("Cache measurement count does not match the search results")
     settings = results["settings"]
     band = tuple(float(value) for value in settings["band_hz"])
+    room_modes = (
+        room_mode_frequencies(room_dimensions_cm, band[1])
+        if room_dimensions_cm is not None
+        else None
+    )
     eq_settings = settings.get("eq", {})
     eq_range = tuple(float(value) for value in eq_settings.get("correction_range_hz", band))
     shelf_settings = eq_settings.get("shelf", {})
@@ -1048,11 +1192,18 @@ def build_report(
                 headroom {pair['post_eq_headroom_db' if not raw else 'headroom_db']:+.2f} dB<br>
                 {metric_summary}</p>
               {_plot_html(
-                  _magnitude_figure(pair, data, raw=raw, y_range=magnitude_range),
+                  _magnitude_figure(pair, data, raw=raw, y_range=magnitude_range, room_modes=room_modes),
                   f'magnitude-{key}',
               )}
-              {_plot_html(_decay_figure(data, raw=raw), f'decay-{key}', static=True)}
-              {_plot_html(_excess_figure(data, raw=raw, y_range=excess_range), f'excess-{key}')}
+              {_plot_html(
+                  _decay_figure(data, raw=raw, room_modes=room_modes),
+                  f'decay-{key}',
+                  static=not room_modes,
+              )}
+              {_plot_html(
+                  _excess_figure(data, raw=raw, y_range=excess_range, room_modes=room_modes),
+                  f'excess-{key}',
+              )}
               {peq_html}
               {modal_html}
             </section>
@@ -1157,6 +1308,7 @@ details {{ margin:22px 0; }} details pre {{ overflow:auto; color:var(--muted); }
 <h1>subpair ranking</h1>
 <p class="lede">{results['measurement_count']} positions · {band[0]:g}–{band[1]:g} Hz · {settings['ppo']} points/octave · {mode_label} usable-output score · showing up to {limit} pairs</p>
 <p class="note">Check table rows to choose comparison pairs. The top {default_count} start selected; the pair tabs below the table open one full diagnostic at a time. Hotkeys 1–9 open the first nine selected tabs.</p>
+{f'<p class="note">Room {room_dimensions_cm[0]:g}×{room_dimensions_cm[1]:g}×{room_dimensions_cm[2]:g} cm: theoretical rigid-box mode frequencies are overlaid on frequency charts (vertical) and CSD heatmaps (horizontal) — solid axial, dashed tangential, dotted oblique. Click a &ldquo;Room mode: …&rdquo; legend entry to hide/show that type; a purely geometric reference, not the measured poles from <code>--modal</code>.</p>' if room_modes is not None else ''}
 <div class="chart-tabs" role="tablist" aria-label="{mode_label} overview chart">
   <button class="chart-tab active" data-overview-view="magnitude" role="tab" aria-selected="true" onclick="setOverviewView('magnitude')">Magnitude</button>
   <button class="chart-tab" data-overview-view="excess" role="tab" aria-selected="false" onclick="setOverviewView('excess')">Excess GD</button>
@@ -1164,13 +1316,13 @@ details {{ margin:22px 0; }} details pre {{ overflow:auto; color:var(--muted); }
 <div class="overview-panels">
   <div class="overview-panel" data-overview-panel data-overview-view="magnitude">
     {_plot_html(
-        _overview_figure(overview, mode, default_keys, magnitude_range),
+        _overview_figure(overview, mode, default_keys, magnitude_range, room_modes),
         f'selected-pairs-magnitude-{mode}',
     )}
   </div>
   <div class="overview-panel is-inactive" data-overview-panel data-overview-view="excess">
     {_plot_html(
-        _overview_excess_figure(overview, mode, default_keys, excess_range),
+        _overview_excess_figure(overview, mode, default_keys, excess_range, room_modes),
         f'selected-pairs-excess-{mode}',
     )}
   </div>
@@ -1262,6 +1414,7 @@ function updateOverview() {{
     const plot=document.getElementById('selected-pairs-'+view+'-'+reportMode);
     if(!plot||!plot.data) return;
     plot.data.forEach((trace,index)=>{{
+      if(!trace.meta||trace.meta.pair_key===undefined) return;
       const visible=selectedPairs.has(trace.meta.pair_key);
       if(trace.visible!==visible) Plotly.restyle(plot,{{visible:visible}},[index]);
     }});

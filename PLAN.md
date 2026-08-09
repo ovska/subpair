@@ -1520,3 +1520,103 @@ it win per-pair when valid, keep the cheap one as the unconditional fallback.
 - `tests/test_modal.py`: new module — estimator, Stage 1/2, metrics,
   robustness, engine integration, CLI, and report tests.
 - `README.md`/`CLAUDE.md`: documented above.
+
+---
+
+# Room mode visualisation overlay (`subpair report --room`)
+
+**Status: implemented.** A report-only, opt-in visual aid; does not touch
+`search`, `SearchOptions`, ranking, or `search-results.json`'s schema (no
+`format_version` bump).
+
+## Summary
+
+`--room LxWxHcm` (e.g. `--room 345x274x248`) computes theoretical rigid-
+rectangular-room eigenfrequencies from the box's dimensions and overlays them
+as reference lines: vertical on every frequency-domain chart (magnitude,
+excess GD, and their overview panels), horizontal on the CSD heatmaps (whose
+y-axis is frequency). This is deliberately a *different, cheaper, and less
+trustworthy* thing than `modal.py`'s measured poles: geometry alone, from the
+standard `f(nx,ny,nz) = (c/2) * sqrt((nx/L)^2 + (ny/W)^2 + (nz/H)^2)` formula
+for a perfectly rigid, empty box, ignoring absorption, furniture, openings,
+and non-rectangular geometry. It exists as a quick, offline, no-cache-needed
+sanity check ("are the dips/resonances I'm seeing roughly where axial modes
+should be?"), not a substitute for `--modal on`'s measured pole set. Both
+`README.md` and the report's own lede paragraph say so explicitly, to avoid
+a user treating the two as interchangeable.
+
+## Design decisions
+
+- **Report-only, not stored in search-results.json.** Mirrors the low-shelf
+  precedent's original reasoning (see this file's low-frequency-GD/low-shelf
+  section, Section B.1): a purely visual/tonal preference at report time
+  should not need a `search` re-run to change, and has no ranking
+  implications to protect. Unlike the low-shelf's later reversal, there is no
+  parallel "should this affect ranking" question here at all — a theoretical
+  geometric estimate has no legitimate role in ranking real measured pairs,
+  so this one stays report-only for good.
+- **Traces, not shapes, for "toggleable."** `figure.add_vline`/`add_hline`
+  produce layout *shapes*, which don't participate in Plotly's default
+  legend-click-to-show/hide behaviour. Ordinary named `Scatter` traces do,
+  and this codebase already uses exactly that pattern (the low-shelf/PEQ
+  overlay traces are legend-toggleable the same way) — reusing it needed no
+  new client-side JS. Each mode *type* (axial/tangential/oblique) is packed
+  into one multi-segment trace (`None`-separated segments) rather than one
+  trace per mode, so there are only 3 legend entries per chart, each toggling
+  every mode of that type together.
+- **The CSD heatmap's `staticPlot` had to be relaxed.** CSD figures are
+  rendered with Plotly's `staticPlot: true` config (no zoom/pan/hover/legend
+  clicks at all) specifically to prevent accidental zooming — but that also
+  blocks the legend clicks this feature needs. Fix: `_decay_figure` now sets
+  `fixedrange: true` on both axes (blocks zoom/pan specifically, Plotly's
+  intended tool for exactly this) and `build_report` only drops `staticPlot`
+  for the pairs actually rendering room-mode traces
+  (`static=not room_modes`), so a report generated without `--room` is
+  byte-for-byte behaviourally unchanged (still fully `staticPlot`).
+- **Vertical/horizontal line extent tracks each chart's own axis range**,
+  not a fixed large constant. A vertical line drawn ±500 dB tall would blow
+  out Plotly's auto-ranging on any chart whose y-range isn't already pinned
+  explicitly (single-pair views, before the shared-range JS runs); instead
+  each figure function threads through its own already-resolved `y_range`
+  (falling back to the same `_finite_axis_range` computation the chart's own
+  axis uses when no explicit range was passed) so the lines exactly span
+  the visible plot, no more and no less.
+- **Overview-panel trace-visibility JS bug found and fixed.** The existing
+  `updateOverview()` script toggled every trace's `visible` by reading
+  `trace.meta.pair_key` unconditionally; room-mode traces have no such
+  `meta`, so `selectedPairs.has(undefined)` evaluated false and the script
+  would forcibly re-hide the room-mode overlay on every selection change,
+  fighting the user's own legend-click toggle. Fixed by skipping traces
+  without `meta.pair_key` in that loop — an actual (if latent, since nothing
+  else previously added a legend-toggleable trace to the overview figures)
+  bug caught while building this feature, not a hypothetical.
+- **Line colours are a distinct "reference annotation" grey family**
+  (`#e2e8f0`/`#94a3b8`/`#64748b`, solid/dashed/dotted for axial/tangential/
+  oblique), not vivid colours, both to read as clearly non-data and to avoid
+  clashing with the CSD overlay curve's near-white (`#f8fafc`) or any of the
+  vivid per-pair-trace colours already in use across the report.
+
+## Non-goals
+
+- No `verify` integration (that command's single frequency chart has no CSD
+  companion, so the "both" half of the request doesn't apply there; revisit
+  only if specifically requested).
+- No attempt to weight/filter modes by likely audibility (e.g. by proximity
+  to a measured pole, or by room-dimension-implied mode spacing/Bonello
+  criteria) — this is intentionally the plain textbook mode list, left for
+  the viewer to cross-reference against the measured data themselves.
+- No non-rectangular-room support (angled walls, vaulted ceilings) — out of
+  scope for a quick geometric sanity overlay.
+
+## Expected file changes
+
+- `src/subpair/html_report.py`: `room_mode_frequencies`, `_room_mode_traces`,
+  `_ROOM_MODE_LINE_STYLE`; `room_modes`/`room_dimensions_cm` threaded through
+  `_magnitude_figure`/`_excess_figure`/`_overview_figure`/
+  `_overview_excess_figure`/`_decay_figure`/`build_report`; the
+  `updateOverview()` JS fix.
+- `src/subpair/cli.py`: `--room` on `report`, `_parse_room_dimensions`.
+- `tests/test_pipeline.py`: `RoomModeTests` — geometry/classification unit
+  tests, trace-construction unit tests, CLI parsing tests, and report
+  integration tests for both `--room` present and absent.
+- `README.md`/`CLAUDE.md`: documented above.

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import re
 import tempfile
@@ -9,7 +10,7 @@ from pathlib import Path
 import numpy as np
 
 from subpair.cache import CacheError, load_cache, write_cache
-from subpair.cli import _build_parser
+from subpair.cli import _build_parser, _parse_room_dimensions
 from subpair.engine import SearchOptions, run_search
 from subpair.dsp import (
     EqOptions,
@@ -38,8 +39,10 @@ from subpair.html_report import (
     _overview_figure,
     _peq_text,
     _ranking_table,
+    _room_mode_traces,
     _selected_axis_ranges,
     build_report,
+    room_mode_frequencies,
 )
 
 
@@ -1139,6 +1142,157 @@ class PipelineTests(unittest.TestCase):
             self.assertNotIn("EQ authority", raw_page)
             self.assertIn("Raw CSD-style decay", raw_page)
             self.assertNotIn("Post-EQ CSD-style decay", raw_page)
+
+
+class RoomModeTests(unittest.TestCase):
+    def test_hand_computed_single_axial_mode(self):
+        # length=3.43 m -> first axial mode at c/(2L) = 343/6.86 = 50 Hz
+        # exactly; width/height are short enough that their own first axial
+        # modes (343 Hz) fall well outside the requested limit.
+        modes = room_mode_frequencies((343.0, 50.0, 50.0), max_frequency_hz=55.0)
+        self.assertEqual(len(modes), 1)
+        self.assertAlmostEqual(modes[0]["frequency_hz"], 50.0, places=6)
+        self.assertEqual(modes[0]["type"], "axial")
+        self.assertEqual(modes[0]["indices"], (1, 0, 0))
+
+    def test_classifies_axial_tangential_and_oblique_by_nonzero_index_count(self):
+        # A cube with c/(2L) = 343/(2*1.715) = 100 Hz per axis: (1,0,0) is
+        # axial, (1,1,0) is tangential, (1,1,1) is oblique.
+        side_cm = 171.5
+        modes = room_mode_frequencies((side_cm, side_cm, side_cm), max_frequency_hz=175.0)
+        by_indices = {mode["indices"]: mode for mode in modes}
+        self.assertEqual(by_indices[(1, 0, 0)]["type"], "axial")
+        self.assertEqual(by_indices[(1, 1, 0)]["type"], "tangential")
+        self.assertEqual(by_indices[(1, 1, 1)]["type"], "oblique")
+        self.assertAlmostEqual(by_indices[(1, 0, 0)]["frequency_hz"], 100.0, places=3)
+        self.assertAlmostEqual(
+            by_indices[(1, 1, 0)]["frequency_hz"], 100.0 * 2**0.5, places=3
+        )
+        self.assertAlmostEqual(
+            by_indices[(1, 1, 1)]["frequency_hz"], 100.0 * 3**0.5, places=3
+        )
+
+    def test_modes_are_sorted_and_respect_the_frequency_limit(self):
+        modes = room_mode_frequencies((343.0, 400.0, 250.0), max_frequency_hz=120.0)
+        frequencies = [mode["frequency_hz"] for mode in modes]
+        self.assertEqual(frequencies, sorted(frequencies))
+        self.assertTrue(all(f <= 120.0 for f in frequencies))
+        self.assertTrue(modes)
+
+    def test_rejects_non_positive_dimensions(self):
+        with self.assertRaises(ValueError):
+            room_mode_frequencies((0.0, 300.0, 250.0), max_frequency_hz=100.0)
+
+    def test_room_mode_traces_group_one_trace_per_type(self):
+        modes = [
+            {"frequency_hz": 40.0, "type": "axial", "indices": (1, 0, 0)},
+            {"frequency_hz": 60.0, "type": "axial", "indices": (2, 0, 0)},
+            {"frequency_hz": 70.0, "type": "tangential", "indices": (1, 1, 0)},
+        ]
+        traces = _room_mode_traces(modes, (-10.0, 10.0), "vertical")
+        names = {trace.name for trace in traces}
+        self.assertEqual(names, {"Room mode: axial", "Room mode: tangential"})
+        axial = next(trace for trace in traces if trace.name == "Room mode: axial")
+        # Two axial modes -> two (x,x,None) segments -> 6 coordinates.
+        self.assertEqual(len(axial.x), 6)
+        self.assertEqual(list(axial.x[:3]), [40.0, 40.0, None])
+        self.assertEqual(list(axial.y[:3]), [-10.0, 10.0, None])
+
+    def test_room_mode_traces_draws_horizontal_segments_for_csd(self):
+        modes = [{"frequency_hz": 55.0, "type": "axial", "indices": (1, 0, 0)}]
+        traces = _room_mode_traces(modes, (0.0, 500.0), "horizontal")
+        self.assertEqual(len(traces), 1)
+        self.assertEqual(list(traces[0].x[:3]), [0.0, 500.0, None])
+        self.assertEqual(list(traces[0].y[:3]), [55.0, 55.0, None])
+
+    def test_room_mode_traces_empty_for_no_modes_or_no_span(self):
+        self.assertEqual(_room_mode_traces(None, (0.0, 10.0), "vertical"), [])
+        self.assertEqual(_room_mode_traces([], (0.0, 10.0), "vertical"), [])
+        modes = [{"frequency_hz": 40.0, "type": "axial", "indices": (1, 0, 0)}]
+        self.assertEqual(_room_mode_traces(modes, None, "vertical"), [])
+
+    def test_cli_parses_room_dimensions(self):
+        self.assertEqual(_parse_room_dimensions("345x274x248"), (345.0, 274.0, 248.0))
+        self.assertEqual(_parse_room_dimensions("345X274X248"), (345.0, 274.0, 248.0))
+        for bad in ("345x274", "345x274x248x1", "axb x c", "0x274x248", "-1x274x248"):
+            with self.assertRaises(argparse.ArgumentTypeError):
+                _parse_room_dimensions(bad)
+
+    def test_cli_room_argument_wired_into_the_report_parser(self):
+        parser = _build_parser()
+        parsed = parser.parse_args(["report", "--room", "345x274x248"])
+        self.assertEqual(parsed.room, (345.0, 274.0, 248.0))
+        self.assertIsNone(parser.parse_args(["report"]).room)
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["report", "--room", "not-a-room"])
+
+    def _write_small_cache(self, cache: Path) -> dict:
+        sample_rate = 4000.0
+        length = 4096
+        rows = []
+        definitions = [
+            (100, [(42, 0.20), (75, 0.10)]),
+            (106, [(48, 0.16), (92, 0.10)]),
+            (112, [(58, 0.18), (110, 0.08)]),
+        ]
+        for index, (delay, modes) in enumerate(definitions, start=1):
+            rows.append(
+                {
+                    "source_index": index,
+                    "title": f"Position {index}",
+                    "uuid": f"uuid-{index}",
+                    "sample_rate": sample_rate,
+                    "start_time_seconds": -0.025,
+                    "impulse": _synthetic_ir(sample_rate, length, delay, modes),
+                }
+            )
+        write_cache(cache, rows, {"test": True})
+        results_path = cache / "search-results.json"
+        return {
+            "results_path": results_path,
+            "result": run_search(
+                cache,
+                results_path,
+                SearchOptions(
+                    band=(25.0, 150.0),
+                    delay_range_ms=(-2.0, 2.0, 1.0),
+                    gain_range_db=(-1.0, 1.0, 1.0),
+                    ppo=24,
+                ),
+            ),
+        }
+
+    def test_report_overlays_room_modes_when_requested(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cache = root / "cache"
+            info = self._write_small_cache(cache)
+            output = root / "report.html"
+            build_report(
+                cache,
+                info["results_path"],
+                output,
+                top=2,
+                limit=3,
+                room_dimensions_cm=(343.0, 400.0, 250.0),
+            )
+            page = output.read_text()
+            self.assertIn("Room mode: axial", page)
+            self.assertIn("Room 343", page)
+            # The decay figures must remain non-zoomable but stop being fully
+            # static, since a static plot can't take legend clicks either.
+            self.assertIn('"fixedrange":true', page)
+
+    def test_report_omits_room_modes_by_default(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cache = root / "cache"
+            info = self._write_small_cache(cache)
+            output = root / "report.html"
+            build_report(cache, info["results_path"], output, top=2, limit=3)
+            page = output.read_text()
+            self.assertNotIn("Room mode:", page)
+            self.assertNotIn("theoretical rigid-box mode frequencies", page)
 
 
 if __name__ == "__main__":
