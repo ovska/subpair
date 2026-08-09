@@ -26,10 +26,10 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
-def _at_least_three(value: str) -> int:
+def _at_least_two(value: str) -> int:
     parsed = int(value)
-    if parsed < 3:
-        raise argparse.ArgumentTypeError("must be at least 3")
+    if parsed < 2:
+        raise argparse.ArgumentTypeError("must be at least 2")
     return parsed
 
 
@@ -62,8 +62,8 @@ def _parse_indices(value: str) -> list[int]:
         result = [int(token.strip()) for token in value.split(",") if token.strip()]
     except ValueError as exc:
         raise ValueError("--indices must be a comma-separated list of integers") from exc
-    if len(result) < 3 or any(index < 1 for index in result) or len(set(result)) != len(result):
-        raise ValueError("--indices must contain at least 3 distinct positive indices")
+    if len(result) < 2 or any(index < 1 for index in result) or len(set(result)) != len(result):
+        raise ValueError("--indices must contain at least 2 distinct positive indices")
     return result
 
 
@@ -93,7 +93,7 @@ def _build_parser() -> argparse.ArgumentParser:
     fetch.add_argument("--url", default=DEFAULT_REW_URL, help="REW API root URL")
     fetch.add_argument("--cache", type=Path, default=DEFAULT_CACHE, help="cache directory")
     selection = fetch.add_mutually_exclusive_group()
-    selection.add_argument("--count", type=_at_least_three, help="use the first N loaded measurements")
+    selection.add_argument("--count", type=_at_least_two, help="use the first N loaded measurements")
     selection.add_argument("--indices", help="comma-separated REW indices to use")
     fetch.add_argument("--timeout", type=float, default=15.0, help="HTTP timeout in seconds")
 
@@ -194,7 +194,10 @@ def _build_parser() -> argparse.ArgumentParser:
             "compute parametric modal decomposition (matrix-pencil pole "
             "estimation, jointly across every solo measurement): per-pair "
             "high-Q resonance metrics reported as diagnostics only, off by "
-            "default (default: off)"
+            "default (default: off). Still experimental and not fully "
+            "tested against real captures -- treat its output with "
+            "skepticism, especially with few measurements, where joint "
+            "pole persistence requires near-unanimous agreement"
         ),
     )
     search.add_argument(
@@ -295,8 +298,8 @@ def _fetch(args: argparse.Namespace) -> int:
         indices = list(range(1, args.count + 1))
     else:
         indices = list(range(1, len(summaries) + 1))
-    if len(indices) < 3:
-        raise RewApiError(f"At least 3 measurements are required, selected {len(indices)}")
+    if len(indices) < 2:
+        raise RewApiError(f"At least 2 measurements are required, selected {len(indices)}")
     if max(indices) > len(summaries):
         raise RewApiError(
             f"Selected index {max(indices)}, but REW has only {len(summaries)} measurements"

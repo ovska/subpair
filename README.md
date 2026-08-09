@@ -16,7 +16,10 @@ python -m pip install -e .
 ```
 
 Start REW's API server (default `http://127.0.0.1:4735`) and load at least
-three solo measurements made with the same loopback timing reference. Then:
+two solo measurements made with the same loopback timing reference (with
+only two, there's exactly one possible pair — `search` still runs the full
+scoring/EQ/diagnostic pipeline on it, just with nothing to rank it against).
+Then:
 
 ```sh
 subpair fetch --count 12
@@ -352,6 +355,19 @@ every solo measurement, the same requirement `search` already has for delay
 alignment. If the retained pole count looks implausibly low, or the report's
 warnings mention a high discard fraction, treat the modal metrics for that
 search with real skepticism rather than as a settled number.
+
+**`--modal` is still experimental and not fully tested against real
+captures** — validation so far is mostly synthetic fixtures plus a handful of
+real-world spot checks, not a broad survey of rooms/capture conditions.
+`estimate_room_poles`'s joint persistence gate (`measurement_persistence_fraction`,
+default 60%) needs near-unanimous agreement across solo measurements, which
+gets stricter the fewer of them there are — with only 2, both must agree,
+so a real mode that's weakly excited at one position, or two positions whose
+individually-detected peaks simply don't line up, can both legitimately
+report `modal_signature.valid: false` with no further explanation of which
+case occurred. Prefer more solo measurements, and cross-check against
+`--room`'s geometric eigenfrequencies, before trusting an empty or
+suspiciously sparse modal signature as a real "no significant modes" result.
 
 Relative SPL is the energy-mean in-band SPL after applying the corresponding
 raw or post-EQ headroom, so it compares equal maximum driver drive rather than
