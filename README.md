@@ -284,11 +284,33 @@ to fall a configured margin below the direct sound). Aggregate per pair:
 high-Q pole far enough below the direct sound is not audible and must not
 inflate the count; reported at two gate levels, -15 and -20 dB, so the
 metric's sensitivity to the threshold is visible), `Q_max` with its
-`(f, Q, L)` triple, and `sum_modal_energy_db`, a total-stored-energy proxy
-over the gated modes. Every pair's fit also carries a robustness check: the
+`(f, Q, L)` triple, `sum_modal_energy_db`, a total-stored-energy proxy over
+the gated modes, and `ringing_ms` — `max(t_audible_n)` over *every* retained
+mode, not just the Q-gated ones (a moderate-Q mode ringing loudly is still
+audible ringing even if it never counts toward `n_highQ`). This is computed
+both for the raw sum (`modal`) and, independently, for the sum after applying
+its already-fitted EQ bank (`post_eq_modal` — the filters are held fixed, not
+re-derived, matching how the rest of the pipeline treats a chosen EQ as fixed
+once selected). Every pair's raw fit also carries a robustness check: the
 fraction of a small ±0.5 ms timing / ±10 cm placement-equivalent / ±1 dB gain
 neighbourhood in which `n_highQ` holds at its nominal value, since a modal
 advantage that evaporates under a little drift is not a real advantage.
+
+`ringing_ms` is a better "how much does this pair audibly ring" answer than
+`raw_tail_ms`/`post_eq_tail_ms` (a fixed -20 dB-from-local-peak CSD envelope
+crossing in a 1/3-octave band): it's referenced to the actual direct-sound
+level rather than an arbitrary local peak, and it isn't blurred across modes
+narrower than a fractional-octave band — the same resolution problem the
+"Method" section above describes for Schroeder decay. `subpair` does not
+replace the CSD-based tail outright, since it is cheap and always available
+while modal estimation is heavier and can fail (LTI violations, a too-short
+capture, insufficient pole persistence); instead, `effective_tail_ms`/
+`post_eq_effective_tail_ms` — what the ranking table's and CLI's "Tail"
+column actually show — use that pair's own `ringing_ms` whenever its modal
+fit is valid, and fall back to the CSD tail otherwise. These two fields are
+always present regardless of `--modal`; `effective_tail_is_modal`/
+`post_eq_effective_tail_is_modal` record which source produced the value, and
+the report marks a modal-sourced value with "(modal)" in the pair summary.
 
 These metrics are diagnostic-only by default: they do not affect `score_db`
 or `post_eq_score_db`, and are never a hidden tie-breaker. `--modal-tiebreak

@@ -527,7 +527,11 @@ def _ranking_table(
     score_key = "post_eq_relative_score_db" if eq else "relative_score_db"
     dip_key = "post_eq_dip_db" if eq else "dip_db"
     excess_key = "post_eq_excess_gd_ms" if eq else "excess_gd_ms"
-    tail_key = "post_eq_tail_ms" if eq else "raw_tail_ms"
+    # effective_tail_ms/post_eq_effective_tail_ms are the modal-derived
+    # audible-ringing time (max t_audible_n across a pair's own valid modal
+    # fit) when available, else the original CSD-based envelope decay time --
+    # see engine.py's settings.ranking.effective_tail documentation.
+    tail_key = "post_eq_effective_tail_ms" if eq else "effective_tail_ms"
     headroom_key = "post_eq_headroom_db" if eq else "headroom_db"
     low_end_power_key = (
         "post_eq_relative_low_end_power_db" if eq else "relative_low_end_power_db"
@@ -811,6 +815,8 @@ def build_report(
         "dip_db",
         "post_eq_dip_db",
         "raw_tail_ms",
+        "effective_tail_ms",
+        "post_eq_effective_tail_ms",
         "post_eq_excess_gd_ms",
         "post_eq_relative_spl_db",
         "eq_filter_count",
@@ -860,6 +866,11 @@ def build_report(
     if int(results.get("format_version", 0)) < 20:
         raise ReportError(
             "Search results predate usable-output scoring; "
+            "run 'subpair search' again"
+        )
+    if int(results.get("format_version", 0)) < 22:
+        raise ReportError(
+            "Search results predate the modal-aware effective tail metric; "
             "run 'subpair search' again"
         )
     if any(
@@ -935,6 +946,23 @@ def build_report(
         "to the magnitude comparisons, final summed response, scoring "
         "inputs, low-end power, and Relative SPL."
     )
+    any_modal_tail = any(
+        pair.get("effective_tail_is_modal") or pair.get("post_eq_effective_tail_is_modal")
+        for pair in pairs
+    )
+    tail_note = (
+        "Tail is this pair's modal-derived audible-ringing time (worst-case "
+        "time for any detected room mode to fall below the audibility margin "
+        "relative to direct sound; marked “(modal)” in the pair "
+        "summary) when this pair's own --modal fit succeeded, else the "
+        "original CSD-based 1/3-octave envelope decay time. Both are "
+        "diagnostics."
+        + (
+            " See the “Modal analysis” section below for per-mode detail."
+            if any_modal_tail
+            else ""
+        )
+    )
     detail_sections = []
     for pair in pairs:
         key = pair_key(pair)
@@ -959,14 +987,16 @@ def build_report(
             f"residual dip {pair['dip_db']:.3f} dB · "
             f"excess GD {pair['excess_gd_ms']:.3f} ms · "
             f"peak {pair['excess_gd_peak_ms']:.2f} ms · "
-            f"tail {pair['raw_tail_ms']:.1f} ms"
+            f"tail {pair['effective_tail_ms']:.1f} ms"
+            + (" (modal)" if pair.get("effective_tail_is_modal") else "")
             if raw
             else (
                 f"EQ’d score {pair['post_eq_relative_score_db']:+.2f} dB · "
                 f"residual dip {pair['post_eq_dip_db']:.3f} dB · "
                 f"excess GD {pair['post_eq_excess_gd_ms']:.3f} ms · "
                 f"peak {pair['post_eq_excess_gd_peak_ms']:.2f} ms · "
-                f"tail {pair['post_eq_tail_ms']:.1f} ms"
+                f"tail {pair['post_eq_effective_tail_ms']:.1f} ms"
+                + (" (modal)" if pair.get("post_eq_effective_tail_is_modal") else "")
             )
         )
         peq_html = ""
@@ -1158,6 +1188,7 @@ details {{ margin:22px 0; }} details pre {{ overflow:auto; color:var(--muted); }
 <p>{score_formula_note}</p>
 <p>{headroom_note}</p>
 <p>Low-end power weights the broad response through 100 Hz by the amplifier/excursion cost of producing pressure at each frequency (+12.04 dB per octave downward). Excess GD and tail remain diagnostics; they do not alter Score.</p>
+<p>{tail_note}</p>
 {f'<p>{eq_notes}</p>' if eq_notes else ''}
 <p>CSD overlay (in each pair's excess-GD and decay charts): excess GD with common delay removed; a vertical line is frequency-independent delay.</p>
 </div></details>

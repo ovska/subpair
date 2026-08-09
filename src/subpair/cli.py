@@ -330,7 +330,7 @@ def _print_ranking(result: dict, top: int) -> None:
                 f"{row['post_eq_excess_gd_ms' if eq else 'excess_gd_ms']:>9.3f}  "
                 f"{row['post_eq_excess_gd_tail_ms' if eq else 'excess_gd_tail_ms']:>11.3f}  "
                 f"{row['post_eq_excess_gd_peak_ms' if eq else 'excess_gd_peak_ms']:>7.3f}  "
-                f"{row['post_eq_tail_ms' if eq else 'raw_tail_ms']:>7.1f}  "
+                f"{row['post_eq_effective_tail_ms' if eq else 'effective_tail_ms']:>7.1f}  "
                 f"{row['post_eq_relative_low_end_power_db' if eq else 'relative_low_end_power_db']:>+8.2f}  "
                 f"{row['post_eq_relative_spl_db' if eq else 'relative_spl_db']:>+7.2f}"
             )

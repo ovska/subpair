@@ -543,13 +543,26 @@ def mode_metrics(
 def aggregate_modal_metrics(
     modes: Sequence[dict[str, Any]], options: ModalOptions
 ) -> dict[str, Any]:
-    """``n_highQ`` (at every configured gate), the worst offender, and stored energy.
+    """``n_highQ`` (at every configured gate), the worst offender, stored energy,
+    and ``ringing_ms``.
 
     Gating is on *both* Q and level: a high-Q pole far enough below the direct
     sound is not audible and must not inflate the count. ``sum_modal_energy_db``
     uses only the primary gate so it stays comparable across pairs; the other
     configured gates are reported purely to show the metric's sensitivity to
     the threshold, per the design brief.
+
+    ``ringing_ms`` is ``max(t_audible_n)`` over *every* retained mode (not
+    just the Q-gated ones -- a moderate-Q mode ringing loudly for a while is
+    still audible ringing even if it never counts toward ``n_highQ``), i.e.
+    the worst-case time for this pair's excitation to fall below the
+    audibility margin relative to its own direct sound. Unlike a fixed
+    -20 dB-from-local-peak CSD envelope crossing in a 1/3-octave band
+    (``dsp.csd_style_decay``'s ``raw_tail_ms``/``post_eq_tail_ms``), this is
+    referenced to the actual direct-sound level of the same sum and isn't
+    blurred across modes narrower than a fractional-octave band -- see
+    ``PLAN.md`` for the comparison this was chosen over. It is ``None`` when
+    no mode survived the noise-floor gate in ``mode_metrics``.
     """
     by_gate: dict[str, int] = {}
     for gate_db in options.level_gates_db:
@@ -578,6 +591,7 @@ def aggregate_modal_metrics(
         q_max = 0.0
         q_max_triple = None
         sum_modal_energy_db = None
+    ringing_ms = 1000.0 * max(m["t_audible_s"] for m in modes) if modes else None
     return {
         "modes": modes,
         "n_high_q": len(primary_gated),
@@ -585,6 +599,7 @@ def aggregate_modal_metrics(
         "q_max": q_max,
         "q_max_triple": q_max_triple,
         "sum_modal_energy_db": sum_modal_energy_db,
+        "ringing_ms": ringing_ms,
         "high_q_threshold": options.high_q_threshold,
         "primary_gate_db": options.primary_gate_db,
     }
