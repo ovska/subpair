@@ -33,6 +33,7 @@ SEARCH_ARGS=(
   --score-dip-weight 1
   --top 8
   --low-shelf on
+  --modal on
 )
 
 generate_report() {
@@ -54,7 +55,8 @@ generate_report() {
     --results "${results_path}" \
     --output "${report_path}" \
     --top 5 \
-    --limit 15
+    --limit 15 \
+    --room 345x274x248
 }
 
 generate_report dsp
