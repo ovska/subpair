@@ -336,13 +336,29 @@ def _fetch(args: argparse.Namespace) -> int:
     return 0
 
 
+def _format_tail(row: dict, eq: bool) -> str:
+    """This pair's 'Tail' cell: dB (worst mode's level vs. direct sound) when
+    the source is modal, else ms (CSD envelope decay time). ringing_ms
+    saturates at 0 for every mode below the audibility margin -- a
+    well-controlled room can do that for every pair -- so the dB figure,
+    which keeps varying below that floor, is shown instead whenever it's
+    available; see engine.py's settings.ranking.effective_tail.
+    """
+    is_modal = row["post_eq_effective_tail_is_modal" if eq else "effective_tail_is_modal"]
+    if is_modal:
+        value = row["post_eq_effective_tail_db" if eq else "effective_tail_db"]
+        return f"{value:>+6.1f}dB"
+    value = row["post_eq_effective_tail_ms" if eq else "effective_tail_ms"]
+    return f"{value:>6.1f}ms"
+
+
 def _print_ranking(result: dict, top: int) -> None:
     def print_mode(rows: list[dict], eq: bool) -> None:
         label = "EQ'd" if eq else "Raw"
         print(f"\n{label} ranking")
         print(
             "Score dB  Pair     Pol   Delay ms  Gain dB  Headroom  Dip dB  Excess ms  "
-            "Excess95 ms  Peak ms  Tail ms  LE power  Rel SPL"
+            "Excess95 ms  Peak ms      Tail  LE power  Rel SPL"
         )
         for row in rows[:top]:
             pair = f"{row['first']}+{row['second']}"
@@ -356,7 +372,7 @@ def _print_ranking(result: dict, top: int) -> None:
                 f"{row['post_eq_excess_gd_ms' if eq else 'excess_gd_ms']:>9.3f}  "
                 f"{row['post_eq_excess_gd_tail_ms' if eq else 'excess_gd_tail_ms']:>11.3f}  "
                 f"{row['post_eq_excess_gd_peak_ms' if eq else 'excess_gd_peak_ms']:>7.3f}  "
-                f"{row['post_eq_effective_tail_ms' if eq else 'effective_tail_ms']:>7.1f}  "
+                f"{_format_tail(row, eq):>8}  "
                 f"{row['post_eq_relative_low_end_power_db' if eq else 'relative_low_end_power_db']:>+8.2f}  "
                 f"{row['post_eq_relative_spl_db' if eq else 'relative_spl_db']:>+7.2f}"
             )

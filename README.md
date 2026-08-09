@@ -279,22 +279,32 @@ Estimation is two-stage:
 Per retained mode, `subpair` reports `f_n` (Hz), `T60_n` (s), `Q_n`, `L_n`
 (initial modal level in dB relative to the same sum's direct-sound peak — the
 quantity delay/gain actually controls), and `t_audible_n` (time for the mode
-to fall a configured margin below the direct sound). Aggregate per pair:
-`n_highQ` (count of modes with `Q > 16` *and* `L_n` above a level gate — a
-high-Q pole far enough below the direct sound is not audible and must not
-inflate the count; reported at two gate levels, -15 and -20 dB, so the
-metric's sensitivity to the threshold is visible), `Q_max` with its
-`(f, Q, L)` triple, `sum_modal_energy_db`, a total-stored-energy proxy over
-the gated modes, and `ringing_ms` — `max(t_audible_n)` over *every* retained
-mode, not just the Q-gated ones (a moderate-Q mode ringing loudly is still
-audible ringing even if it never counts toward `n_highQ`). This is computed
-both for the raw sum (`modal`) and, independently, for the sum after applying
-its already-fitted EQ bank (`post_eq_modal` — the filters are held fixed, not
-re-derived, matching how the rest of the pipeline treats a chosen EQ as fixed
-once selected). Every pair's raw fit also carries a robustness check: the
-fraction of a small ±0.5 ms timing / ±10 cm placement-equivalent / ±1 dB gain
-neighbourhood in which `n_highQ` holds at its nominal value, since a modal
-advantage that evaporates under a little drift is not a real advantage.
+to fall a configured margin below the direct sound). The 0 dB reference for
+`L_n` is the RMS of the band-limited direct arrival over a window spanning at
+least one period of the lowest in-band mode (floored at 20 ms), not a single
+peak sample in a fixed 20 ms window: the lowest in-band mode can have a
+period longer than 20 ms (e.g. 1/18 Hz ≈ 55.6 ms), so a fixed 20 ms window
+doesn't even complete one cycle of it and a peak sample within it mostly
+measures the band-limited impulse's broadband onset transient — which a
+handful of narrowband poles cannot represent — rather than any one mode's
+sustained level. Aggregate per pair: `n_highQ` (count of modes with `Q > 16`
+*and* `L_n` above a level gate — a high-Q pole far enough below the direct
+sound is not audible and must not inflate the count; reported at two gate
+levels, -15 and -20 dB, so the metric's sensitivity to the threshold is
+visible), `Q_max` with its `(f, Q, L)` triple, `sum_modal_energy_db`, a
+total-stored-energy proxy over the gated modes, `ringing_ms` —
+`max(t_audible_n)` over *every* retained mode, not just the Q-gated ones (a
+moderate-Q mode ringing loudly is still audible ringing even if it never
+counts toward `n_highQ`) — and `worst_mode_level_db`, `max(L_n)` over that
+same set: the loudest mode's level regardless of whether it actually crosses
+the audibility margin. This is computed both for the raw sum (`modal`) and,
+independently, for the sum after applying its already-fitted EQ bank
+(`post_eq_modal` — the filters are held fixed, not re-derived, matching how
+the rest of the pipeline treats a chosen EQ as fixed once selected). Every
+pair's raw fit also carries a robustness check: the fraction of a small ±0.5
+ms timing / ±10 cm placement-equivalent / ±1 dB gain neighbourhood in which
+`n_highQ` holds at its nominal value, since a modal advantage that evaporates
+under a little drift is not a real advantage.
 
 `ringing_ms` is a better "how much does this pair audibly ring" answer than
 `raw_tail_ms`/`post_eq_tail_ms` (a fixed -20 dB-from-local-peak CSD envelope
@@ -305,12 +315,21 @@ narrower than a fractional-octave band — the same resolution problem the
 replace the CSD-based tail outright, since it is cheap and always available
 while modal estimation is heavier and can fail (LTI violations, a too-short
 capture, insufficient pole persistence); instead, `effective_tail_ms`/
-`post_eq_effective_tail_ms` — what the ranking table's and CLI's "Tail"
-column actually show — use that pair's own `ringing_ms` whenever its modal
-fit is valid, and fall back to the CSD tail otherwise. These two fields are
-always present regardless of `--modal`; `effective_tail_is_modal`/
-`post_eq_effective_tail_is_modal` record which source produced the value, and
-the report marks a modal-sourced value with "(modal)" in the pair summary.
+`post_eq_effective_tail_ms` use that pair's own `ringing_ms` whenever its
+modal fit is valid, and fall back to the CSD tail otherwise. These two fields
+are always present regardless of `--modal`; `effective_tail_is_modal`/
+`post_eq_effective_tail_is_modal` record which source produced the value.
+
+The ranking table's and CLI's "Tail" column, though, shows
+`effective_tail_db`/`post_eq_effective_tail_db` (that pair's own
+`worst_mode_level_db`/`post_eq_modal`'s equivalent) instead of the ms value
+whenever the source is modal, falling back to the ms value (with no dB
+equivalent) otherwise: `ringing_ms` saturates at 0 the instant a mode's level
+drops below `audible_margin_db`, which a well-controlled room with no strong
+modes can do for every single pair — a wall of identical, uninformative 0 ms
+values. The dB figure keeps varying below that floor, so pairs stay
+distinguishable even when none of them cross the audibility margin. The
+report marks a modal-sourced value with "(modal)" in the pair summary.
 
 These metrics are diagnostic-only by default: they do not affect `score_db`
 or `post_eq_score_db`, and are never a hidden tie-breaker. `--modal-tiebreak
@@ -387,18 +406,25 @@ frequency-domain charts (magnitude, excess GD, and their overview panels)
 and horizontal lines on the CSD heatmaps, since that plot's y-axis is
 frequency. Modes are computed from the standard rigid-box formula
 `f(nx,ny,nz) = (c/2) * sqrt((nx/L)^2 + (ny/W)^2 + (nz/H)^2)` up to the
-search band's upper edge, and classified by how many of the three integer
-indices are nonzero: axial (one wall pair, solid line), tangential (two wall
-pairs, dashed), or oblique (all three, dotted). This is a purely geometric
-reference for a perfectly rigid, empty box — it does not know about
-absorption, furniture, openings, or non-rectangular geometry, so treat it as
-a rough guide to where axial modes are *likely* to fall, not a prediction of
-the room's actual measured behaviour; `subpair search --modal on` measures
-the room's real poles directly from the cached impulse responses instead
-(see below) and is the more trustworthy source when the two disagree.
+search band's upper edge and up to 3rd order on each axis index (`nx`/`ny`/
+`nz` each capped at 3 — past low single digits, higher-order modes are both
+weak in a typical room and numerous enough, particularly in tangential/
+oblique combinations, to clutter the chart), and classified by how many of
+the three integer indices are nonzero: axial (one wall pair, solid line),
+tangential (two wall pairs, dashed), or oblique (all three, dotted). This is
+a purely geometric reference for a perfectly rigid, empty box — it does not
+know about absorption, furniture, openings, or non-rectangular geometry, so
+treat it as a rough guide to where axial modes are *likely* to fall, not a
+prediction of the room's actual measured behaviour; `subpair search --modal
+on` measures the room's real poles directly from the cached impulse
+responses instead (see below) and is the more trustworthy source when the
+two disagree.
 
 Each mode type is its own legend entry (`Room mode: axial` etc.); click it to
-show or hide that type independently, on every chart on the page. Omitting
+show or hide that type independently, on every chart on the page. Only axial
+modes are drawn by default — tangential and oblique modes are usually much
+weaker and numerous enough to clutter the chart on their own — but both stay
+in the legend and one click makes either visible everywhere. Omitting
 `--room` leaves every chart exactly as before — this is a purely additive,
 opt-in visual aid with no effect on ranking, scoring, or any other report
 content.

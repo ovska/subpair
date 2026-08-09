@@ -333,6 +333,22 @@ def _compute_pair(
         post_ringing_ms if post_ringing_ms is not None else diagnostics["post_eq_tail_ms"]
     )
     diagnostics["post_eq_effective_tail_is_modal"] = post_ringing_ms is not None
+    # ringing_ms saturates at 0 the instant a mode's level drops below
+    # audible_margin_db, which a well-controlled room can do for every pair --
+    # a wall of identical 0 ms values that carries no ranking information.
+    # effective_tail_db carries on below that floor: it's the loudest
+    # surviving mode's level relative to direct sound (modal.
+    # aggregate_modal_metrics' worst_mode_level_db), so pairs stay
+    # distinguishable even when none of them cross the audibility margin. Only
+    # populated when the source is modal; the CSD fallback has no dB analogue.
+    diagnostics["effective_tail_db"] = (
+        raw_modal.get("worst_mode_level_db") if diagnostics["effective_tail_is_modal"] else None
+    )
+    diagnostics["post_eq_effective_tail_db"] = (
+        post_modal.get("worst_mode_level_db")
+        if diagnostics["post_eq_effective_tail_is_modal"]
+        else None
+    )
     return first, second, polarity, delay_ms, gain_db, diagnostics
 
 
@@ -503,7 +519,7 @@ def run_search(
     ]
 
     result = {
-        "format_version": 22,
+        "format_version": 23,
         "measurement_count": len(measurements),
         "sample_rate": measurements[0].sample_rate,
         "response_length": measurements[0].impulse.size,
@@ -562,10 +578,18 @@ def run_search(
                     "- both lower-is-better - is inserted strictly after the "
                     "primary usable-output score, before the deterministic "
                     "pair-index tie-break; off by default. ringing_ms feeds "
-                    "effective_tail_ms/post_eq_effective_tail_ms (see "
-                    "'effective_tail' below) whenever a pair's own fit is "
-                    "valid. See modal_signature for the pooled room pole set "
-                    "this was computed against"
+                    "effective_tail_ms/post_eq_effective_tail_ms and "
+                    "worst_mode_level_db feeds effective_tail_db/"
+                    "post_eq_effective_tail_db (see 'effective_tail' below) "
+                    "whenever a pair's own fit is valid. The 0 dB reference "
+                    "for level_db/worst_mode_level_db is the RMS of the "
+                    "band-limited direct arrival over a window spanning at "
+                    "least one period of the lowest in-band mode (floored at "
+                    "20 ms), not a single peak sample in a fixed 20 ms window "
+                    "-- a peak sample in a window shorter than the mode's own "
+                    "period measures the onset transient, not the mode. See "
+                    "modal_signature for the pooled room pole set this was "
+                    "computed against"
                 ),
                 **(
                     {
@@ -687,8 +711,7 @@ def run_search(
                     "optimum; wider is more robust to real-world drift"
                 ),
                 "effective_tail": (
-                    "effective_tail_ms/post_eq_effective_tail_ms are the value "
-                    "shown in the report's/CLI's 'Tail' column: this pair's "
+                    "effective_tail_ms/post_eq_effective_tail_ms are this pair's "
                     "modal.ringing_ms/post_eq_modal.ringing_ms (worst-case time "
                     "for any detected mode to fall below the audibility margin "
                     "relative to direct sound) when that pair's own --modal fit "
@@ -697,7 +720,17 @@ def run_search(
                     "effective_tail_is_modal/post_eq_effective_tail_is_modal "
                     "record which source was used for that pair. Always "
                     "present regardless of --modal; a diagnostic, not a score "
-                    "component"
+                    "component. The report's/CLI's 'Tail' column shows "
+                    "effective_tail_db/post_eq_effective_tail_db (this pair's "
+                    "modal.worst_mode_level_db/post_eq_modal.worst_mode_level_db, "
+                    "the loudest detected mode's level relative to direct sound, "
+                    "in dB) instead of the ms value whenever the source is "
+                    "modal: ringing_ms saturates at 0 for every mode below the "
+                    "audibility margin, which a well-controlled room can do for "
+                    "every pair, so the ms value alone can be uninformative; "
+                    "the dB value keeps varying below that floor. Falls back to "
+                    "the ms value, with no dB equivalent, when the source is "
+                    "the CSD envelope decay time"
                 ),
                 "low_end_power": {
                     "fields": {
