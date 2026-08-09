@@ -1178,3 +1178,287 @@ still bump for Part A, independently).
   verify` section.
 - `CLAUDE.md`: update the `dsp.py`/architecture summary once implemented, per its own
   instruction to keep pace with `PLAN.md`'s status.
+
+---
+
+# Modal decay and high-Q resonance metrics
+
+**Status: Stage 1/Stage 2 estimation, per-pair metrics, an opt-in tie-break, and
+report visualization landed as a new `src/subpair/modal.py` module.**
+`format_version` bumped to `21`. Multi-mic-position `decoupling_ratio` and an
+ESPRIT estimator are explicit non-goals of this pass — see below.
+
+## Summary
+
+Current scoring (null depth -> non-minimum-phase residual -> excess group delay)
+captures magnitude and phase pathology but says nothing about stored energy. Two
+candidate pairs with near-identical smoothed frequency response can differ
+substantially in how hard they drive room modes: delay/polarity/gain cannot change
+a mode's frequency or damping (those are properties of the room), but they change
+how strongly a given sum excites it, so the tail can start lower and fall below
+audibility sooner even with an identical decay slope. This adds that as a
+separate, explicitly diagnostic axis — never conflated into the one scalar
+usable-output score — via parametric modal decomposition rather than
+Schroeder-per-band decay: Schroeder integration in fractional-octave bands cannot
+separate two modes closer together than the band, and a Q~9 mode at 50 Hz has a
+modal bandwidth (~5 Hz) narrower than 1/6-octave smoothing (~8.4 Hz) at that
+frequency.
+
+## Design origin and scope adjustments from the original brief
+
+The originating design brief (preserved here for the reasoning it contains, not
+reproduced verbatim) specified ESPRIT-or-matrix-pencil pole estimation, a
+two-stage joint/per-pair fit, an extension of "the existing perturbation
+analysis," and multi-*mic*-position decoupling. Two of those needed to be
+reconciled against what this codebase actually is before implementation:
+
+- **No pre-existing perturbation/robustness sweep.** Grepping the codebase
+  turned up nothing: `search`'s plateau diagnostics (`delay_plateau_ms`/
+  `gain_plateau_db`, `engine._plateau_width`) are a 1-D walk along the already-
+  evaluated grid, not a perturbation neighbourhood. The modal robustness check
+  (`modal.modal_robustness`) is therefore new, not an extension, and is scoped
+  narrowly to what this codebase can actually perturb: `delay_ms`/`gain_db` are
+  continuous search axes, `polarity` is discrete and held fixed, and there is no
+  continuous placement/position axis at all (a cached measurement is a fixed,
+  already-captured solo position). "±10 cm placement uncertainty" is therefore
+  folded into the one continuous axis that stands in for it — delay — via RSS
+  with the ±0.5 ms timing jitter (`about 0.29 ms at 343 m/s`), not modelled as
+  an independent axis. This is documented as an approximation in
+  `modal.modal_robustness`'s docstring, not silently assumed.
+- **No multi-mic-position data model.** `CachedMeasurement.position` is the
+  *sub* position index (one measurement per solo sub placement, at whatever
+  single mic seat the whole cache was captured at); there is no axis in
+  `cache.py`/`manifest.json` for multiple *listening* positions at fixed sub
+  placements. The brief's "if solo measurements exist at multiple mic
+  positions ... `decoupling_ratio`" therefore has no data to compute from in
+  this codebase as it exists today, and is an explicit non-goal below rather
+  than a partially-implemented field. The brief's "solo positions" invariance
+  check (Stage 1 pole agreement across solo measurements), by contrast, maps
+  exactly onto this codebase's actual solo-sub-position measurements and is
+  fully implemented (`RoomModalSignature.per_measurement`, the report's
+  invariance-check plot).
+- **Matrix-pencil, not ESPRIT.** The brief allowed either ("matrix-pencil or
+  ESPRIT ... Prony is acceptable but noise-sensitive; prefer matrix-pencil").
+  Matrix-pencil was implemented; ESPRIT was not, since matrix-pencil already
+  meets the brief's own stated preference and adding a second estimator with no
+  synthetic case where it demonstrably outperforms matrix-pencil would be
+  unjustified complexity. Revisit only if real-world captures show matrix-pencil
+  estimation failures ESPRIT would plausibly avoid.
+
+## Method
+
+1. **Preprocess.** Each candidate signal (a solo measurement's impulse for
+   Stage 1, or a candidate pair sum's impulse for Stage 2) is band-limited to
+   18-200 Hz and decimated to 500 Hz for estimator conditioning
+   (`modal._bandlimited_decimated_impulse`). This deviates from the brief's
+   literal "band-limit the complex spectrum with a mask, IFFT" in one respect,
+   found necessary during implementation (Phase 0 below): a hard
+   frequency-domain mask applied to an impulsive signal exhibits Gibbs-ringing
+   that decays as `~1/t`, not exponentially, so it does not damp out within any
+   realistic fit window and is trivially mistaken for an extremely high-Q pole.
+   A zero-phase Butterworth bandpass (`scipy.signal.sosfiltfilt`, mirroring
+   `dsp.csd_style_decay`'s existing filtering convention) band-limits with a
+   fast-decaying impulse response instead, at the cost of a finite (not brick-
+   wall) transition band — acceptable because `_eigenvalues_to_modes` already
+   discards any resulting pole outside the true `18-200` Hz band regardless of
+   how it arose.
+2. **Window.** `DIRECT_REFERENCE_WINDOW_SECONDS` (20 ms) after each signal's
+   band-limited peak is reserved for `Ln`'s 0 dB reference (the brief's "fixed
+   0-20 ms energy window" alternative) and *excluded* from the pole-fitting
+   window, which starts immediately after it and covers up to
+   `ModalOptions.window_seconds` (default 600 ms, i.e. >=1.5x an assumed ~390 ms
+   worst-case T60 at 50 Hz). This split was also found necessary during
+   implementation: a bandlimited impulse's direct-arrival transient is itself
+   broadband within the analysis band and a handful of narrowband high-Q room
+   poles cannot represent it, so including it in the fit window produced a
+   spuriously poor fixed-pole-fit residual unrelated to whether the room poles
+   were actually correct.
+3. **Estimate poles.** Matrix-pencil (`modal._matrix_pencil_poles`): SVD of a
+   Hankel matrix built from the windowed segment, generalized-eigenvalue solve
+   on the top-`order` right singular vectors' row-shifted halves. Only
+   decaying (`0 < |z| < 1`), positive-frequency, in-band poles are kept
+   (`_eigenvalues_to_modes`).
+4. **Model order selection.** Swept `order_min..order_max` (default 10-60,
+   step 5); a pole is retained only if it recurs (frequency within
+   `freq_tolerance_hz`, decay rate within `decay_tolerance_fraction`) across
+   `>= order_persistence_fraction` (default 60%) of the orders tried
+   (`_measurement_consensus_poles`). The discard fraction is reported.
+
+## Joint estimation across positions
+
+- **Stage 1** (`estimate_room_poles`) pools each solo measurement's own
+  order-sweep-consensus poles across all solo measurements, retaining a pooled
+  mode only if it recurs across `>= measurement_persistence_fraction` (default
+  60%) of them — the room's modal signature, independent of which pair is
+  later evaluated. If no pole survives both gates, the signature is marked
+  `valid=False` with an explanatory warning and callers must not report modal
+  scores (`compute_pair_modal_metrics` short-circuits on this).
+- **Stage 2** (`compute_pair_modal_metrics`/`fit_mode_residues`) fixes that
+  pole set and solves one ordinary real linear least-squares fit (`a_i cos +
+  b_i sin`, envelope amplitude `sqrt(a_i^2+b_i^2)`) per candidate pair sum for
+  residues only. This is what keeps per-pair evaluation cheap: `engine.py`
+  runs it once per pair's already-chosen finalist configuration (not across
+  every shortlisted candidate, matching this codebase's existing pattern of
+  reserving expensive per-configuration work for finalists only), plus 9 more
+  fits for the robustness neighbourhood — no SVD, no order sweep, at pair time.
+- **Validity check.** `fit_mode_residues` reports `fit_r2` (1 - residual/total
+  energy); `compute_pair_modal_metrics` flags `fixed_pole_fit_flagged` when it
+  is below `ModalOptions.min_fixed_pole_fit_r2` (default 0.5) rather than
+  silently trusting a fit the fixed pole set does not actually explain.
+
+## Metrics emitted, per candidate pair
+
+Per retained mode (`modal.mode_metrics`): `frequency_hz`, `t60_s` (`6.908/alpha`),
+`q` (`pi*f*T60/6.908`), `level_db` (`Ln`, relative to the direct-sound
+reference), `t_audible_s`. A mode whose fitted level is within
+`noise_floor_margin_db` (default 10 dB) of the fit window's own noise floor is
+dropped rather than reported with fabricated confidence.
+
+Aggregate (`modal.aggregate_modal_metrics`): `n_high_q` (`Q > high_q_threshold`
+(16) *and* `level_db > primary_gate_db` (-20 dB) — gated on level so an
+inaudible high-Q pole cannot inflate the count), `n_high_q_by_gate_db` at both
+-15 and -20 dB so the threshold's sensitivity is visible, `q_max`/
+`q_max_triple`, and `sum_modal_energy_db` (`10*log10(sum(10**(L/10)/alpha))`
+over the gated modes).
+
+Robustness (`modal.modal_robustness`): fraction of a 3x3 (delay, gain)
+neighbourhood — see the scope-adjustment note above for what "position"
+uncertainty means here — in which `n_high_q` holds at its nominal value.
+
+## Scoring integration
+
+`score_db`/`post_eq_score_db` are completely untouched. `SearchOptions.modal`
+(default `False`) gates whether any of this computes at all; `--modal on`
+adds a `modal` block to each pair's diagnostics and a top-level
+`modal_signature`, but changes no ranking output. `SearchOptions.modal_tiebreak`
+(default `False`, requires `modal=True`, validated in
+`SearchOptions.__post_init__`) inserts `(n_highQ, sum_modal_energy_db)` — both
+lower-is-better — into `engine.py`'s raw/EQ sort keys strictly after the
+primary score and before the deterministic pair-index tie-break
+(`engine._modal_tiebreak_key`). A pair with no valid modal fit sorts as if it
+had the worst possible tiebreak (`(inf, inf)`), so a fit failure cannot look
+artificially good under the tiebreak.
+
+## Report output
+
+`html_report.build_report` renders a "Modal analysis" `<details>` section
+(only when `modal_signature` is present and valid) with a pole map (`f` vs
+`Q`, marker size ~ level, one colour per displayed pair, a dotted line at the
+high-Q threshold) and two invariance-check scatter plots (`f_n`/`T60_n` per
+solo position per pooled mode, dotted line at the pooled value). Each
+displayed pair's detail section additionally gets a sortable per-mode table
+(reuses the existing ranking-table click-to-sort script rather than adding new
+JS) and an `n_highQ`/stored-energy/robustness summary line. The decoupling
+scatter plot from the original brief is not implemented — it has no
+corresponding data (see the scope-adjustment note above).
+
+## Implementation phases
+
+### Phase 0: core estimator and synthetic fixtures
+
+- [x] `modal._matrix_pencil_poles`/`_eigenvalues_to_modes`, tested against
+      known-frequency/known-decay synthetic decaying sinusoids
+      (`tests/test_modal.py::MatrixPencilTests`).
+- [x] Found and fixed the brick-wall-mask Gibbs-ringing problem (see "Method"
+      above) via a Butterworth bandpass, with a regression test
+      (`PreprocessingTests::test_bandlimiting_an_impulse_decays_quickly_rather_than_ringing`).
+- [x] Found and fixed the direct-arrival-contaminates-the-fit-window problem
+      (see "Method" above) by splitting the direct-reference window from the
+      fit window (`modal._prepare_segments`), with a regression test
+      (`PairMetricsAndRobustnessTests::test_pair_metrics_report_a_mode_at_the_fixed_pole`,
+      which failed with `fit_r2 ~ 0.11` before the split and passes at
+      `fit_r2 > 0.9` after).
+
+### Phase 1: order-sweep and joint (Stage 1) estimation
+
+- [x] `_measurement_consensus_poles` (order-sweep persistence) and
+      `_cluster_candidates` (greedy frequency-sorted grouping — documented as
+      not globally optimal, but deterministic and adequate for well-separated
+      room modes).
+- [x] `estimate_room_poles` (cross-measurement pooling), tested for: a pole
+      shared by every measurement is pooled; a pole present in only one
+      measurement is not; an all-noise cache correctly reports
+      `valid=False` with a warning (`JointEstimationTests`).
+
+### Phase 2: Stage 2 residue fit and per-pair metrics
+
+- [x] `fit_mode_residues` (fixed-pole real linear least squares), tested for
+      known-amplitude recovery, phase invariance, and a deliberately wrong
+      pole set producing a poor `fit_r2` (`ResidueFitTests`).
+- [x] `mode_metrics`/`aggregate_modal_metrics`, tested against hand-computed
+      `T60`/`Q`/`level_db`/`t_audible_s`, the noise-floor discard gate, the
+      two-gate `n_highQ` sensitivity report, and `sum_modal_energy_db`'s
+      monotonicity in level and decay rate (`ModeMetricsTests`,
+      `AggregateMetricsTests`).
+- [x] `compute_pair_modal_metrics`, tested for the invalid-signature
+      short-circuit and a correct fit against a synthetic mode
+      (`PairMetricsAndRobustnessTests`).
+
+### Phase 3: robustness sweep
+
+- [x] `modal_robustness`, tested for full stability on a delay/gain-invariant
+      synthetic excitation and for correctly propagating an invalid signature.
+
+### Phase 4: engine integration
+
+- [x] `SearchOptions.modal`/`modal_tiebreak` fields with `__post_init__`
+      validation; `engine.estimate_room_poles` called once per search (not
+      per pair); `_pair_impulse`/`compute_pair_modal_metrics`/
+      `modal_robustness` called once per pair's chosen finalist.
+- [x] `_modal_tiebreak_key` and its insertion into both raw and EQ sort keys,
+      gated on `SearchOptions.modal_tiebreak`.
+- [x] `format_version` bumped to 21; `modal` settings block; top-level
+      `modal_signature`. No new `html_report.py` version guard was added,
+      since old/`--modal off` results remain fully valid to report — the
+      modal section is additive and simply omitted when absent.
+- [x] JSON-serializability audit: `write_json` uses `allow_nan=False`, so
+      every numpy-float/`inf` leak was tracked down and fixed (`fit_r2`'s
+      `EPS`-mixing, `_noise_floor_db`'s short-segment `-inf` case) rather than
+      left to fail at write time on some future edge case.
+- [x] Integration tests: `--modal on` end-to-end through `run_search` +
+      `write_json` + reload; `--modal off` omits every modal field; the CLI
+      rejects `--modal-tiebreak on --modal off` (`EngineIntegrationTests`,
+      `CliIntegrationTests`).
+
+### Phase 5: report and documentation
+
+- [x] Pole map, invariance-check plots, per-pair mode table
+      (`html_report._modal_pole_map_figure`/`_modal_invariance_figures`/
+      `_modal_mode_table`), gated on a valid `modal_signature`; integration
+      tests for both presence (`--modal on`) and absence (`--modal off`).
+- [x] `README.md`: full `--modal`/`--modal-tiebreak` section under
+      `subpair search`.
+- [x] `CLAUDE.md`: `modal.py` architecture entry, `engine.py` update, new
+      "modal metrics stay a separate, opt-in axis" invariant.
+
+## Non-goals (this pass)
+
+- Multi-mic-position `decoupling_ratio` — no data model for it exists; see
+  the scope-adjustment note above. Would need a new cache/manifest axis for
+  listening position, which is a materially larger change than this plan.
+- ESPRIT as an alternative/fallback estimator.
+- Any change to `score_db`/`post_eq_score_db` beyond the explicit, opt-in
+  `modal_tiebreak` secondary key.
+- Computing Stage 2 for every shortlisted candidate (only each pair's already-
+  selected finalist); a future pass could reconsider this if a case is found
+  where the finalist choice itself should depend on modal metrics.
+- Formal validation of `ModalOptions`' default thresholds (persistence
+  fractions, tolerances, gate levels, order range) against real captures —
+  these are the brief's own suggested defaults, exercised only against
+  synthetic fixtures so far. Revisit once real multi-position caches are
+  available, the same caveat this file already carries for the low-shelf and
+  native-resolution constants above.
+
+## Expected file changes
+
+- `src/subpair/modal.py`: new module (pole estimation, Stage 1/2, metrics,
+  robustness).
+- `src/subpair/engine.py`: `SearchOptions.modal`/`modal_tiebreak`, worker
+  wiring, tiebreak sort keys, `modal` settings block, top-level
+  `modal_signature`, `format_version` 21.
+- `src/subpair/cli.py`: `--modal`/`--modal-tiebreak` on `search`.
+- `src/subpair/html_report.py`: modal pole map/invariance/per-mode-table
+  rendering, gated on a valid `modal_signature`.
+- `tests/test_modal.py`: new module — estimator, Stage 1/2, metrics,
+  robustness, engine integration, CLI, and report tests.
+- `README.md`/`CLAUDE.md`: documented above.

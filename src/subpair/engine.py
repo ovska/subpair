@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import itertools
+import math
 import os
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
@@ -31,6 +32,8 @@ from .dsp import (
     smoothed_dip_db,
     usable_output_score_db,
 )
+from . import modal as modal_analysis
+from .modal import ModalOptions, RoomModalSignature
 
 
 @dataclass(frozen=True)
@@ -48,6 +51,12 @@ class SearchOptions:
     score_low_end_weight: float = DEFAULT_SCORE_LOW_END_WEIGHT
     score_dip_weight: float = DEFAULT_SCORE_DIP_WEIGHT
     low_shelf: bool = True
+    modal: bool = False
+    modal_tiebreak: bool = False
+
+    def __post_init__(self) -> None:
+        if self.modal_tiebreak and not self.modal:
+            raise ValueError("modal_tiebreak requires modal analysis to be enabled")
 
 
 PLATEAU_TOLERANCE_DB = 0.5
@@ -159,6 +168,8 @@ def _init_pair_worker(
     eq_options: EqOptions,
     score_low_end_weight: float,
     score_dip_weight: float,
+    modal_signature: RoomModalSignature | None,
+    modal_options: ModalOptions | None,
 ) -> None:
     """Stash shared read-only search state once per worker process.
 
@@ -173,7 +184,17 @@ def _init_pair_worker(
         eq_options=eq_options,
         score_low_end_weight=score_low_end_weight,
         score_dip_weight=score_dip_weight,
+        modal_signature=modal_signature,
+        modal_options=modal_options,
     )
+
+
+def _pair_impulse(
+    context: AnalysisContext, first: int, second: int, polarity: int, delay_ms: float, gain_db: float
+) -> np.ndarray:
+    full_sum, _ = context.sum_full(first, second, polarity, delay_ms, gain_db)
+    n_fft = 2 * (full_sum.size - 1)
+    return np.fft.irfft(full_sum, n=n_fft)
 
 
 def _compute_pair(
@@ -186,6 +207,8 @@ def _compute_pair(
     eq_options = _worker_state["eq_options"]
     score_low_end_weight = _worker_state["score_low_end_weight"]
     score_dip_weight = _worker_state["score_dip_weight"]
+    modal_signature: RoomModalSignature | None = _worker_state["modal_signature"]
+    modal_options: ModalOptions | None = _worker_state["modal_options"]
 
     configurations = _best_configurations(
         context, first, second, delays, gains, score_low_end_weight, score_dip_weight
@@ -224,6 +247,23 @@ def _compute_pair(
             -item[2],
         ),
     )
+    if modal_signature is not None and modal_options is not None:
+        # Stage 2 (fixed-pole residue fit) is a single linear solve, so this
+        # is cheap even though it runs once per pair -- see modal.py's module
+        # docstring for why the two-stage design keeps it that way.
+        impulse = _pair_impulse(context, first, second, polarity, delay_ms, gain_db)
+        pair_modal = modal_analysis.compute_pair_modal_metrics(
+            modal_signature, impulse, context.sample_rate, modal_options
+        )
+        pair_modal["robustness"] = modal_analysis.modal_robustness(
+            modal_signature,
+            lambda d, g: _pair_impulse(context, first, second, polarity, d, g),
+            context.sample_rate,
+            delay_ms,
+            gain_db,
+            modal_options,
+        )
+        diagnostics["modal"] = pair_modal
     return first, second, polarity, delay_ms, gain_db, diagnostics
 
 
@@ -258,6 +298,15 @@ def run_search(
         max_filters=options.eq_bands,
         low_shelf=options.low_shelf,
     )
+    modal_options: ModalOptions | None = None
+    modal_signature: RoomModalSignature | None = None
+    if options.modal:
+        modal_options = ModalOptions()
+        modal_signature = modal_analysis.estimate_room_poles(
+            [(row.title, row.impulse) for row in measurements],
+            context.sample_rate,
+            modal_options,
+        )
     combinations = list(itertools.combinations(range(len(measurements)), 2))
     worker_count = max(1, min((os.cpu_count() or 1) // 4, 8, len(combinations)))
     pairs: list[dict] = []
@@ -271,6 +320,8 @@ def run_search(
             eq_options,
             options.score_low_end_weight,
             options.score_dip_weight,
+            modal_signature,
+            modal_options,
         ),
     ) as executor:
         for ordinal, (first, second, polarity, delay_ms, gain_db, diagnostics) in enumerate(
@@ -290,14 +341,31 @@ def run_search(
             if progress:
                 progress(ordinal, len(combinations), f"{first + 1}+{second + 1}")
 
-    raw_order = sorted(
-        range(len(pairs)),
-        key=lambda i: (
-            -pairs[i]["score_db"],
-            pairs[i]["first"],
-            pairs[i]["second"],
-        ),
-    )
+    def _modal_tiebreak_key(pair: dict) -> tuple[float, float]:
+        """``(n_highQ, sum_modal_energy_db)``, both lower-is-better.
+
+        Fewer audible high-Q modes, then less total stored modal energy --
+        applied only when ``--modal-tiebreak`` is on, strictly after the
+        primary usable-output score (see the module docstring in ``modal.py``
+        and ``PLAN.md``: this must never outrank null suppression by default).
+        A pair with no valid modal fit sorts last among ties rather than
+        first, so a fit failure cannot look artificially good.
+        """
+        pair_modal = pair.get("modal")
+        if not pair_modal or not pair_modal.get("valid"):
+            return (math.inf, math.inf)
+        energy_db = pair_modal.get("sum_modal_energy_db")
+        return (
+            float(pair_modal.get("n_high_q", 0)),
+            float(energy_db) if energy_db is not None else -math.inf,
+        )
+
+    def _raw_sort_key(i: int) -> tuple:
+        base = (-pairs[i]["score_db"],)
+        tiebreak = _modal_tiebreak_key(pairs[i]) if options.modal_tiebreak else ()
+        return base + tiebreak + (pairs[i]["first"], pairs[i]["second"])
+
+    raw_order = sorted(range(len(pairs)), key=_raw_sort_key)
     pairs = [pairs[i] for i in raw_order]
     reference_spl = pairs[0]["spl_db"]
     reference_low_end_power = pairs[0]["low_end_power_db"]
@@ -309,14 +377,12 @@ def run_search(
         row["relative_low_end_power_db"] = float(
             row["low_end_power_db"] - reference_low_end_power
         )
-    eq_order = sorted(
-        range(len(pairs)),
-        key=lambda i: (
-            -pairs[i]["post_eq_score_db"],
-            pairs[i]["first"],
-            pairs[i]["second"],
-        ),
-    )
+    def _eq_sort_key(i: int) -> tuple:
+        base = (-pairs[i]["post_eq_score_db"],)
+        tiebreak = _modal_tiebreak_key(pairs[i]) if options.modal_tiebreak else ()
+        return base + tiebreak + (pairs[i]["first"], pairs[i]["second"])
+
+    eq_order = sorted(range(len(pairs)), key=_eq_sort_key)
     eq_pairs = [pairs[i] for i in eq_order]
     eq_reference_spl = eq_pairs[0]["post_eq_spl_db"]
     eq_reference_low_end_power = eq_pairs[0]["post_eq_low_end_power_db"]
@@ -333,6 +399,29 @@ def run_search(
             row["post_eq_low_end_power_db"] - eq_reference_low_end_power
         )
 
+    modal_signature_json = None
+    if modal_signature is not None:
+        modal_signature_json = {
+            "valid": modal_signature.valid,
+            "decimated_fs_hz": modal_signature.decimated_fs_hz,
+            "window_seconds": modal_signature.window_seconds,
+            "discard_fraction": modal_signature.discard_fraction,
+            "warnings": list(modal_signature.warnings),
+            "modes": [
+                {
+                    "frequency_hz": mode.frequency_hz,
+                    "t60_s": modal_analysis.T60_LN_RATIO / mode.decay_rate_per_s,
+                    "decay_rate_per_s": mode.decay_rate_per_s,
+                    "measurement_persistence": mode.measurement_persistence,
+                }
+                for mode in modal_signature.modes
+            ],
+            # Per solo position: each of its own (pre-pooling) consensus poles
+            # matched to a pooled-mode index, for the report's invariance
+            # check (f_n/T60_n should agree across positions for a real mode).
+            "per_measurement": [dict(entry) for entry in modal_signature.per_measurement],
+        }
+
     low_end_power_mask = context.frequencies <= LOW_END_POWER_UPPER_HZ
     low_end_power_frequencies = (
         context.frequencies[low_end_power_mask]
@@ -345,7 +434,7 @@ def run_search(
     ]
 
     result = {
-        "format_version": 20,
+        "format_version": 21,
         "measurement_count": len(measurements),
         "sample_rate": measurements[0].sample_rate,
         "response_length": measurements[0].impulse.size,
@@ -386,6 +475,38 @@ def run_search(
                     "apply the result in an external DSP. Scoring is now based "
                     "only on equal-drive output and the smoothed-response dip, "
                     "so 'dsp' has no target-specific scoring exception."
+                ),
+            },
+            "modal": {
+                "enabled": options.modal,
+                "tiebreak": options.modal_tiebreak,
+                "note": (
+                    "parametric modal decomposition (matrix-pencil pole "
+                    "estimation, jointly across every solo measurement) "
+                    "reporting per-mode f_n/T60_n/Q_n/L_n/t_audible_n and "
+                    "aggregate n_highQ/Q_max/sum_modal_energy_db per pair; "
+                    "diagnostic-only and does not affect score_db/"
+                    "post_eq_score_db. When tiebreak is enabled, "
+                    "(n_highQ, sum_modal_energy_db) - both lower-is-better - "
+                    "is inserted strictly after the primary usable-output "
+                    "score, before the deterministic pair-index tie-break; "
+                    "off by default, see modal_signature for the pooled room "
+                    "pole set this was computed against"
+                ),
+                **(
+                    {
+                        "band_hz": list(modal_options.band),
+                        "decimated_fs_hz": modal_options.decimated_fs_hz,
+                        "window_seconds": modal_options.window_seconds,
+                        "order_range": [modal_options.order_min, modal_options.order_max],
+                        "order_step": modal_options.order_step,
+                        "high_q_threshold": modal_options.high_q_threshold,
+                        "level_gates_db": list(modal_options.level_gates_db),
+                        "primary_gate_db": modal_options.primary_gate_db,
+                        "audible_margin_db": modal_options.audible_margin_db,
+                    }
+                    if modal_options is not None
+                    else {}
                 ),
             },
             "minimum_phase": {
@@ -524,6 +645,7 @@ def run_search(
             },
         },
         "cache_manifest_format": manifest.get("format_version"),
+        "modal_signature": modal_signature_json,
         "pairs": pairs,
     }
     write_json(output_path, result)

@@ -638,6 +638,137 @@ def _ranking_table(
     )
 
 
+_MODAL_PALETTE = (
+    "#7dd3fc", "#c4b5fd", "#86efac", "#fca5a5", "#fcd34d", "#67e8f9", "#f0abfc", "#a5b4fc",
+)
+
+
+def _modal_mode_table(modes: list[dict[str, Any]], table_id: str) -> str:
+    """Sortable per-mode table (reuses the ranking table's click-to-sort script)."""
+    columns = [
+        ("frequency_hz", "f (Hz)"),
+        ("q", "Q"),
+        ("level_db", "L (dB)"),
+        ("t60_s", "T60 (s)"),
+        ("t_audible_s", "t audible (s)"),
+    ]
+    heading = "".join(
+        f'<th data-key="{key}" data-type="number" data-column-index="{index}">'
+        f'{html.escape(label)}</th>'
+        for index, (key, label) in enumerate(columns)
+    )
+    display = {
+        "frequency_hz": lambda v: f"{v:.1f}",
+        "q": lambda v: f"{v:.1f}",
+        "level_db": lambda v: f"{v:+.1f}",
+        "t60_s": lambda v: f"{v:.2f}",
+        "t_audible_s": lambda v: f"{v:.2f}",
+    }
+    rows = []
+    for mode in sorted(modes, key=lambda m: -float(m["q"])):
+        cells = "".join(
+            f'<td class="metric-cell" data-value="{mode[key]}">'
+            f'{html.escape(display[key](mode[key]))}</td>'
+            for key, _ in columns
+        )
+        rows.append(f"<tr>{cells}</tr>")
+    return (
+        f'<table id="{table_id}" class="ranking-table"><thead><tr>{heading}</tr></thead>'
+        f'<tbody>{"".join(rows)}</tbody></table>'
+    )
+
+
+def _modal_pole_map_figure(rows: list[tuple[dict[str, Any], dict[str, Any]]]) -> go.Figure:
+    """f (x) vs Q (y), marker size ~ modal level, one colour per pair."""
+    figure = go.Figure()
+    high_q_threshold = 16.0
+    for index, (pair, pair_modal) in enumerate(rows):
+        modes = pair_modal.get("modes", [])
+        if not modes:
+            continue
+        high_q_threshold = float(pair_modal.get("high_q_threshold", high_q_threshold))
+        color = _MODAL_PALETTE[index % len(_MODAL_PALETTE)]
+        sizes = [
+            float(np.clip(10.0 + (float(mode["level_db"]) + 30.0) * 1.1, 6.0, 42.0))
+            for mode in modes
+        ]
+        figure.add_trace(
+            go.Scatter(
+                x=[mode["frequency_hz"] for mode in modes],
+                y=[mode["q"] for mode in modes],
+                mode="markers",
+                marker={"size": sizes, "color": color, "line": {"width": 1, "color": "#0f1b2d"}},
+                name=f"{pair['first']}+{pair['second']}",
+                customdata=[float(mode["level_db"]) for mode in modes],
+                hovertemplate=(
+                    "%{x:.1f} Hz<br>Q %{y:.1f}<br>L %{customdata:+.1f} dB<extra>"
+                    f"{pair['first']}+{pair['second']}</extra>"
+                ),
+            )
+        )
+    figure.add_hline(
+        y=high_q_threshold,
+        line={"color": "#64748b", "width": 1, "dash": "dot"},
+        annotation_text=f"Q = {high_q_threshold:g}",
+        annotation_position="top left",
+    )
+    figure.update_xaxes(type="log", title_text="Frequency (Hz)")
+    figure.update_yaxes(title_text="Q")
+    figure.update_layout(
+        title="Modal pole map (marker size ~ level relative to direct sound)",
+        template="plotly_dark",
+        height=430,
+        legend={"orientation": "h", "y": -0.22},
+        margin={"l": 62, "r": 24, "t": 52, "b": 78},
+    )
+    return figure
+
+
+def _modal_invariance_figures(modal_signature: dict[str, Any]) -> tuple[go.Figure, go.Figure]:
+    """Per-mode f_n/T60_n across every solo position, to check the joint fit's poles
+    are genuinely room properties rather than an artifact of one measurement."""
+    modes = modal_signature.get("modes", [])
+    per_measurement = modal_signature.get("per_measurement", [])
+    freq_figure = go.Figure()
+    t60_figure = go.Figure()
+    for mode_index, mode in enumerate(modes):
+        color = _MODAL_PALETTE[mode_index % len(_MODAL_PALETTE)]
+        label = f"{mode['frequency_hz']:.1f} Hz"
+        titles: list[str] = []
+        freqs: list[float] = []
+        t60s: list[float] = []
+        for entry in per_measurement:
+            for candidate in entry.get("modes", []):
+                if candidate.get("pooled_index") == mode_index:
+                    titles.append(str(entry["title"]))
+                    freqs.append(float(candidate["frequency_hz"]))
+                    t60s.append(float(candidate["t60_s"]))
+        marker = {"color": color, "size": 11}
+        freq_figure.add_trace(
+            go.Scatter(x=titles, y=freqs, mode="markers", name=label, marker=marker)
+        )
+        freq_figure.add_hline(y=float(mode["frequency_hz"]), line={"color": color, "width": 1, "dash": "dot"})
+        t60_figure.add_trace(
+            go.Scatter(x=titles, y=t60s, mode="markers", name=label, marker=marker)
+        )
+        t60_figure.add_hline(y=float(mode["t60_s"]), line={"color": color, "width": 1, "dash": "dot"})
+    freq_figure.update_layout(
+        title="Pole frequency invariance across solo positions",
+        template="plotly_dark",
+        height=360,
+        yaxis={"title": "Frequency (Hz)"},
+        margin={"l": 62, "r": 24, "t": 52, "b": 60},
+    )
+    t60_figure.update_layout(
+        title="T60 invariance across solo positions",
+        template="plotly_dark",
+        height=360,
+        yaxis={"title": "T60 (s)"},
+        margin={"l": 62, "r": 24, "t": 52, "b": 60},
+    )
+    return freq_figure, t60_figure
+
+
 def build_report(
     cache_dir: Path,
     results_path: Path,
@@ -850,6 +981,31 @@ def build_report(
                 '<button onclick="copyPeq(this)">Copy</button>'
                 f"<pre>{html.escape(peq)}</pre></div>"
             )
+        modal_html = ""
+        pair_modal = pair.get("modal")
+        if pair_modal and pair_modal.get("valid") and pair_modal.get("modes"):
+            robustness = pair_modal.get("robustness") or {}
+            robustness_note = (
+                f" · n_highQ stable in {robustness['fraction_stable'] * 100.0:.0f}% of a "
+                f"±{robustness['delay_jitter_ms']:.2f} ms / ±{robustness['gain_jitter_db']:.0f} dB "
+                "neighbourhood"
+                if robustness.get("valid")
+                else ""
+            )
+            modal_html = (
+                '<div class="modal-block"><h3>Modal resonance (diagnostic only)</h3>'
+                f'<p class="note">n_highQ (Q &gt; {pair_modal["high_q_threshold"]:g}, '
+                f'L &gt; {pair_modal["primary_gate_db"]:+g} dB) = {pair_modal["n_high_q"]}'
+                + (
+                    f' · stored energy {pair_modal["sum_modal_energy_db"]:+.1f} dB'
+                    if pair_modal.get("sum_modal_energy_db") is not None
+                    else ""
+                )
+                + robustness_note
+                + "</p>"
+                + f'<div class="table-wrap">{_modal_mode_table(pair_modal["modes"], f"modal-{key}")}</div>'
+                + "</div>"
+            )
         detail_sections.append(
             f"""
             <section class="{detail_class}" data-pair-key="{key}"
@@ -868,6 +1024,7 @@ def build_report(
               {_plot_html(_decay_figure(data, raw=raw), f'decay-{key}', static=True)}
               {_plot_html(_excess_figure(data, raw=raw, y_range=excess_range), f'excess-{key}')}
               {peq_html}
+              {modal_html}
             </section>
             """.strip()
         )
@@ -881,6 +1038,41 @@ function copyPeq(button) {
   const old=button.innerText; button.innerText='Copied'; setTimeout(()=>button.innerText=old,900);
 }
 """.strip()
+
+    modal_signature = results.get("modal_signature")
+    modal_section_html = ""
+    if modal_signature and modal_signature.get("valid"):
+        modal_rows = [
+            (pair, pair["modal"])
+            for pair in pairs
+            if pair.get("modal", {}).get("valid") and pair["modal"].get("modes")
+        ]
+        pole_map_html = (
+            _plot_html(_modal_pole_map_figure(modal_rows), "modal-pole-map")
+            if modal_rows
+            else "<p class=\"note\">No displayed pair has a gated high-Q mode.</p>"
+        )
+        freq_figure, t60_figure = _modal_invariance_figures(modal_signature)
+        discard_pct = float(modal_signature.get("discard_fraction", 0.0)) * 100.0
+        modal_warnings = "".join(
+            f"<p class=\"note\">{html.escape(str(warning))}</p>"
+            for warning in modal_signature.get("warnings", [])
+        )
+        modal_section_html = f"""
+        <details class="modal-section" open>
+        <summary>Modal analysis (matrix-pencil pole estimation, diagnostic only)</summary>
+        <p class="note">{len(modal_signature.get('modes', []))} room mode(s) retained jointly
+          across every solo position ({discard_pct:.0f}% of candidate poles discarded as
+          noise/order-inconsistent). Modal metrics do not affect ranking unless
+          <code>--modal-tiebreak</code> was enabled at search time; see the settings JSON below.</p>
+        {modal_warnings}
+        {pole_map_html}
+        <div class="modal-figures">
+          {_plot_html(freq_figure, "modal-invariance-frequency")}
+          {_plot_html(t60_figure, "modal-invariance-t60")}
+        </div>
+        </details>
+        """.strip()
 
     settings_json = html.escape(json.dumps(settings, sort_keys=True, indent=2))
     document = f"""<!doctype html>
@@ -921,6 +1113,11 @@ th:hover {{ background:#1b2d48; }} tbody tr:hover {{ background:#132238; }}
 .peq {{ position:relative; padding:16px; background:#091322; border-radius:9px; }}
 .peq h3 {{ margin:0 0 10px; }} .peq pre {{ margin:0; white-space:pre-wrap; color:#a7f3d0; }}
 .peq button {{ position:absolute; right:14px; top:14px; border:1px solid #49607e; border-radius:6px; padding:6px 11px; color:var(--text); background:#1c2d47; cursor:pointer; }}
+.modal-block {{ margin-top:18px; padding:16px; background:#091322; border-radius:9px; }}
+.modal-block h3 {{ margin:0 0 10px; }}
+.modal-section .table-wrap {{ margin-top:12px; }}
+.modal-figures {{ display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-top:12px; }}
+@media (max-width:900px) {{ .modal-figures {{ grid-template-columns:1fr; }} }}
 details {{ margin:22px 0; }} details pre {{ overflow:auto; color:var(--muted); }}
 .glossary p {{ margin:0 0 10px; color:var(--muted); }} .glossary p:last-child {{ margin-bottom:0; }}
 </style>
@@ -964,6 +1161,7 @@ details {{ margin:22px 0; }} details pre {{ overflow:auto; color:var(--muted); }
 {f'<p>{eq_notes}</p>' if eq_notes else ''}
 <p>CSD overlay (in each pair's excess-GD and decay charts): excess GD with common delay removed; a vertical line is frequency-independent delay.</p>
 </div></details>
+{modal_section_html}
 <details><summary>Analysis settings and minimum-phase convention</summary><pre>{settings_json}</pre></details>
 </main>
 <script>
