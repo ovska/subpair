@@ -128,16 +128,39 @@ the real logic. Data flows strictly one-way through `.subpair-cache/`:
    expensive per-finalist diagnostics (`dsp.pair_diagnostics`) and selects by
    post-EQ usable-output score. Writes `search-results.json`
    (`format_version` is bumped whenever the result schema changes — keep
-   `verification.py`/`html_report.py` in sync with it).
+   `verification.py`/`html_report.py` in sync with it). When
+   `SearchOptions.modal` is set, also computes `modal.estimate_room_poles`
+   once (Stage 1, over every solo measurement) and, per finalist pair,
+   `modal.compute_pair_modal_metrics`/`modal.modal_robustness` (Stage 2, cheap
+   fixed-pole linear fits) — diagnostic fields only, never part of
+   `score_db`/`post_eq_score_db` unless `SearchOptions.modal_tiebreak` opts a
+   pair's `(n_highQ, sum_modal_energy_db)` into the sort key strictly after
+   the primary score.
 
-5. **`html_report.py`** / **`verification.py`** — consume
+5. **`modal.py`** — parametric modal decomposition, independent of
+   `dsp.py`'s magnitude/phase scoring. Matrix-pencil pole estimation
+   (`_matrix_pencil_poles`) on an 18–200 Hz band-limited, 500 Hz-decimated,
+   Butterworth-filtered (not a hard frequency mask — see the module
+   docstring for why a brick-wall mask rings unacceptably on an impulsive
+   signal) segment; poles are swept across model order and pooled jointly
+   across every solo measurement (`estimate_room_poles`), retaining only
+   poles that persist across a majority of both. A fixed-pole linear
+   least-squares residue fit (`fit_mode_residues`/`compute_pair_modal_metrics`)
+   is what makes per-pair metrics cheap. No CLI or I/O code here; `engine.py`
+   is the only caller.
+
+6. **`html_report.py`** / **`verification.py`** — consume
    `search-results.json` (+ cache) to produce self-contained HTML (Plotly
    inlined, no CDN/network at view time). `verification.py` additionally
    talks to `RewClient` once, to fetch the one new physical measurement being
    checked against a predicted sum. Neither takes its own shelf flag.
    `build_report` reads the search-time automatic-shelf enablement and reruns
    `pair_diagnostics`; `run_verification` compares the unequalized physical
-   and predicted sums, applying neither PK nor LS filters.
+   and predicted sums, applying neither PK nor LS filters. `build_report`
+   also renders a "Modal analysis" section (pole map, per-position invariance
+   check, per-pair mode tables) whenever `search-results.json` carries a
+   valid `modal_signature`; it is omitted entirely for older or
+   `--modal off` results.
 
 ### Key invariants to preserve
 
@@ -156,3 +179,8 @@ the real logic. Data flows strictly one-way through `.subpair-cache/`:
   metrics are diagnostics and EQ-authority inputs only.
 - **Offline-first.** `search`, `report`, and the scoring/EQ logic in `dsp.py`
   must never require network access; only `fetch` and `verify` talk to REW.
+- **Modal metrics stay a separate, opt-in axis.** `modal.py`'s per-pair
+  high-Q/stored-energy metrics must never silently enter `score_db`/
+  `post_eq_score_db`; the only sanctioned path is the explicit
+  `SearchOptions.modal_tiebreak` secondary sort key, inserted strictly after
+  the primary score, never before it.

@@ -171,6 +171,27 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     _add_shelf_arguments(search)
+    search.add_argument(
+        "--modal",
+        choices=("on", "off"),
+        default="off",
+        help=(
+            "compute parametric modal decomposition (matrix-pencil pole "
+            "estimation, jointly across every solo measurement): per-pair "
+            "high-Q resonance metrics reported as diagnostics only, off by "
+            "default (default: off)"
+        ),
+    )
+    search.add_argument(
+        "--modal-tiebreak",
+        choices=("on", "off"),
+        default="off",
+        help=(
+            "after the primary usable-output score, break ties using "
+            "(n_highQ, sum_modal_energy_db), both lower-is-better; requires "
+            "--modal on (default: off)"
+        ),
+    )
     search.add_argument("--top", type=_positive_int, default=10, help="rows to print")
 
     report = commands.add_parser("report", help="write the self-contained HTML report")
@@ -334,6 +355,8 @@ def _search(args: argparse.Namespace) -> int:
         score_low_end_weight=args.score_low_end_weight,
         score_dip_weight=args.score_dip_weight,
         low_shelf=args.low_shelf == "on",
+        modal=args.modal == "on",
+        modal_tiebreak=args.modal_tiebreak == "on",
     )
 
     def progress(done: int, total: int, pair: str) -> None:

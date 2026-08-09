@@ -248,6 +248,70 @@ overshoot; there are no manual shelf-frequency, gain, or slope flags. A fitted
 shelf appears alongside the PK filters in the report as an `LS Fc ... Gain ...
 Slope ...` line and is included in every post-EQ plot and score.
 
+#### Modal decay and high-Q resonance metrics
+
+`--modal on|off` (default `off`) computes a parametric modal decomposition —
+matrix-pencil pole estimation — separate from the magnitude/phase-based
+scoring above. It answers a question null suppression and excess GD do not:
+how hard does a given placement drive the room's own resonances, and for how
+long does that stored energy stay audible? Delay/polarity/gain cannot change
+a room mode's frequency or damping (those are properties of the room), but
+they change how strongly a given sum excites it, so two placements with
+near-identical smoothed response can still differ substantially in modal
+excitation and audible tail length.
+
+Estimation is two-stage:
+
+- **Stage 1** jointly estimates the room's pole set — frequency `f_n` and
+  decay rate `α_n` per mode — from every solo measurement's impulse, using the
+  matrix-pencil method (preferred over Prony here for its SVD-based noise
+  robustness) on a signal band-limited to 18–200 Hz and decimated to 500 Hz
+  ("frequency zoom" conditioning, essential for the estimator). Model order is
+  swept 10–60; a candidate pole is retained only if it recurs, within
+  tolerance, across a majority of orders tried *and* a majority of solo
+  measurements. This is the room's modal signature and does not depend on
+  which pair is being evaluated.
+- **Stage 2** fixes that pole set and solves an ordinary linear least-squares
+  fit for each candidate pair sum's modal amplitudes only. This is fast and
+  well-conditioned, which is what makes per-pair modal metrics affordable —
+  only Stage 1 (once per search) runs the expensive order sweep.
+
+Per retained mode, `subpair` reports `f_n` (Hz), `T60_n` (s), `Q_n`, `L_n`
+(initial modal level in dB relative to the same sum's direct-sound peak — the
+quantity delay/gain actually controls), and `t_audible_n` (time for the mode
+to fall a configured margin below the direct sound). Aggregate per pair:
+`n_highQ` (count of modes with `Q > 16` *and* `L_n` above a level gate — a
+high-Q pole far enough below the direct sound is not audible and must not
+inflate the count; reported at two gate levels, -15 and -20 dB, so the
+metric's sensitivity to the threshold is visible), `Q_max` with its
+`(f, Q, L)` triple, and `sum_modal_energy_db`, a total-stored-energy proxy
+over the gated modes. Every pair's fit also carries a robustness check: the
+fraction of a small ±0.5 ms timing / ±10 cm placement-equivalent / ±1 dB gain
+neighbourhood in which `n_highQ` holds at its nominal value, since a modal
+advantage that evaporates under a little drift is not a real advantage.
+
+These metrics are diagnostic-only by default: they do not affect `score_db`
+or `post_eq_score_db`, and are never a hidden tie-breaker. `--modal-tiebreak
+on` (requires `--modal on`) inserts `(n_highQ, sum_modal_energy_db)` — both
+lower-is-better — strictly after the primary usable-output score, before the
+deterministic pair-index tie-break, so the weighting stays opt-in and
+inspectable rather than assumed. The pooled room pole set, per-solo-position
+invariance data, discard fraction, and any estimation warnings are written to
+`search-results.json`'s top-level `modal_signature`; `subpair report` renders
+a pole map (`f` vs `Q`, marker size ∝ level), a per-position invariance check
+(confirms `f_n`/`T60_n` agree across solo positions, as a real room mode
+should), and a sortable per-mode table for every displayed pair, all inside a
+"Modal analysis" section that only appears when `--modal` was enabled.
+
+This is a genuinely more expensive analysis than the rest of `search` and is
+new/less battle-tested than the magnitude-based scoring; it requires strict
+LTI behaviour (a rattling panel or fan noise will confidently produce
+confident-looking, meaningless poles) and consistent absolute timing across
+every solo measurement, the same requirement `search` already has for delay
+alignment. If the retained pole count looks implausibly low, or the report's
+warnings mention a high discard fraction, treat the modal metrics for that
+search with real skepticism rather than as a settled number.
+
 Relative SPL is the energy-mean in-band SPL after applying the corresponding
 raw or post-EQ headroom, so it compares equal maximum driver drive rather than
 nominal searched levels. It contributes to sound power according to
