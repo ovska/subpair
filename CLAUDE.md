@@ -140,8 +140,14 @@ the real logic. Data flows strictly one-way through `.subpair-cache/`:
    the primary score. `effective_tail_ms`/`post_eq_effective_tail_ms` are
    always populated (regardless of `SearchOptions.modal`): a pair's own modal
    `ringing_ms` when valid, else `dsp.csd_style_decay`'s original
-   `raw_tail_ms`/`post_eq_tail_ms` — the report's/CLI's "Tail" column reads
-   these, not the raw CSD fields directly.
+   `raw_tail_ms`/`post_eq_tail_ms`. The report's/CLI's "Tail" column instead
+   reads `effective_tail_db`/`post_eq_effective_tail_db` (that pair's modal
+   `worst_mode_level_db`, the loudest detected mode's level relative to
+   direct sound) whenever the source is modal, falling back to the ms fields
+   otherwise: `ringing_ms` saturates at 0 for every mode below
+   `ModalOptions.audible_margin_db`, which a well-controlled room can do for
+   every pair, so the dB figure — which keeps varying below that floor — is
+   preferred whenever it's available.
 
 5. **`modal.py`** — parametric modal decomposition, independent of
    `dsp.py`'s magnitude/phase scoring. Matrix-pencil pole estimation
@@ -153,7 +159,13 @@ the real logic. Data flows strictly one-way through `.subpair-cache/`:
    poles that persist across a majority of both. A fixed-pole linear
    least-squares residue fit (`fit_mode_residues`/`compute_pair_modal_metrics`)
    is what makes per-pair metrics cheap. No CLI or I/O code here; `engine.py`
-   is the only caller.
+   is the only caller. `L_n`'s 0 dB reference (`compute_pair_modal_metrics`'s
+   `direct_reference`) is the RMS of the band-limited direct arrival over
+   `_direct_reference_window_seconds` (at least one period of the lowest
+   in-band mode, floored at 20 ms), not a single peak sample in a fixed
+   20 ms window — a window shorter than the mode's own period, scored by
+   peak sample, measures the onset transient rather than the mode and
+   systematically understates every mode's level.
 
 6. **`html_report.py`** / **`verification.py`** — consume
    `search-results.json` (+ cache) to produce self-contained HTML (Plotly
@@ -168,11 +180,14 @@ the real logic. Data flows strictly one-way through `.subpair-cache/`:
    valid `modal_signature`; it is omitted entirely for older or
    `--modal off` results. `build_report`'s own `--room` flag (report-only,
    not stored in `search-results.json`) overlays `room_mode_frequencies`'
-   purely geometric rigid-box eigenfrequencies as legend-toggleable line
-   traces (`_room_mode_traces`) on every frequency-domain chart and, as
-   horizontal lines, the CSD heatmaps — a deliberately distinct, cheaper,
-   less trustworthy sibling to `modal.py`'s measured poles, not a replacement
-   for them.
+   purely geometric rigid-box eigenfrequencies, capped at 3rd order per axis
+   index by default, as legend-toggleable line traces (`_room_mode_traces`)
+   on every frequency-domain chart and, as horizontal lines, the CSD
+   heatmaps — a deliberately distinct, cheaper, less trustworthy sibling to
+   `modal.py`'s measured poles, not a replacement for them. Only the axial
+   trace is drawn by default (`visible=True`); tangential/oblique start
+   `visible="legendonly"` (still toggleable, not hidden from the legend)
+   since they're usually weaker and numerous enough to clutter the chart.
 
 ### Key invariants to preserve
 

@@ -18,12 +18,15 @@ from subpair.modal import (
     RoomMode,
     RoomModalSignature,
     T60_LN_RATIO,
+    DIRECT_REFERENCE_WINDOW_SECONDS,
     _bandlimited_decimated_impulse,
     _cluster_candidates,
+    _direct_reference_window_seconds,
     _eigenvalues_to_modes,
     _matrix_pencil_poles,
     _measurement_consensus_poles,
     _noise_floor_db,
+    _prepare_segments,
     _windowed_segment,
     aggregate_modal_metrics,
     compute_pair_modal_metrics,
@@ -161,6 +164,27 @@ class PreprocessingTests(unittest.TestCase):
         segment = _decaying_sinusoid(300, fs, 50.0, 0.4, 1.0)
         floor_db = _noise_floor_db(segment)
         self.assertLess(floor_db, -20.0)
+
+    def test_direct_reference_window_spans_at_least_one_period_of_the_lowest_mode(self):
+        # 1/18 Hz ~= 55.6 ms, longer than the 20 ms floor.
+        self.assertAlmostEqual(
+            _direct_reference_window_seconds((18.0, 200.0)), 1.0 / 18.0
+        )
+        # A higher band floor (e.g. 60 Hz, period ~16.7 ms) is already
+        # shorter than the 20 ms floor, which must still win.
+        self.assertAlmostEqual(
+            _direct_reference_window_seconds((60.0, 200.0)),
+            DIRECT_REFERENCE_WINDOW_SECONDS,
+        )
+
+    def test_prepare_segments_direct_window_widens_for_a_low_band_floor(self):
+        fs = 4000.0
+        impulse = _decaying_sinusoid(8000, fs, 30.0, 0.4, 1.0)
+        options = ModalOptions(band=(18.0, 200.0), decimated_fs_hz=500.0)
+        direct_segment, _, actual_fs, _ = _prepare_segments(impulse, fs, options)
+        self.assertAlmostEqual(
+            direct_segment.size / actual_fs, 1.0 / 18.0, delta=1.0 / actual_fs
+        )
 
 
 class ConsensusTests(unittest.TestCase):
@@ -404,6 +428,23 @@ class AggregateMetricsTests(unittest.TestCase):
         self.assertEqual(aggregate["n_high_q"], 0)
         self.assertAlmostEqual(aggregate["ringing_ms"], 500.0)
 
+    def test_worst_mode_level_db_is_the_loudest_mode_regardless_of_audibility(self):
+        # None of these cross the audibility margin (t_audible_s=0 for all),
+        # so ringing_ms is 0 for every one of them -- worst_mode_level_db
+        # must still distinguish the loudest (-22 dB) from the rest.
+        modes = [
+            self._mode(50.0, 20.0, -35.0, 5.0, t_audible_s=0.0),
+            self._mode(60.0, 20.0, -22.0, 5.0, t_audible_s=0.0),
+            self._mode(70.0, 20.0, -40.0, 5.0, t_audible_s=0.0),
+        ]
+        aggregate = aggregate_modal_metrics(modes, ModalOptions())
+        self.assertEqual(aggregate["ringing_ms"], 0.0)
+        self.assertAlmostEqual(aggregate["worst_mode_level_db"], -22.0)
+
+    def test_worst_mode_level_db_is_none_when_no_modes_survive(self):
+        aggregate = aggregate_modal_metrics([], ModalOptions())
+        self.assertIsNone(aggregate["worst_mode_level_db"])
+
 
 class PairMetricsAndRobustnessTests(unittest.TestCase):
     def _signature(self) -> RoomModalSignature:
@@ -444,6 +485,25 @@ class PairMetricsAndRobustnessTests(unittest.TestCase):
         self.assertAlmostEqual(result["modes"][0]["frequency_hz"], 55.0, delta=0.5)
         self.assertGreater(result["fixed_pole_fit_r2"], 0.9)
         self.assertFalse(result["fixed_pole_fit_flagged"])
+
+    def test_level_db_uses_the_rms_of_the_direct_window_not_its_peak_sample(self):
+        fs = 4000.0
+        n = 3000
+        signature = self._signature()
+        options = ModalOptions()
+        impulse = self._impulse_for_amplitude(1.0, fs, n)
+        result = compute_pair_modal_metrics(signature, impulse, fs, options)
+
+        direct_segment, fit_segment, actual_fs, _ = _prepare_segments(impulse, fs, options)
+        poles = [(mode.frequency_hz, mode.decay_rate_per_s) for mode in signature.modes]
+        amplitudes, _ = fit_mode_residues(fit_segment, actual_fs, poles)
+        rms_reference = float(np.sqrt(np.mean(np.square(direct_segment))))
+        peak_reference = float(np.max(np.abs(direct_segment)))
+        expected_level_db = 20.0 * math.log10(float(amplitudes[0]) / rms_reference)
+        peak_based_level_db = 20.0 * math.log10(float(amplitudes[0]) / peak_reference)
+
+        self.assertAlmostEqual(result["modes"][0]["level_db"], expected_level_db, places=6)
+        self.assertGreater(abs(result["modes"][0]["level_db"] - peak_based_level_db), 1.0)
 
     def test_robustness_reports_full_stability_for_a_flat_neighbourhood(self):
         fs = 4000.0
@@ -523,7 +583,7 @@ class EngineIntegrationTests(unittest.TestCase):
                     modal_tiebreak=True,
                 ),
             )
-            self.assertEqual(result["format_version"], 22)
+            self.assertEqual(result["format_version"], 23)
             signature = result["modal_signature"]
             self.assertIsNotNone(signature)
             self.assertTrue(signature["valid"])
@@ -549,6 +609,16 @@ class EngineIntegrationTests(unittest.TestCase):
                 self.assertAlmostEqual(pair["effective_tail_ms"], pair["modal"]["ringing_ms"])
                 self.assertAlmostEqual(
                     pair["post_eq_effective_tail_ms"], pair["post_eq_modal"]["ringing_ms"]
+                )
+                # The report/CLI "Tail" column reads *_effective_tail_db, not
+                # the ms fields, whenever the source is modal.
+                self.assertIn("worst_mode_level_db", pair["modal"])
+                self.assertAlmostEqual(
+                    pair["effective_tail_db"], pair["modal"]["worst_mode_level_db"]
+                )
+                self.assertAlmostEqual(
+                    pair["post_eq_effective_tail_db"],
+                    pair["post_eq_modal"]["worst_mode_level_db"],
                 )
             # write_json (allow_nan=False) already succeeded above without
             # raising; reloading confirms every modal field round-trips.
@@ -585,6 +655,8 @@ class EngineIntegrationTests(unittest.TestCase):
                 self.assertAlmostEqual(
                     pair["post_eq_effective_tail_ms"], pair["post_eq_tail_ms"]
                 )
+                self.assertIsNone(pair["effective_tail_db"])
+                self.assertIsNone(pair["post_eq_effective_tail_db"])
 
     def test_post_eq_modal_reflects_the_fitted_eq_bank(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -740,6 +812,60 @@ class CliIntegrationTests(unittest.TestCase):
                 )
             self.assertEqual(exit_code, 2)
             self.assertIn("modal_tiebreak requires modal", stderr.getvalue())
+
+    def test_print_ranking_shows_db_tail_for_modal_sourced_pairs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cache = root / "cache"
+            sample_rate = 2000.0
+            length = 3000
+            rows = []
+            for index, amplitude in enumerate([0.30, 0.55, 0.20, 0.45], start=1):
+                impulse = _synthetic_modal_impulse(
+                    length, sample_rate, [(50.0, 0.3, amplitude)]
+                )
+                rows.append(
+                    {
+                        "source_index": index,
+                        "title": f"Position {index}",
+                        "uuid": f"uuid-{index}",
+                        "sample_rate": sample_rate,
+                        "start_time_seconds": -0.05,
+                        "impulse": impulse,
+                    }
+                )
+            write_cache(cache, rows, {"test": True})
+            results_path = cache / "search-results.json"
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                exit_code = main(
+                    [
+                        "search",
+                        "--cache",
+                        str(cache),
+                        "--band",
+                        "25",
+                        "150",
+                        "--delay-range",
+                        "-1",
+                        "1",
+                        "1",
+                        "--gain-range",
+                        "0",
+                        "0",
+                        "1",
+                        "--eq-bands",
+                        "0",
+                        "--modal",
+                        "on",
+                        "--results",
+                        str(results_path),
+                    ]
+                )
+            self.assertEqual(exit_code, 0)
+            output = stdout.getvalue()
+            self.assertIn("dB", output)
+            self.assertNotIn("Tail ms", output)
 
 
 if __name__ == "__main__":

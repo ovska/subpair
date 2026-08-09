@@ -115,12 +115,27 @@ class ModalOptions:
             raise ValueError("Modal primary gate must be one of the reported level gates")
 
 
-# Reference window for the direct-sound level (Ln's denominator): the spec's
-# simpler alternative to a minimum-phase-equivalent early-response peak. Also
-# used as the skip-ahead offset before the decay-fit window starts (see
-# _prepare_segments below) so the fit window models only modal ringing, not
-# the direct arrival itself.
+# Floor for the reference window for the direct-sound level (Ln's
+# denominator): the spec's simpler alternative to a minimum-phase-equivalent
+# early-response peak. Also used as the skip-ahead offset before the
+# decay-fit window starts (see _prepare_segments below) so the fit window
+# models only modal ringing, not the direct arrival itself.
+#
+# A fixed 20 ms is too short on its own: the lowest in-band mode can have a
+# period longer than that (e.g. 1/18 Hz = 55.6 ms), so a 20 ms window doesn't
+# even complete one cycle of it and instead measures the band-limited
+# impulse's broadband onset transient -- a handful of narrowband poles cannot
+# represent that transient (see the module docstring's Stage 2 rationale), so
+# comparing a single mode's fitted amplitude against its peak systematically
+# understates every mode's level by tens of dB. _direct_reference_window_seconds
+# widens the window to span at least one period of the lowest frequency the
+# pole estimator can find, so the window actually captures modal content.
 DIRECT_REFERENCE_WINDOW_SECONDS = 0.02
+
+
+def _direct_reference_window_seconds(band: tuple[float, float]) -> float:
+    """At least one period of the lowest in-band mode, floored at 20 ms."""
+    return max(DIRECT_REFERENCE_WINDOW_SECONDS, 1.0 / band[0])
 
 
 def _bandlimited_decimated_impulse(
@@ -193,7 +208,7 @@ def _prepare_segments(
 ) -> tuple[np.ndarray, np.ndarray, float, float]:
     """Return ``(direct_segment, fit_segment, decimated_fs, fit_window_seconds)``.
 
-    ``direct_segment`` covers the direct arrival (``DIRECT_REFERENCE_WINDOW_SECONDS``
+    ``direct_segment`` covers the direct arrival (``_direct_reference_window_seconds``
     starting at the band-limited impulse's peak) and is used only to compute
     ``Ln``'s 0 dB reference. ``fit_segment`` starts immediately after it and
     is what the matrix-pencil estimator and the fixed-pole residue fit run
@@ -205,11 +220,12 @@ def _prepare_segments(
         impulse, source_fs, options.band, options.decimated_fs_hz
     )
     peak_index = int(np.argmax(np.abs(decimated)))
+    window_seconds = _direct_reference_window_seconds(options.band)
     direct_segment, _ = _windowed_segment(
-        decimated, actual_fs, peak_index, 0.0, DIRECT_REFERENCE_WINDOW_SECONDS
+        decimated, actual_fs, peak_index, 0.0, window_seconds
     )
     fit_segment, achieved_seconds = _windowed_segment(
-        decimated, actual_fs, peak_index, DIRECT_REFERENCE_WINDOW_SECONDS, options.window_seconds
+        decimated, actual_fs, peak_index, window_seconds, options.window_seconds
     )
     return direct_segment, fit_segment, actual_fs, achieved_seconds
 
@@ -563,6 +579,14 @@ def aggregate_modal_metrics(
     blurred across modes narrower than a fractional-octave band -- see
     ``PLAN.md`` for the comparison this was chosen over. It is ``None`` when
     no mode survived the noise-floor gate in ``mode_metrics``.
+
+    ``worst_mode_level_db`` is ``max(level_db)`` over the same set of modes --
+    the loudest mode's level relative to direct sound, regardless of whether
+    it actually crosses ``audible_margin_db``. ``ringing_ms`` saturates at
+    0 for every mode below that margin, which in a well-controlled room can
+    mean every pair reports the same uninformative 0 ms; ``worst_mode_level_db``
+    keeps varying below the margin, so a report can still show which pairs are
+    closer to audible ringing even when none of them actually cross the line.
     """
     by_gate: dict[str, int] = {}
     for gate_db in options.level_gates_db:
@@ -592,6 +616,7 @@ def aggregate_modal_metrics(
         q_max_triple = None
         sum_modal_energy_db = None
     ringing_ms = 1000.0 * max(m["t_audible_s"] for m in modes) if modes else None
+    worst_mode_level_db = max(m["level_db"] for m in modes) if modes else None
     return {
         "modes": modes,
         "n_high_q": len(primary_gated),
@@ -600,6 +625,7 @@ def aggregate_modal_metrics(
         "q_max_triple": q_max_triple,
         "sum_modal_energy_db": sum_modal_energy_db,
         "ringing_ms": ringing_ms,
+        "worst_mode_level_db": worst_mode_level_db,
         "high_q_threshold": options.high_q_threshold,
         "primary_gate_db": options.primary_gate_db,
     }
@@ -624,7 +650,12 @@ def compute_pair_modal_metrics(
         impulse, source_fs, options
     )
     noise_floor_db = _noise_floor_db(fit_segment)
-    direct_reference = float(np.max(np.abs(direct_segment)))
+    # RMS rather than a single peak sample: over a window now wide enough to
+    # span a full cycle of the lowest in-band mode, a peak sample is still
+    # dominated by whichever instant the broadband onset transient happens to
+    # spike hardest, which has nothing to do with any one mode's sustained
+    # level. RMS averages that spike down across the whole window instead.
+    direct_reference = float(np.sqrt(np.mean(np.square(direct_segment))))
     poles = [(mode.frequency_hz, mode.decay_rate_per_s) for mode in signature.modes]
     amplitudes, fit_r2 = fit_mode_residues(fit_segment, actual_fs, poles)
     modes = mode_metrics(poles, amplitudes, direct_reference, noise_floor_db, options)

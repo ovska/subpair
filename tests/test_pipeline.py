@@ -941,6 +941,12 @@ class PipelineTests(unittest.TestCase):
                 )
                 self.assertNotIn("null_score_db", row)
                 self.assertNotIn("post_eq_null_score_db", row)
+                # --modal was not requested, so the CSD tail is always the
+                # source and there is no dB figure to show for it.
+                self.assertFalse(row["effective_tail_is_modal"])
+                self.assertFalse(row["post_eq_effective_tail_is_modal"])
+                self.assertIsNone(row["effective_tail_db"])
+                self.assertIsNone(row["post_eq_effective_tail_db"])
                 self.assertGreaterEqual(row["excess_gd_peak_ms"], 0.0)
                 self.assertGreaterEqual(row["post_eq_excess_gd_peak_ms"], 0.0)
                 self.assertGreaterEqual(row["delay_plateau_ms"], 0.0)
@@ -1179,6 +1185,26 @@ class RoomModeTests(unittest.TestCase):
         self.assertTrue(all(f <= 120.0 for f in frequencies))
         self.assertTrue(modes)
 
+    def test_max_order_caps_axis_indices_regardless_of_frequency_limit(self):
+        # side_cm chosen so the first axial mode is exactly 100 Hz (as in the
+        # classification test above); with a frequency limit generous enough
+        # to admit a 4th-order axial mode (400 Hz), the default max_order=3
+        # must still exclude it while keeping the 3rd-order one (300 Hz).
+        side_cm = 171.5
+        modes = room_mode_frequencies((side_cm, side_cm, side_cm), max_frequency_hz=500.0)
+        indices = {mode["indices"] for mode in modes}
+        self.assertIn((3, 0, 0), indices)
+        self.assertNotIn((4, 0, 0), indices)
+        self.assertTrue(all(max(idx) <= 3 for idx in indices))
+
+    def test_max_order_can_be_raised_explicitly(self):
+        side_cm = 171.5
+        modes = room_mode_frequencies(
+            (side_cm, side_cm, side_cm), max_frequency_hz=500.0, max_order=5
+        )
+        indices = {mode["indices"] for mode in modes}
+        self.assertIn((4, 0, 0), indices)
+
     def test_rejects_non_positive_dimensions(self):
         with self.assertRaises(ValueError):
             room_mode_frequencies((0.0, 300.0, 250.0), max_frequency_hz=100.0)
@@ -1197,6 +1223,18 @@ class RoomModeTests(unittest.TestCase):
         self.assertEqual(len(axial.x), 6)
         self.assertEqual(list(axial.x[:3]), [40.0, 40.0, None])
         self.assertEqual(list(axial.y[:3]), [-10.0, 10.0, None])
+
+    def test_room_mode_traces_hide_tangential_and_oblique_by_default(self):
+        modes = [
+            {"frequency_hz": 40.0, "type": "axial", "indices": (1, 0, 0)},
+            {"frequency_hz": 70.0, "type": "tangential", "indices": (1, 1, 0)},
+            {"frequency_hz": 90.0, "type": "oblique", "indices": (1, 1, 1)},
+        ]
+        traces = _room_mode_traces(modes, (-10.0, 10.0), "vertical")
+        by_name = {trace.name: trace for trace in traces}
+        self.assertEqual(by_name["Room mode: axial"].visible, True)
+        self.assertEqual(by_name["Room mode: tangential"].visible, "legendonly")
+        self.assertEqual(by_name["Room mode: oblique"].visible, "legendonly")
 
     def test_room_mode_traces_draws_horizontal_segments_for_csd(self):
         modes = [{"frequency_hz": 55.0, "type": "axial", "indices": (1, 0, 0)}]

@@ -33,10 +33,20 @@ _EXCESS_GD_LOWER_LIMIT_MS = -20.0
 SPEED_OF_SOUND_M_PER_S = 343.0
 
 _ROOM_MODE_LINE_STYLE = {
-    "axial": {"color": "#e2e8f0", "dash": "solid", "width": 1.3},
-    "tangential": {"color": "#94a3b8", "dash": "dash", "width": 1.0},
-    "oblique": {"color": "#64748b", "dash": "dot", "width": 0.9},
+    "axial": {"color": "#e2e8f0", "dash": "solid", "width": 1.3, "visible": True},
+    # Tangential/oblique modes are usually much weaker than axial ones and a
+    # full order sweep of them clutters the chart fast, so they start hidden
+    # ("legendonly": Plotly still lists and can toggle the trace, it's just
+    # not drawn) rather than being left out of the report entirely.
+    "tangential": {"color": "#94a3b8", "dash": "dash", "width": 1.0, "visible": "legendonly"},
+    "oblique": {"color": "#64748b", "dash": "dot", "width": 0.9, "visible": "legendonly"},
 }
+
+# Order here is each axis index (nx/ny/nz), not the frequency-domain "filter
+# order" sense of the word: a 4th-order-or-higher axial/tangential/oblique
+# mode is both weak in a typical room and, past this point, mostly clutters
+# the chart with lines a subwoofer placement search has little control over.
+_ROOM_MODE_MAX_ORDER = 3
 
 
 class ReportError(RuntimeError):
@@ -44,7 +54,9 @@ class ReportError(RuntimeError):
 
 
 def room_mode_frequencies(
-    dimensions_cm: tuple[float, float, float], max_frequency_hz: float
+    dimensions_cm: tuple[float, float, float],
+    max_frequency_hz: float,
+    max_order: int = _ROOM_MODE_MAX_ORDER,
 ) -> list[dict[str, Any]]:
     """Axial/tangential/oblique rigid-rectangular-room eigenfrequencies, <= a limit.
 
@@ -57,6 +69,12 @@ def room_mode_frequencies(
     measured poles in ``modal.py``: a real room's absorption, non-rigid
     boundaries, furniture, and non-rectangular geometry all shift and damp
     its actual modes away from this idealization.
+
+    ``max_order`` caps every axis index (``nx``/``ny``/``nz``) in addition to
+    ``max_frequency_hz``: past low single digits, higher-order modes are both
+    weak in a typical room and numerous enough (particularly tangential and
+    oblique combinations) to clutter the chart, so they're excluded from the
+    reference entirely rather than just hidden.
     """
     length_m, width_m, height_m = (value / 100.0 for value in dimensions_cm)
     if min(length_m, width_m, height_m) <= 0.0:
@@ -64,7 +82,10 @@ def room_mode_frequencies(
     if not math.isfinite(max_frequency_hz) or max_frequency_hz <= 0.0:
         raise ValueError("Room mode frequency limit must be positive")
     axis_limits = tuple(
-        max(0, math.floor(2.0 * max_frequency_hz * dimension / SPEED_OF_SOUND_M_PER_S))
+        min(
+            max_order,
+            max(0, math.floor(2.0 * max_frequency_hz * dimension / SPEED_OF_SOUND_M_PER_S)),
+        )
         for dimension in (length_m, width_m, height_m)
     )
     modes: list[dict[str, Any]] = []
@@ -128,6 +149,7 @@ def _room_mode_traces(
                 name=f"Room mode: {mode_type}",
                 legendgroup=f"room-mode-{mode_type}",
                 hoverinfo="skip",
+                visible=style["visible"],
             )
         )
     return traces
@@ -665,11 +687,26 @@ def _ranking_table(
     score_key = "post_eq_relative_score_db" if eq else "relative_score_db"
     dip_key = "post_eq_dip_db" if eq else "dip_db"
     excess_key = "post_eq_excess_gd_ms" if eq else "excess_gd_ms"
-    # effective_tail_ms/post_eq_effective_tail_ms are the modal-derived
-    # audible-ringing time (max t_audible_n across a pair's own valid modal
-    # fit) when available, else the original CSD-based envelope decay time --
-    # see engine.py's settings.ranking.effective_tail documentation.
+    # "Tail" shows effective_tail_db/post_eq_effective_tail_db (the loudest
+    # detected mode's level relative to direct sound, in dB) whenever the
+    # source is modal, else effective_tail_ms/post_eq_effective_tail_ms (the
+    # CSD-based envelope decay time, in ms) -- see engine.py's
+    # settings.ranking.effective_tail documentation for why: ringing_ms
+    # saturates at 0 for every mode below the audibility margin, which a
+    # well-controlled room can do for every pair, so the dB figure (which
+    # keeps varying below that floor) is preferred when it's available. Both
+    # directions are "lower is better" (a shorter tail or a quieter mode), so
+    # they share one colour-scaled column even though their units differ.
     tail_key = "post_eq_effective_tail_ms" if eq else "effective_tail_ms"
+    tail_db_key = "post_eq_effective_tail_db" if eq else "effective_tail_db"
+    tail_modal_key = "post_eq_effective_tail_is_modal" if eq else "effective_tail_is_modal"
+    tail_display: dict[int, tuple[float | None, str]] = {}
+    for pair in pairs:
+        if pair.get(tail_modal_key) and pair.get(tail_db_key) is not None:
+            tail_display[id(pair)] = (float(pair[tail_db_key]), "dB")
+        else:
+            raw_tail = pair.get(tail_key)
+            tail_display[id(pair)] = (float(raw_tail) if raw_tail is not None else None, "ms")
     headroom_key = "post_eq_headroom_db" if eq else "headroom_db"
     low_end_power_key = (
         "post_eq_relative_low_end_power_db" if eq else "relative_low_end_power_db"
@@ -687,7 +724,7 @@ def _ranking_table(
     columns.extend([
         (dip_key, "Residual dip (dB)", "number"),
         (excess_key, "Excess GD (ms)", "number"),
-        (tail_key, "Tail (ms)", "number"),
+        (tail_key, "Tail", "number"),
         (low_end_power_key, "Low-end power (dB)", "number"),
         (spl_key, "Relative SPL (dB)", "number"),
     ])
@@ -708,7 +745,10 @@ def _ranking_table(
     # coercing them to numbers that could skew the best/worst endpoints.
     metric_ranges: dict[str, tuple[float, float]] = {}
     for key in metric_directions:
-        numeric = [float(pair[key]) for pair in pairs if pair[key] is not None]
+        if key == tail_key:
+            numeric = [value for value, _ in tail_display.values() if value is not None]
+        else:
+            numeric = [float(pair[key]) for pair in pairs if pair[key] is not None]
         metric_ranges[key] = (min(numeric), max(numeric)) if numeric else (0.0, 0.0)
 
     def score_style(key: str, value: float | None) -> str:
@@ -729,6 +769,12 @@ def _ranking_table(
     rows = []
     for pair in pairs:
         key_value = f"{int(pair['first'])}-{int(pair['second'])}"
+        tail_value, tail_unit = tail_display[id(pair)]
+        tail_display_text = (
+            (f"{tail_value:+.1f} dB" if tail_unit == "dB" else f"{tail_value:.1f} ms")
+            if tail_value is not None
+            else "—"
+        )
 
         values: dict[str, tuple[str, str]] = {
             score_key: (f"{pair[score_key]:+.2f}", str(pair[score_key])),
@@ -745,7 +791,7 @@ def _ranking_table(
             ),
             dip_key: (f"{pair[dip_key]:.3f}", str(pair[dip_key])),
             excess_key: (f"{pair[excess_key]:.3f}", str(pair[excess_key])),
-            tail_key: (f"{pair[tail_key]:.1f}", str(pair[tail_key])),
+            tail_key: (tail_display_text, "" if tail_value is None else str(tail_value)),
             low_end_power_key: (
                 f"{pair[low_end_power_key]:+.2f}",
                 str(pair[low_end_power_key]),
@@ -755,8 +801,11 @@ def _ranking_table(
         cells = []
         for key, _, _ in columns:
             is_metric = key in metric_directions
-            raw_value = pair.get(key) if is_metric else None
-            numeric_value = float(raw_value) if raw_value is not None else None
+            if key == tail_key:
+                numeric_value = tail_value
+            else:
+                raw_value = pair.get(key) if is_metric else None
+                numeric_value = float(raw_value) if raw_value is not None else None
             style = score_style(key, numeric_value) if is_metric else ""
             empty_class = " is-empty" if is_metric and numeric_value is None else ""
             style_attribute = f' style="{style}"' if style else ""
@@ -961,6 +1010,8 @@ def build_report(
         "raw_tail_ms",
         "effective_tail_ms",
         "post_eq_effective_tail_ms",
+        "effective_tail_db",
+        "post_eq_effective_tail_db",
         "post_eq_excess_gd_ms",
         "post_eq_relative_spl_db",
         "eq_filter_count",
@@ -1015,6 +1066,11 @@ def build_report(
     if int(results.get("format_version", 0)) < 22:
         raise ReportError(
             "Search results predate the modal-aware effective tail metric; "
+            "run 'subpair search' again"
+        )
+    if int(results.get("format_version", 0)) < 23:
+        raise ReportError(
+            "Search results predate the dB-based modal ringing margin; "
             "run 'subpair search' again"
         )
     if any(
@@ -1095,12 +1151,16 @@ def build_report(
         for pair in pairs
     )
     tail_note = (
-        "Tail is this pair's modal-derived audible-ringing time (worst-case "
-        "time for any detected room mode to fall below the audibility margin "
-        "relative to direct sound; marked “(modal)” in the pair "
-        "summary) when this pair's own --modal fit succeeded, else the "
-        "original CSD-based 1/3-octave envelope decay time. Both are "
-        "diagnostics."
+        "Tail is this pair's loudest detected room mode's level relative to "
+        "direct sound, in dB (marked “(modal)” in the pair summary; less "
+        "negative is closer to audible) when this pair's own --modal fit "
+        "succeeded, else the original CSD-based 1/3-octave envelope decay "
+        "time in ms. The dB figure is shown instead of the modal fit's own "
+        "ringing time (worst-case time for any detected mode to fall below "
+        "the audibility margin) because that time saturates at 0 for every "
+        "mode below the margin — which a well-controlled room can do for "
+        "every pair — while the dB figure keeps varying below that floor. "
+        "Both are diagnostics."
         + (
             " See the “Modal analysis” section below for per-mode detail."
             if any_modal_tail
@@ -1126,21 +1186,27 @@ def build_report(
         detail_class = (
             "pair-detail" if key == initial_active_key else "pair-detail is-inactive"
         )
+        if pair.get("effective_tail_is_modal"):
+            raw_tail_text = f"tail {pair['effective_tail_db']:+.1f} dB (modal)"
+        else:
+            raw_tail_text = f"tail {pair['effective_tail_ms']:.1f} ms"
+        if pair.get("post_eq_effective_tail_is_modal"):
+            post_eq_tail_text = f"tail {pair['post_eq_effective_tail_db']:+.1f} dB (modal)"
+        else:
+            post_eq_tail_text = f"tail {pair['post_eq_effective_tail_ms']:.1f} ms"
         metric_summary = (
             f"Raw score {pair['relative_score_db']:+.2f} dB · "
             f"residual dip {pair['dip_db']:.3f} dB · "
             f"excess GD {pair['excess_gd_ms']:.3f} ms · "
             f"peak {pair['excess_gd_peak_ms']:.2f} ms · "
-            f"tail {pair['effective_tail_ms']:.1f} ms"
-            + (" (modal)" if pair.get("effective_tail_is_modal") else "")
+            f"{raw_tail_text}"
             if raw
             else (
                 f"EQ’d score {pair['post_eq_relative_score_db']:+.2f} dB · "
                 f"residual dip {pair['post_eq_dip_db']:.3f} dB · "
                 f"excess GD {pair['post_eq_excess_gd_ms']:.3f} ms · "
                 f"peak {pair['post_eq_excess_gd_peak_ms']:.2f} ms · "
-                f"tail {pair['post_eq_effective_tail_ms']:.1f} ms"
-                + (" (modal)" if pair.get("post_eq_effective_tail_is_modal") else "")
+                f"{post_eq_tail_text}"
             )
         )
         peq_html = ""
