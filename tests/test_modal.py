@@ -331,14 +331,14 @@ class ModeMetricsTests(unittest.TestCase):
 
 
 class AggregateMetricsTests(unittest.TestCase):
-    def _mode(self, frequency_hz, q, level_db, decay_rate_per_s):
+    def _mode(self, frequency_hz, q, level_db, decay_rate_per_s, t_audible_s=0.0):
         return {
             "frequency_hz": frequency_hz,
             "decay_rate_per_s": decay_rate_per_s,
             "t60_s": T60_LN_RATIO / decay_rate_per_s,
             "q": q,
             "level_db": level_db,
-            "t_audible_s": 0.0,
+            "t_audible_s": t_audible_s,
         }
 
     def test_counts_only_high_q_modes_above_the_level_gate(self):
@@ -385,6 +385,24 @@ class AggregateMetricsTests(unittest.TestCase):
         self.assertEqual(aggregate["n_high_q"], 0)
         self.assertIsNone(aggregate["sum_modal_energy_db"])
         self.assertIsNone(aggregate["q_max_triple"])
+        self.assertIsNone(aggregate["ringing_ms"])
+
+    def test_ringing_ms_is_the_worst_case_time_audible_across_every_mode(self):
+        modes = [
+            self._mode(50.0, 20.0, -5.0, 5.0, t_audible_s=0.05),
+            self._mode(60.0, 20.0, -5.0, 5.0, t_audible_s=0.30),
+            self._mode(70.0, 20.0, -5.0, 5.0, t_audible_s=0.10),
+        ]
+        aggregate = aggregate_modal_metrics(modes, ModalOptions())
+        self.assertAlmostEqual(aggregate["ringing_ms"], 300.0)
+
+    def test_ringing_ms_counts_a_low_q_mode_not_gated_into_n_highq(self):
+        # Q below the high-Q threshold, so it doesn't count toward n_highQ,
+        # but it still rings audibly and must still set ringing_ms.
+        modes = [self._mode(50.0, 5.0, -5.0, 5.0, t_audible_s=0.5)]
+        aggregate = aggregate_modal_metrics(modes, ModalOptions(high_q_threshold=16.0))
+        self.assertEqual(aggregate["n_high_q"], 0)
+        self.assertAlmostEqual(aggregate["ringing_ms"], 500.0)
 
 
 class PairMetricsAndRobustnessTests(unittest.TestCase):
@@ -505,7 +523,7 @@ class EngineIntegrationTests(unittest.TestCase):
                     modal_tiebreak=True,
                 ),
             )
-            self.assertEqual(result["format_version"], 21)
+            self.assertEqual(result["format_version"], 22)
             signature = result["modal_signature"]
             self.assertIsNotNone(signature)
             self.assertTrue(signature["valid"])
@@ -515,8 +533,23 @@ class EngineIntegrationTests(unittest.TestCase):
                 self.assertIn("modal", pair)
                 self.assertTrue(pair["modal"]["valid"])
                 self.assertIn("n_high_q", pair["modal"])
+                self.assertIn("ringing_ms", pair["modal"])
                 self.assertIn("robustness", pair["modal"])
                 self.assertTrue(pair["modal"]["robustness"]["valid"])
+                self.assertIn("post_eq_modal", pair)
+                self.assertTrue(pair["post_eq_modal"]["valid"])
+                # eq_bands=0 means no filters were fitted, so the post-EQ
+                # impulse is just the raw sum plus headroom; ringing_ms is a
+                # level-relative metric so headroom cancels out of it exactly.
+                self.assertAlmostEqual(
+                    pair["post_eq_modal"]["ringing_ms"], pair["modal"]["ringing_ms"]
+                )
+                self.assertTrue(pair["effective_tail_is_modal"])
+                self.assertTrue(pair["post_eq_effective_tail_is_modal"])
+                self.assertAlmostEqual(pair["effective_tail_ms"], pair["modal"]["ringing_ms"])
+                self.assertAlmostEqual(
+                    pair["post_eq_effective_tail_ms"], pair["post_eq_modal"]["ringing_ms"]
+                )
             # write_json (allow_nan=False) already succeeded above without
             # raising; reloading confirms every modal field round-trips.
             reloaded = json.loads(results_path.read_text())
@@ -526,6 +559,62 @@ class EngineIntegrationTests(unittest.TestCase):
             )
             self.assertTrue(reloaded["settings"]["modal"]["enabled"])
             self.assertTrue(reloaded["settings"]["modal"]["tiebreak"])
+
+    def test_effective_tail_falls_back_to_csd_tail_when_modal_is_off(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cache = root / "cache"
+            self._write_modal_cache(cache)
+            results_path = cache / "search-results.json"
+            result = run_search(
+                cache,
+                results_path,
+                SearchOptions(
+                    band=(25.0, 150.0),
+                    delay_range_ms=(-1.0, 1.0, 1.0),
+                    gain_range_db=(0.0, 0.0, 1.0),
+                    ppo=24,
+                    eq_bands=0,
+                ),
+            )
+            for pair in result["pairs"]:
+                self.assertNotIn("modal", pair)
+                self.assertFalse(pair["effective_tail_is_modal"])
+                self.assertFalse(pair["post_eq_effective_tail_is_modal"])
+                self.assertAlmostEqual(pair["effective_tail_ms"], pair["raw_tail_ms"])
+                self.assertAlmostEqual(
+                    pair["post_eq_effective_tail_ms"], pair["post_eq_tail_ms"]
+                )
+
+    def test_post_eq_modal_reflects_the_fitted_eq_bank(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cache = root / "cache"
+            self._write_modal_cache(cache)
+            results_path = cache / "search-results.json"
+            result = run_search(
+                cache,
+                results_path,
+                SearchOptions(
+                    band=(25.0, 150.0),
+                    delay_range_ms=(-1.0, 1.0, 1.0),
+                    gain_range_db=(0.0, 0.0, 1.0),
+                    ppo=24,
+                    eq_bands=4,
+                    max_cut_db=18.0,
+                    modal=True,
+                ),
+            )
+            for pair in result["pairs"]:
+                self.assertIn("post_eq_modal", pair)
+                # Whether or not the fitter happened to touch the 50 Hz mode
+                # for this pair, the post-EQ fit must independently succeed
+                # (not crash, and report a well-defined fit quality) against
+                # the same fixed room poles -- EQ can legitimately change how
+                # well those fixed poles explain the post-EQ signal, so this
+                # does not assert a fit-quality floor.
+                self.assertTrue(pair["post_eq_modal"]["valid"])
+                self.assertTrue(math.isfinite(pair["post_eq_modal"]["fixed_pole_fit_r2"]))
 
     def test_search_with_modal_disabled_omits_modal_fields(self):
         with tempfile.TemporaryDirectory() as temporary:

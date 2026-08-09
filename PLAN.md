@@ -1431,6 +1431,64 @@ corresponding data (see the scope-adjustment note above).
 - [x] `CLAUDE.md`: `modal.py` architecture entry, `engine.py` update, new
       "modal metrics stay a separate, opt-in axis" invariant.
 
+### Phase 6: `ringing_ms` and the modal-aware effective tail (follow-up)
+
+Prompted by an explicit question: is `raw_tail_ms`/`post_eq_tail_ms` (a fixed
+-20 dB-from-local-peak CSD envelope crossing in a 1/3-octave band, computed by
+`dsp.csd_style_decay`) actually a good "how much audible ringing does this
+pair have" answer, now that a physically-grounded, audibility-referenced
+alternative exists? Answer: the CSD tail has the same resolution problem
+Schroeder decay has for the rest of this feature (a 1/3-octave band blurs
+together modes narrower than it, and its threshold is local/arbitrary rather
+than referenced to the actual direct-sound level), so the modal fit's
+`t_audible_n` is a better basis *when it is available*. It should not
+outright replace the CSD tail, though: modal estimation is heavier and can
+fail (LTI violations, a too-short capture, insufficient pole persistence)
+where the CSD tail is cheap and unconditional, and `--modal` remains
+deliberately opt-in/experimental. Resolution: add the better metric and let
+it win per-pair when valid, keep the cheap one as the unconditional fallback.
+
+- [x] `modal.aggregate_modal_metrics` gained `ringing_ms`:
+      `max(t_audible_n)` over *every* retained mode, deliberately not limited
+      to the `n_highQ`-gated ones (a moderate-Q mode ringing loudly for a
+      while is still audible ringing even though it never counts toward
+      `n_highQ`). Tested for the aggregate-max behavior and for correctly
+      including a mode that is excluded from `n_highQ` by the Q gate
+      (`AggregateMetricsTests`).
+- [x] `engine._compute_pair` now also computes `post_eq_modal`: the same
+      Stage 2 fit against the pair sum *after* applying its already-fitted EQ
+      bank (`engine._post_eq_pair_impulse`, reusing `dsp.filters_response`/
+      `dsp.low_shelf_response` rather than duplicating `pair_diagnostics`'s
+      internals, and reusing the filters/shelf/headroom `pair_diagnostics`
+      already fit rather than re-deriving them). The robustness sweep
+      remains raw-sum-only (perturbing delay/gain around a fixed EQ bank,
+      not re-fitting EQ per perturbed point, for the same reason the rest of
+      the pipeline treats a chosen EQ as fixed once selected) -- a documented
+      scope limit, not an oversight.
+- [x] `effective_tail_ms`/`post_eq_effective_tail_ms` (plus
+      `effective_tail_is_modal`/`post_eq_effective_tail_is_modal`) are now
+      computed unconditionally for every pair, regardless of `--modal`: that
+      pair's own `ringing_ms` when its modal fit is valid, else the original
+      CSD tail. `format_version` bumped to 22 (new required fields; new
+      `html_report.build_report` guard) since these are always-present,
+      required fields from this point on, not opt-in additions like the rest
+      of the modal schema.
+- [x] `html_report.py`'s ranking table, pair-summary line, and CLI's text
+      ranking table (`cli._print_ranking`) all read the effective-tail
+      fields instead of the raw CSD ones; a modal-sourced pair summary is
+      marked "(modal)". The glossary note explaining this is itself
+      conditional on whether any *displayed* pair actually used the modal
+      source, so a `--modal off` report (or a `--modal on` report where the
+      displayed pairs all fell back to CSD) does not dangle a reference to
+      the "Modal analysis" section when that section isn't present --
+      caught by an existing regression test
+      (`test_report_without_modal_data_has_no_modal_section`) asserting the
+      exact string "Modal analysis" is absent.
+- [x] Tests: `ringing_ms` unit tests; `post_eq_modal` engine-integration
+      test with EQ enabled; effective-tail fallback-to-CSD test with
+      `--modal off`; existing hand-built `_ranking_table` fixture
+      (`test_pipeline.py`) updated for the new required field.
+
 ## Non-goals (this pass)
 
 - Multi-mic-position `decoupling_ratio` — no data model for it exists; see

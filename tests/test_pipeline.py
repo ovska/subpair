@@ -389,6 +389,7 @@ class PipelineTests(unittest.TestCase):
             "dip_db": 1.0,
             "excess_gd_ms": 0.5,
             "raw_tail_ms": 10.0,
+            "effective_tail_ms": 10.0,
             "relative_spl_db": 0.0,
         }
         pairs = [

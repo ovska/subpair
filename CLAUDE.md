@@ -131,11 +131,17 @@ the real logic. Data flows strictly one-way through `.subpair-cache/`:
    `verification.py`/`html_report.py` in sync with it). When
    `SearchOptions.modal` is set, also computes `modal.estimate_room_poles`
    once (Stage 1, over every solo measurement) and, per finalist pair,
-   `modal.compute_pair_modal_metrics`/`modal.modal_robustness` (Stage 2, cheap
+   `modal.compute_pair_modal_metrics`/`modal.modal_robustness` against the raw
+   sum plus a second `compute_pair_modal_metrics` pass against the sum after
+   applying its already-fitted (not re-derived) EQ bank (Stage 2, cheap
    fixed-pole linear fits) — diagnostic fields only, never part of
    `score_db`/`post_eq_score_db` unless `SearchOptions.modal_tiebreak` opts a
    pair's `(n_highQ, sum_modal_energy_db)` into the sort key strictly after
-   the primary score.
+   the primary score. `effective_tail_ms`/`post_eq_effective_tail_ms` are
+   always populated (regardless of `SearchOptions.modal`): a pair's own modal
+   `ringing_ms` when valid, else `dsp.csd_style_decay`'s original
+   `raw_tail_ms`/`post_eq_tail_ms` — the report's/CLI's "Tail" column reads
+   these, not the raw CSD fields directly.
 
 5. **`modal.py`** — parametric modal decomposition, independent of
    `dsp.py`'s magnitude/phase scoring. Matrix-pencil pole estimation

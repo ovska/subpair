@@ -26,8 +26,10 @@ from .dsp import (
     EqOptions,
     broad_trend_db,
     db20,
+    filters_response,
     inclusive_range,
     low_end_power_db,
+    low_shelf_response,
     pair_diagnostics,
     smoothed_dip_db,
     usable_output_score_db,
@@ -197,6 +199,40 @@ def _pair_impulse(
     return np.fft.irfft(full_sum, n=n_fft)
 
 
+def _post_eq_pair_impulse(
+    context: AnalysisContext,
+    first: int,
+    second: int,
+    polarity: int,
+    delay_ms: float,
+    gain_db: float,
+    filters: list[dict[str, float]],
+    shelf: dict[str, Any],
+    post_eq_headroom_db: float,
+) -> np.ndarray:
+    """The pair sum's impulse after applying its already-fitted EQ bank.
+
+    Reuses ``pair_diagnostics``'s already-fitted ``filters``/``shelf`` rather
+    than refitting, mirroring how the rest of the pipeline treats a selected
+    EQ as fixed once chosen (e.g. the robustness sweep also holds it fixed
+    while perturbing delay/gain).
+    """
+    full_sum, full_frequencies = context.sum_full(first, second, polarity, delay_ms, gain_db)
+    n_fft = 2 * (full_sum.size - 1)
+    eq_full = filters_response(full_frequencies, context.sample_rate, filters)
+    if shelf.get("active"):
+        eq_full = eq_full * low_shelf_response(
+            full_frequencies,
+            context.sample_rate,
+            float(shelf["freq_hz"]),
+            float(shelf["gain_db"]),
+            float(shelf.get("slope", 1.0)),
+        )
+    post_eq_headroom_linear = 10.0 ** (post_eq_headroom_db / 20.0)
+    post_full = full_sum * eq_full * post_eq_headroom_linear
+    return np.fft.irfft(post_full, n=n_fft)
+
+
 def _compute_pair(
     indices: tuple[int, int],
 ) -> tuple[int, int, int, float, float, dict]:
@@ -264,6 +300,39 @@ def _compute_pair(
             modal_options,
         )
         diagnostics["modal"] = pair_modal
+
+        post_eq_impulse = _post_eq_pair_impulse(
+            context,
+            first,
+            second,
+            polarity,
+            delay_ms,
+            gain_db,
+            diagnostics["filters"],
+            diagnostics["eq_shelf"],
+            diagnostics["post_eq_headroom_db"],
+        )
+        diagnostics["post_eq_modal"] = modal_analysis.compute_pair_modal_metrics(
+            modal_signature, post_eq_impulse, context.sample_rate, modal_options
+        )
+
+    # The ranking table's "Tail" column uses the modal-derived audible-ringing
+    # time whenever this pair's own fit is valid -- a physically-grounded,
+    # audibility-referenced measure (see modal.aggregate_modal_metrics'
+    # docstring) -- and otherwise falls back to the CSD-based envelope decay
+    # time, so the field is always populated regardless of --modal.
+    raw_modal = diagnostics.get("modal") or {}
+    post_modal = diagnostics.get("post_eq_modal") or {}
+    raw_ringing_ms = raw_modal.get("ringing_ms") if raw_modal.get("valid") else None
+    post_ringing_ms = post_modal.get("ringing_ms") if post_modal.get("valid") else None
+    diagnostics["effective_tail_ms"] = (
+        raw_ringing_ms if raw_ringing_ms is not None else diagnostics["raw_tail_ms"]
+    )
+    diagnostics["effective_tail_is_modal"] = raw_ringing_ms is not None
+    diagnostics["post_eq_effective_tail_ms"] = (
+        post_ringing_ms if post_ringing_ms is not None else diagnostics["post_eq_tail_ms"]
+    )
+    diagnostics["post_eq_effective_tail_is_modal"] = post_ringing_ms is not None
     return first, second, polarity, delay_ms, gain_db, diagnostics
 
 
@@ -434,7 +503,7 @@ def run_search(
     ]
 
     result = {
-        "format_version": 21,
+        "format_version": 22,
         "measurement_count": len(measurements),
         "sample_rate": measurements[0].sample_rate,
         "response_length": measurements[0].impulse.size,
@@ -484,14 +553,19 @@ def run_search(
                     "parametric modal decomposition (matrix-pencil pole "
                     "estimation, jointly across every solo measurement) "
                     "reporting per-mode f_n/T60_n/Q_n/L_n/t_audible_n and "
-                    "aggregate n_highQ/Q_max/sum_modal_energy_db per pair; "
-                    "diagnostic-only and does not affect score_db/"
-                    "post_eq_score_db. When tiebreak is enabled, "
-                    "(n_highQ, sum_modal_energy_db) - both lower-is-better - "
-                    "is inserted strictly after the primary usable-output "
-                    "score, before the deterministic pair-index tie-break; "
-                    "off by default, see modal_signature for the pooled room "
-                    "pole set this was computed against"
+                    "aggregate n_highQ/Q_max/sum_modal_energy_db/ringing_ms "
+                    "per pair (both a raw 'modal' block and a post-EQ "
+                    "'post_eq_modal' block, the latter against the "
+                    "already-fitted, not re-derived, EQ bank); diagnostic-"
+                    "only and does not affect score_db/post_eq_score_db. "
+                    "When tiebreak is enabled, (n_highQ, sum_modal_energy_db) "
+                    "- both lower-is-better - is inserted strictly after the "
+                    "primary usable-output score, before the deterministic "
+                    "pair-index tie-break; off by default. ringing_ms feeds "
+                    "effective_tail_ms/post_eq_effective_tail_ms (see "
+                    "'effective_tail' below) whenever a pair's own fit is "
+                    "valid. See modal_signature for the pooled room pole set "
+                    "this was computed against"
                 ),
                 **(
                     {
@@ -611,6 +685,19 @@ def run_search(
                     f"can drift from the chosen value while the raw usable-output "
                     f"score stays within {PLATEAU_TOLERANCE_DB:g} dB of its "
                     "optimum; wider is more robust to real-world drift"
+                ),
+                "effective_tail": (
+                    "effective_tail_ms/post_eq_effective_tail_ms are the value "
+                    "shown in the report's/CLI's 'Tail' column: this pair's "
+                    "modal.ringing_ms/post_eq_modal.ringing_ms (worst-case time "
+                    "for any detected mode to fall below the audibility margin "
+                    "relative to direct sound) when that pair's own --modal fit "
+                    "is valid, else the original CSD-based raw_tail_ms/"
+                    "post_eq_tail_ms envelope decay time. "
+                    "effective_tail_is_modal/post_eq_effective_tail_is_modal "
+                    "record which source was used for that pair. Always "
+                    "present regardless of --modal; a diagnostic, not a score "
+                    "component"
                 ),
                 "low_end_power": {
                     "fields": {
