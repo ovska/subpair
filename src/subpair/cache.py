@@ -53,8 +53,8 @@ def write_cache(
     """Validate all responses first, then replace the cache files atomically."""
     cache_dir.mkdir(parents=True, exist_ok=True)
     materialised = list(rows)
-    if len(materialised) < 3:
-        raise CacheError(f"At least 3 measurements are required, got {len(materialised)}")
+    if len(materialised) < 2:
+        raise CacheError(f"At least 2 measurements are required, got {len(materialised)}")
     rates = {float(row["sample_rate"]) for row in materialised}
     lengths = {int(np.asarray(row["impulse"]).size) for row in materialised}
     if len(rates) != 1:
@@ -154,8 +154,8 @@ def load_cache(cache_dir: Path) -> tuple[list[CachedMeasurement], dict[str, Any]
                 path=path,
             )
         )
-    if len(rows) < 3:
-        raise CacheError(f"Cache contains {len(rows)} measurements; at least 3 are required")
+    if len(rows) < 2:
+        raise CacheError(f"Cache contains {len(rows)} measurements; at least 2 are required")
     rates = {row.sample_rate for row in rows}
     lengths = {row.impulse.size for row in rows}
     if len(rates) != 1 or len(lengths) != 1:

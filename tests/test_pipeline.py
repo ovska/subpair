@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 
 from subpair.cache import CacheError, load_cache, write_cache
-from subpair.cli import _build_parser, _parse_room_dimensions
+from subpair.cli import _build_parser, _parse_indices, _parse_room_dimensions
 from subpair.engine import SearchOptions, run_search
 from subpair.dsp import (
     EqOptions,
@@ -809,6 +809,51 @@ class PipelineTests(unittest.TestCase):
             with self.assertRaisesRegex(CacheError, "refusing to zero-pad"):
                 write_cache(Path(temporary), rows, {})
 
+    def test_write_cache_accepts_exactly_two_measurements(self):
+        # With only two candidate positions there's exactly one possible
+        # pair -- nothing to pick between -- but the pipeline should still
+        # run rather than requiring a third, unrelated measurement just to
+        # clear a count.
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = Path(temporary)
+            rows = [
+                {
+                    "source_index": index,
+                    "title": f"sub {label}",
+                    "uuid": str(index),
+                    "sample_rate": 4000.0,
+                    "impulse": _synthetic_ir(4000.0, 2048, 100, [(50, 0.2)]),
+                }
+                for index, label in enumerate(["L", "R"], start=1)
+            ]
+            write_cache(cache, rows, {"test": True})
+            measurements, _manifest = load_cache(cache)
+            self.assertEqual(len(measurements), 2)
+
+    def test_write_cache_rejects_a_single_measurement(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            rows = [
+                {
+                    "source_index": 1,
+                    "title": "sub L",
+                    "uuid": "1",
+                    "sample_rate": 4000.0,
+                    "impulse": _synthetic_ir(4000.0, 2048, 100, [(50, 0.2)]),
+                }
+            ]
+            with self.assertRaisesRegex(CacheError, "[Aa]t least 2"):
+                write_cache(Path(temporary), rows, {})
+
+    def test_fetch_count_and_indices_accept_exactly_two(self):
+        parser = _build_parser()
+        parsed = parser.parse_args(["fetch", "--count", "2"])
+        self.assertEqual(parsed.count, 2)
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["fetch", "--count", "1"])
+        self.assertEqual(_parse_indices("3,5"), [3, 5])
+        with self.assertRaises(ValueError):
+            _parse_indices("3")
+
     def test_analysis_context_rejects_large_relative_start_time_offsets(self):
         from subpair.cache import CachedMeasurement
         from subpair.dsp import AnalysisContext
@@ -1148,6 +1193,50 @@ class PipelineTests(unittest.TestCase):
             self.assertNotIn("EQ authority", raw_page)
             self.assertIn("Raw CSD-style decay", raw_page)
             self.assertNotIn("Post-EQ CSD-style decay", raw_page)
+
+    def test_search_and_report_with_exactly_two_measurements(self):
+        # Exactly two candidate positions means exactly one possible pair --
+        # nothing to rank it against -- but search/report must still run the
+        # full pipeline on it rather than requiring a third position solely
+        # to clear a minimum count.
+        sample_rate = 4000.0
+        length = 4096
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cache = root / "cache"
+            rows = [
+                {
+                    "source_index": index,
+                    "title": f"sub {label}",
+                    "uuid": str(index),
+                    "sample_rate": sample_rate,
+                    "start_time_seconds": -0.025,
+                    "impulse": _synthetic_ir(sample_rate, length, delay, [(50, 0.2)]),
+                }
+                for index, (label, delay) in enumerate(
+                    [("L", 100), ("R", 106)], start=1
+                )
+            ]
+            write_cache(cache, rows, {"test": True})
+            results_path = cache / "search-results.json"
+            result = run_search(
+                cache,
+                results_path,
+                SearchOptions(
+                    band=(25.0, 150.0),
+                    delay_range_ms=(-2.0, 2.0, 1.0),
+                    gain_range_db=(-1.0, 1.0, 1.0),
+                    ppo=24,
+                ),
+            )
+            self.assertEqual(len(result["pairs"]), 1)
+            self.assertEqual(result["pairs"][0]["rank"], 1)
+            self.assertEqual(result["pairs"][0]["eq_rank"], 1)
+            self.assertAlmostEqual(result["pairs"][0]["relative_score_db"], 0.0)
+
+            report_path = root / "report.html"
+            build_report(cache, results_path, report_path, top=5, limit=15)
+            self.assertIn("sub L", report_path.read_text())
 
 
 class RoomModeTests(unittest.TestCase):
