@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from pathlib import Path
 from typing import Sequence
@@ -64,6 +65,20 @@ def _parse_indices(value: str) -> list[int]:
     if len(result) < 3 or any(index < 1 for index in result) or len(set(result)) != len(result):
         raise ValueError("--indices must contain at least 3 distinct positive indices")
     return result
+
+
+def _parse_room_dimensions(value: str) -> tuple[float, float, float]:
+    parts = value.lower().split("x")
+    usage = "must be LENGTHxWIDTHxHEIGHT in cm, e.g. 345x274x248"
+    if len(parts) != 3:
+        raise argparse.ArgumentTypeError(usage)
+    try:
+        length, width, height = (float(part) for part in parts)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(usage) from exc
+    if not all(math.isfinite(dimension) and dimension > 0.0 for dimension in (length, width, height)):
+        raise argparse.ArgumentTypeError("room dimensions must be positive")
+    return length, width, height
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -215,6 +230,17 @@ def _build_parser() -> argparse.ArgumentParser:
         "--raw",
         action="store_true",
         help="show raw results instead of the default EQ'd results",
+    )
+    report.add_argument(
+        "--room",
+        type=_parse_room_dimensions,
+        metavar="LxWxH",
+        help=(
+            "room dimensions in cm, e.g. 345x274x248; overlays theoretical "
+            "rigid-box mode frequencies on frequency charts (vertical) and "
+            "CSD heatmaps (horizontal), toggleable per mode type via the "
+            "legend"
+        ),
     )
 
     verify = commands.add_parser("verify", help="compare one physical sum with a prediction")
@@ -378,6 +404,7 @@ def _report(args: argparse.Namespace) -> int:
         top=args.top,
         limit=args.limit,
         raw=args.raw,
+        room_dimensions_cm=args.room,
     )
     print(f"Wrote self-contained report to {output.resolve()}")
     return 0

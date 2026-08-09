@@ -166,7 +166,13 @@ the real logic. Data flows strictly one-way through `.subpair-cache/`:
    also renders a "Modal analysis" section (pole map, per-position invariance
    check, per-pair mode tables) whenever `search-results.json` carries a
    valid `modal_signature`; it is omitted entirely for older or
-   `--modal off` results.
+   `--modal off` results. `build_report`'s own `--room` flag (report-only,
+   not stored in `search-results.json`) overlays `room_mode_frequencies`'
+   purely geometric rigid-box eigenfrequencies as legend-toggleable line
+   traces (`_room_mode_traces`) on every frequency-domain chart and, as
+   horizontal lines, the CSD heatmaps — a deliberately distinct, cheaper,
+   less trustworthy sibling to `modal.py`'s measured poles, not a replacement
+   for them.
 
 ### Key invariants to preserve
 

@@ -369,12 +369,39 @@ Each CSD heatmap includes the corresponding zero-referenced excess-group-delay
 curve and a solid 0 ms reference. A vertical overlay indicates constant delay;
 frequency-dependent bends expose excess storage without relying on visual
 estimation of the heatmap ridge. CSD figures are static to avoid accidental
-zooming or panning and appear before the separate excess-group-delay graph.
+zooming or panning and appear before the separate excess-group-delay graph,
+except when `--room` is given (see below), which needs legend clicks to stay
+available and so relaxes this to a fixed-axis (no zoom/pan) but otherwise
+interactive plot instead.
 
 The table is initially sorted by the computed Score rather than an ordinal
 Rank column. It also shows the score's residual-dip, low-end-power, and
 Relative-SPL components plus the applied Headroom gain. Low-end power and
 Score use higher-is-better colouring; residual dip uses lower-is-better.
+
+#### Room mode overlay
+
+`--room LxWxHcm` (e.g. `--room 345x274x248`) overlays theoretical rigid-
+rectangular-room eigenfrequencies on every chart: vertical lines on the
+frequency-domain charts (magnitude, excess GD, and their overview panels)
+and horizontal lines on the CSD heatmaps, since that plot's y-axis is
+frequency. Modes are computed from the standard rigid-box formula
+`f(nx,ny,nz) = (c/2) * sqrt((nx/L)^2 + (ny/W)^2 + (nz/H)^2)` up to the
+search band's upper edge, and classified by how many of the three integer
+indices are nonzero: axial (one wall pair, solid line), tangential (two wall
+pairs, dashed), or oblique (all three, dotted). This is a purely geometric
+reference for a perfectly rigid, empty box — it does not know about
+absorption, furniture, openings, or non-rectangular geometry, so treat it as
+a rough guide to where axial modes are *likely* to fall, not a prediction of
+the room's actual measured behaviour; `subpair search --modal on` measures
+the room's real poles directly from the cached impulse responses instead
+(see below) and is the more trustworthy source when the two disagree.
+
+Each mode type is its own legend entry (`Room mode: axial` etc.); click it to
+show or hide that type independently, on every chart on the page. Omitting
+`--room` leaves every chart exactly as before — this is a purely additive,
+opt-in visual aid with no effect on ranking, scoring, or any other report
+content.
 
 ### `subpair verify`
 
