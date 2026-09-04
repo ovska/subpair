@@ -37,7 +37,7 @@ CLI usage (see `README.md` for full flag semantics):
 
 ```sh
 subpair fetch --count 12
-subpair search --band 25 150 --delay-range -10 10 0.1 --gain-range -3 3 0.5 --eq-bands 7 --top 10
+subpair search --band 25 150 --delay-range -10 10 0.05 --gain-range -3 3 0.5 --eq-bands 7 --top 10
 subpair report --top 5 --limit 15 --output subpair-report.html
 subpair verify --rank 1 --output verification.html
 ```

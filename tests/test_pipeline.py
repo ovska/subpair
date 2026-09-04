@@ -10,8 +10,19 @@ from pathlib import Path
 import numpy as np
 
 from subpair.cache import CacheError, load_cache, write_cache
-from subpair.cli import _build_parser, _parse_indices, _parse_room_dimensions
-from subpair.engine import SearchOptions, run_search
+from subpair.cli import (
+    _build_parser,
+    _parse_geometry_config,
+    _parse_indices,
+    _parse_room_dimensions,
+)
+from subpair.engine import (
+    SearchOptions,
+    _arrival_outliers,
+    _basin_width,
+    _geometry_jitter,
+    run_search,
+)
 from subpair.dsp import (
     EqOptions,
     EXCURSION_POWER_DB_PER_OCTAVE,
@@ -56,6 +67,108 @@ def _synthetic_ir(sample_rate: float, length: int, delay: int, modes: list[tuple
 
 
 class PipelineTests(unittest.TestCase):
+    def test_basin_width_uses_only_the_contiguous_interval_around_the_minimum(self):
+        tau = np.arange(-2.0, 2.0001, 0.05)
+        objective = np.full(tau.size, 2.0)
+        objective[(tau >= -0.5) & (tau <= 0.5)] = 0.0
+        # A disconnected equally good region must not inflate the basin.
+        objective[(tau >= 1.5) & (tau <= 1.8)] = 0.0
+        centre = int(np.argmin(np.abs(tau)))
+        self.assertLessEqual(
+            abs(_basin_width(objective, tau, centre, 0.3) - 1.0), 0.05 + 1e-12
+        )
+
+    def test_geometry_jitter_reaches_2d_over_c_for_opposite_subs(self):
+        excursion_ms, conservative = _geometry_jitter(
+            0,
+            1,
+            (0.0, 0.0, 0.0),
+            {1: (-2.0, 0.0, 0.0), 2: (2.0, 0.0, 0.0)},
+            0.25,
+            343.0,
+        )
+        self.assertFalse(conservative)
+        self.assertAlmostEqual(excursion_ms, 1000.0 * 0.5 / 343.0)
+        same_direction_ms, conservative = _geometry_jitter(
+            0,
+            1,
+            (0.0, 0.0, 0.0),
+            {1: (2.0, 0.0, 0.0), 2: (4.0, 0.0, 0.0)},
+            0.25,
+            343.0,
+        )
+        self.assertFalse(conservative)
+        self.assertAlmostEqual(same_direction_ms, 0.0)
+
+    def test_geometry_config_accepts_one_based_sub_position_object(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "geometry.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "listening_position_m": [1, 2, 1],
+                        "sub_positions_m": {"1": [0, 0, 0], "2": [4, 0, 0]},
+                        "room_dimensions_m": [5, 4, 2.5],
+                    }
+                )
+            )
+            listener, subs, room = _parse_geometry_config(path)
+        self.assertEqual(listener, (1.0, 2.0, 1.0))
+        self.assertEqual(subs[2], (4.0, 0.0, 0.0))
+        self.assertEqual(room, (5.0, 4.0, 2.5))
+
+    def test_arrival_delay_outlier_is_flagged_with_path_length_warning(self):
+        measurements = [
+            type(
+                "Measurement",
+                (),
+                {
+                    "position": index,
+                    "title": f"Position {index}",
+                    "metadata": {"arrival_delay_ms": delay},
+                },
+            )()
+            for index, delay in enumerate((10.0, 11.0, 12.0, 25.0), start=1)
+        ]
+        delays, outliers, warnings = _arrival_outliers(measurements, 343.0, (5.0, 4.0, 2.5))
+        self.assertEqual(delays[-1], 25.0)
+        self.assertEqual(outliers, {3})
+        self.assertIn("8.57 m", warnings[0])
+
+    def test_search_constrains_robust_delay_to_measured_physical_window(self):
+        sample_rate = 4000.0
+        length = 4096
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = Path(temporary) / "cache"
+            rows = []
+            for index, (sample_delay, arrival_ms) in enumerate(((100, 25.0), (108, 27.0)), start=1):
+                rows.append(
+                    {
+                        "source_index": index,
+                        "title": f"Position {index}",
+                        "uuid": f"uuid-{index}",
+                        "sample_rate": sample_rate,
+                        "start_time_seconds": -0.025,
+                        "impulse": _synthetic_ir(sample_rate, length, sample_delay, [(50, 0.2)]),
+                        "metadata": {"arrival_delay_ms": arrival_ms},
+                    }
+                )
+            write_cache(cache, rows, {"test": True})
+            result = run_search(
+                cache,
+                cache / "results.json",
+                SearchOptions(
+                    delay_range_ms=(-3.0, 3.0, 0.25),
+                    gain_range_db=(0.0, 0.0, 1.0),
+                    eq_bands=0,
+                    physical_delay_window_ms=0.5,
+                ),
+            )
+        pair = result["pairs"][0]
+        self.assertEqual(pair["physical_tau"], -2.0)
+        self.assertLessEqual(abs(pair["tau_robust"] + 2.0), 0.5 + 1e-12)
+        self.assertTrue(pair["pair_valid"])
+
     def test_selected_report_graphs_share_data_bounds_and_cap_negative_excess_gd(self):
         rows = [
             (
@@ -167,6 +280,7 @@ class PipelineTests(unittest.TestCase):
     def test_search_score_weight_arguments(self):
         parser = _build_parser()
         defaults = parser.parse_args(["search"])
+        self.assertEqual(defaults.delay_range[2], 0.05)
         self.assertEqual(defaults.max_cut, 18.0)
         self.assertEqual(defaults.score_low_end_weight, 0.5)
         self.assertEqual(defaults.score_dip_weight, 1.0)
@@ -996,6 +1110,16 @@ class PipelineTests(unittest.TestCase):
                 self.assertGreaterEqual(row["post_eq_excess_gd_peak_ms"], 0.0)
                 self.assertGreaterEqual(row["delay_plateau_ms"], 0.0)
                 self.assertGreaterEqual(row["gain_plateau_db"], 0.0)
+                self.assertEqual(row["delay_ms"], row["tau_robust"])
+                self.assertGreaterEqual(row["fragility"], -1e-12)
+                self.assertGreaterEqual(row["basin_w03"], 0.0)
+                self.assertGreaterEqual(row["basin_w05"], row["basin_w03"])
+                self.assertEqual(set(row["worst_case"]), {"0.5", "1.0", "1.5"})
+                self.assertIn("objective_db", row["robustness"])
+                self.assertTrue(row["robustness"]["geometry_conservative_bound"])
+                self.assertAlmostEqual(
+                    row["robustness"]["delta_tau_max_ms"], 1000.0 * 0.5 / 343.0
+                )
                 for key in low_end_power_keys:
                     self.assertIn(key, row)
                     self.assertTrue(np.isfinite(row[key]))
@@ -1170,6 +1294,10 @@ class PipelineTests(unittest.TestCase):
             self.assertIn("usable-output score", page)
             self.assertIn("Residual dip (dB)", page)
             self.assertIn("Score (dB)", page)
+            self.assertIn("Fragility (dB)", page)
+            self.assertIn("Basin +0.3 (ms)", page)
+            self.assertIn("Delay robustness (lower f is better)", page)
+            self.assertIn("disqualifier, not a certificate", page)
             self.assertNotIn(">Rank</th>", page)
             self.assertIn("Fitted EQ filters", page)
             self.assertIn("Post-EQ excess GD", page)

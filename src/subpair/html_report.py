@@ -400,6 +400,91 @@ def _magnitude_figure(
     return figure
 
 
+def _robustness_figure(pair: dict[str, Any]) -> go.Figure:
+    """Delay-objective landscape with basin and physical reference markers."""
+
+    robustness = pair["robustness"]
+    tau = np.asarray(robustness["tau_grid_ms"], dtype=np.float64)
+    objective = np.asarray(robustness["objective_db"], dtype=np.float64)
+    robust = np.asarray(robustness["robust_objective_db"], dtype=np.float64)
+    star_index = int(np.argmin(np.abs(tau - float(robustness["tau_star_ms"]))))
+    robust_index = int(np.argmin(np.abs(tau - float(robustness["tau_robust_ms"]))))
+    threshold = objective[star_index] + 0.3
+    left = star_index
+    while left > 0 and objective[left - 1] <= threshold:
+        left -= 1
+    right = star_index
+    while right + 1 < tau.size and objective[right + 1] <= threshold:
+        right += 1
+
+    figure = go.Figure()
+    figure.add_vrect(
+        x0=float(tau[left]),
+        x1=float(tau[right]),
+        fillcolor="#22c55e",
+        opacity=0.15,
+        line_width=0,
+        annotation_text="+0.3 dB contiguous basin",
+        annotation_position="top left",
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=tau,
+            y=objective,
+            name="Raw f(tau)",
+            line={"color": "#7dd3fc", "width": 1.5},
+            hovertemplate="%{x:.2f} ms<br>f %{y:.2f} dB<extra></extra>",
+        )
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=tau,
+            y=robust,
+            name="Jitter-averaged f_robust(tau)",
+            line={"color": "#c4b5fd", "width": 2.0},
+            hovertemplate="%{x:.2f} ms<br>f_robust %{y:.2f} dB<extra></extra>",
+        )
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=[tau[star_index]],
+            y=[objective[star_index]],
+            name="tau* (raw)",
+            mode="markers",
+            marker={"color": "#fbbf24", "size": 10, "symbol": "diamond"},
+            hovertemplate="tau* %{x:.2f} ms<br>f %{y:.2f} dB<extra></extra>",
+        )
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=[tau[robust_index]],
+            y=[robust[robust_index]],
+            name="tau_robust (reported delay)",
+            mode="markers",
+            marker={"color": "#86efac", "size": 10, "symbol": "circle"},
+            hovertemplate="tau_robust %{x:.2f} ms<br>f_robust %{y:.2f} dB<extra></extra>",
+        )
+    )
+    physical_tau = robustness.get("physical_tau_ms")
+    if physical_tau is not None:
+        figure.add_vline(
+            x=float(physical_tau),
+            line={"color": "#fb7185", "width": 1.5, "dash": "dash"},
+            annotation_text="physical tau",
+            annotation_position="bottom right",
+        )
+    figure.update_layout(
+        title="Delay robustness (lower f is better)",
+        xaxis={"title": "Delay applied to sub 2 (ms)"},
+        yaxis={"title": "Objective f = -raw score (dB)"},
+        margin={"l": 62, "r": 40, "t": 58, "b": 55},
+        legend={"orientation": "h", "y": -0.24},
+        template="plotly_dark",
+        height=470,
+    )
+    return figure
+
+
 def _overview_figure(
     rows: list[tuple[dict[str, Any], dict[str, Any]]],
     mode: str,
@@ -715,6 +800,11 @@ def _ranking_table(
     columns = [
         (score_key, "Score (dB)", "number"),
         ("pair", "Pair", "text"),
+        ("fragility", "Fragility (dB)", "number"),
+        ("basin_w03", "Basin +0.3 (ms)", "number"),
+        ("worst_case_1", "Worst f +/-1 ms (dB)", "number"),
+        ("geometric_pass", "Basin vs geometry", "text"),
+        ("physical_status", "Physical", "text"),
         ("polarity", "Pol 2", "number"),
         ("delay_ms", "Delay 2 (ms)", "number"),
         ("gain_db", "Gain 2 (dB)", "number"),
@@ -781,6 +871,44 @@ def _ranking_table(
             "pair": (
                 f"{pair['first']} + {pair['second']}",
                 f"{pair['first']:04d}-{pair['second']:04d}",
+            ),
+            "fragility": (
+                f"{float(pair['fragility']):.2f}" if pair.get("fragility") is not None else "—",
+                str(pair.get("fragility", "")),
+            ),
+            "basin_w03": (
+                f"{float(pair['basin_w03']):.2f}" if pair.get("basin_w03") is not None else "—",
+                str(pair.get("basin_w03", "")),
+            ),
+            "worst_case_1": (
+                f"{float(pair['worst_case']['1.0']):.2f}"
+                if pair.get("worst_case", {}).get("1.0") is not None
+                else "—",
+                str(pair.get("worst_case", {}).get("1.0", "")),
+            ),
+            "geometric_pass": (
+                "PASS" if pair.get("geometric_pass") else "FAIL",
+                "1" if pair.get("geometric_pass") else "0",
+            ),
+            "physical_status": (
+                (
+                    "INVALID"
+                    if not pair.get("pair_valid", True)
+                    else (
+                        "N/A"
+                        if pair.get("physical_tau") is None
+                        else ("OUT" if pair.get("non_physical_solution") else "OK")
+                    )
+                ),
+                (
+                    "3"
+                    if not pair.get("pair_valid", True)
+                    else (
+                        "2"
+                        if pair.get("physical_tau") is None
+                        else ("1" if pair.get("non_physical_solution") else "0")
+                    )
+                ),
             ),
             "polarity": ("+" if pair["polarity"] > 0 else "−", str(pair["polarity"])),
             "delay_ms": (f"{pair['delay_ms']:+.3f}", str(pair["delay_ms"])),
@@ -1022,6 +1150,11 @@ def build_report(
         "relative_low_end_power_db",
         "post_eq_low_end_power_db",
         "post_eq_relative_low_end_power_db",
+        "robustness",
+        "fragility",
+        "basin_w03",
+        "worst_case",
+        "geometric_pass",
     }
     if int(results.get("format_version", 0)) < 6:
         raise ReportError(
@@ -1073,6 +1206,10 @@ def build_report(
             "Search results predate the dB-based modal ringing margin; "
             "run 'subpair search' again"
         )
+    if int(results.get("format_version", 0)) < 24:
+        raise ReportError(
+            "Search results predate basin robustness scoring; run 'subpair search' again"
+        )
     if any(
         not required_ranking_fields.issubset(pair)
         for pair in results["pairs"]
@@ -1085,7 +1222,7 @@ def build_report(
     mode_label = "Raw" if raw else "EQ’d"
     rank_key = "rank" if raw else "eq_rank"
     score_key = "relative_score_db" if raw else "post_eq_relative_score_db"
-    pairs = sorted(results["pairs"], key=lambda pair: -float(pair[score_key]))[:limit]
+    pairs = sorted(results["pairs"], key=lambda pair: int(pair[rank_key]))[:limit]
     score_settings = settings.get("ranking", {}).get("score", {})
     score_low_end_weight = float(score_settings.get("low_end_weight", 0.5))
     score_dip_weight = float(score_settings.get("dip_weight", 1.0))
@@ -1209,6 +1346,36 @@ def build_report(
                 f"{post_eq_tail_text}"
             )
         )
+        robustness = pair["robustness"]
+        physical_text = (
+            f"{float(robustness['physical_tau_ms']):+.3f} ms"
+            if robustness.get("physical_tau_ms") is not None
+            else "unavailable"
+        )
+        geometry_text = (
+            "conservative 2d/c bound"
+            if robustness.get("geometry_conservative_bound")
+            else "configured coordinates"
+        )
+        if robustness.get("measurement_delay_outlier"):
+            physical_warning = " <strong>INVALID: ARRIVAL-DELAY OUTLIER</strong>"
+        elif not robustness.get("physical_window_in_scan", True):
+            physical_warning = " <strong>INVALID: PHYSICAL WINDOW OUTSIDE SCAN</strong>"
+        elif pair.get("non_physical_solution"):
+            physical_warning = " <strong>NON-PHYSICAL RAW OPTIMUM</strong>"
+        else:
+            physical_warning = ""
+        robustness_summary = (
+            f"Raw tau* {pair['tau_star']:+.3f} ms · robust tau {pair['tau_robust']:+.3f} ms · "
+            f"f(tau*) {pair['f_tau_star']:.2f} dB · "
+            f"f_robust(tau_robust) {pair['f_robust_tau_robust']:.2f} dB · "
+            f"fragility {pair['fragility']:.2f} dB · +0.3 dB basin {pair['basin_w03']:.2f} ms · "
+            f"worst f (+/-1 ms) {pair['worst_case']['1.0']:.2f} dB · "
+            f"{pair['n_competing']} competing minima · "
+            f"physical tau {physical_text} · geometric excursion "
+            f"{robustness['delta_tau_max_ms']:.2f} ms ({geometry_text}) · "
+            f"basin {'PASS' if pair['geometric_pass'] else 'FAIL'}{physical_warning}"
+        )
         peq_html = ""
         if not raw:
             peq = _peq_text(
@@ -1254,9 +1421,10 @@ def build_report(
               <h2>{mode_label} score {pair[score_key]:+.2f} dB:
                 {html.escape(pair['first_name'])} + {html.escape(pair['second_name'])}</h2>
               <p class="configuration">Sub 2: {'normal' if pair['polarity'] > 0 else 'inverted'},
-                delay {pair['delay_ms']:+.3f} ms, gain {pair['gain_db']:+.2f} dB,
+                robust delay {pair['delay_ms']:+.3f} ms, gain {pair['gain_db']:+.2f} dB,
                 headroom {pair['post_eq_headroom_db' if not raw else 'headroom_db']:+.2f} dB<br>
-                {metric_summary}</p>
+                {metric_summary}<br>{robustness_summary}</p>
+              {_plot_html(_robustness_figure(pair), f'robustness-{key}')}
               {_plot_html(
                   _magnitude_figure(pair, data, raw=raw, y_range=magnitude_range, room_modes=room_modes),
                   f'magnitude-{key}',
@@ -1322,6 +1490,10 @@ function copyPeq(button) {
         """.strip()
 
     settings_json = html.escape(json.dumps(settings, sort_keys=True, indent=2))
+    warning_html = "".join(
+        f'<p class="warning"><strong>Warning:</strong> {html.escape(str(warning))}</p>'
+        for warning in results.get("warnings", [])
+    )
     document = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -1335,6 +1507,7 @@ body {{ margin:0; background:var(--bg); color:var(--text); font:15px/1.5 ui-sans
 main {{ width:min(1500px,96vw); margin:0 auto; padding:36px 0 80px; }}
 h1 {{ font-size:2.2rem; margin:0 0 4px; }} h2 {{ margin-top:0; }}
 .lede,.configuration,.note {{ color:var(--muted); }}
+.warning {{ color:#fecaca; border-left:3px solid #fb7185; padding-left:10px; }}
 .chart-tabs,.pair-tabs {{ display:flex; flex-wrap:wrap; gap:6px; margin:14px 0; }}
 .chart-tab,.pair-tab {{ border:1px solid #3b506d; border-radius:7px; padding:7px 13px; color:var(--muted); background:#101e31; cursor:pointer; font-weight:650; }}
 .chart-tab.active,.pair-tab.active {{ color:#07111f; border-color:#7dd3fc; background:#7dd3fc; }}
@@ -1374,6 +1547,7 @@ details {{ margin:22px 0; }} details pre {{ overflow:auto; color:var(--muted); }
 <h1>subpair ranking</h1>
 <p class="lede">{results['measurement_count']} positions · {band[0]:g}–{band[1]:g} Hz · {settings['ppo']} points/octave · {mode_label} usable-output score · showing up to {limit} pairs</p>
 <p class="note">Check table rows to choose comparison pairs. The top {default_count} start selected; the pair tabs below the table open one full diagnostic at a time. Hotkeys 1–9 open the first nine selected tabs.</p>
+{warning_html}
 {f'<p class="note">Room {room_dimensions_cm[0]:g}×{room_dimensions_cm[1]:g}×{room_dimensions_cm[2]:g} cm: theoretical rigid-box mode frequencies are overlaid on frequency charts (vertical) and CSD heatmaps (horizontal) — solid axial, dashed tangential, dotted oblique. Click a &ldquo;Room mode: …&rdquo; legend entry to hide/show that type; a purely geometric reference, not the measured poles from <code>--modal</code>.</p>' if room_modes is not None else ''}
 <div class="chart-tabs" role="tablist" aria-label="{mode_label} overview chart">
   <button class="chart-tab active" data-overview-view="magnitude" role="tab" aria-selected="true" onclick="setOverviewView('magnitude')">Magnitude</button>
@@ -1393,7 +1567,7 @@ details {{ margin:22px 0; }} details pre {{ overflow:auto; color:var(--muted); }
     )}
   </div>
 </div>
-<p class="note">Score: higher is better, best pair is 0 dB. Click a heading to sort; cells run green (best) to red (worst).</p>
+<p class="note">Score: higher is better, and 0 dB marks the highest numeric score. Arrival-delay outliers and non-physical raw optima are placed after eligible pairs without changing their displayed score. Click a heading to sort; score cells run green (best) to red (worst).</p>
 <div class="table-controls">
   <button type="button" onclick="selectTopN(0)">Clear</button>
   <button type="button" onclick="selectTopN(3)">Top 3</button>
@@ -1407,6 +1581,7 @@ details {{ margin:22px 0; }} details pre {{ overflow:auto; color:var(--muted); }
 <p>{headroom_note}</p>
 <p>Low-end power weights the broad response through 100 Hz by the amplifier/excursion cost of producing pressure at each frequency (+12.04 dB per octave downward). Excess GD and tail remain diagnostics; they do not alter Score.</p>
 <p>{tail_note}</p>
+<p>Delay fragility is a disqualifier, not a certificate. A narrow basin proves the timing solution cannot survive the configured listener excursion. A wide basin only shows timing tolerance: it does not model how each sub’s magnitude response changes as the microphone moves through the modal pressure field. Validate a listening area with multi-position measurements.</p>
 {f'<p>{eq_notes}</p>' if eq_notes else ''}
 <p>CSD overlay (in each pair's excess-GD and decay charts): excess GD with common delay removed; a vertical line is frequency-independent delay.</p>
 </div></details>

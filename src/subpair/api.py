@@ -282,6 +282,74 @@ class RewClient:
         return None if value is None else float(value)
 
     @staticmethod
+    def measurement_arrival_delay_seconds(payload: dict[str, Any]) -> float | None:
+        """Extract REW's loopback-referenced arrival delay from nested metadata.
+
+        Beta API builds have used several spellings. Explicit unit-bearing
+        fields are preferred. REW's API emits a bare numeric
+        ``delay``/``arrivalDelay`` in seconds; strings may carry an explicit
+        ``ms`` or ``s`` suffix as they do in exported notes.
+        """
+
+        millisecond_keys = {
+            "arrivaldelayms",
+            "delayms",
+            "estimateddelayms",
+            "acousticdelayms",
+            "irpeakdelayms",
+            "timingdelayms",
+        }
+        second_keys = {
+            "arrivaldelayseconds",
+            "delayseconds",
+            "estimateddelayseconds",
+            "acousticdelayseconds",
+            "irpeakdelayseconds",
+            "timeofirpeakseconds",
+        }
+        bare_keys = {"arrivaldelay", "delay", "estimateddelay", "acousticdelay"}
+
+        def numeric(value: Any, scale: float) -> float | None:
+            if isinstance(value, bool):
+                return None
+            if isinstance(value, (int, float)):
+                result = float(value) * scale
+                return result if np.isfinite(result) else None
+            if isinstance(value, str):
+                match = re.fullmatch(
+                    r"\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*(ms|s)?\s*",
+                    value,
+                    flags=re.IGNORECASE,
+                )
+                if match:
+                    parsed = float(match.group(1))
+                    unit = (match.group(2) or "").lower()
+                    if unit == "ms":
+                        return parsed / 1000.0
+                    if unit == "s":
+                        return parsed
+                    return parsed * scale
+            return None
+
+        def walk(value: Any) -> float | None:
+            if not isinstance(value, dict):
+                return None
+            for keys, scale in ((second_keys, 1.0), (millisecond_keys, 1e-3), (bare_keys, 1.0)):
+                for key, item in value.items():
+                    if _normal_key(str(key)) in keys:
+                        parsed = numeric(item, scale)
+                        if parsed is not None:
+                            return parsed
+            for item in value.values():
+                if isinstance(item, dict):
+                    parsed = walk(item)
+                    if parsed is not None:
+                        return parsed
+            return None
+
+        return walk(payload)
+
+    @staticmethod
     def _find_ir_data(payload: dict[str, Any]) -> Any:
         direct = _field(
             payload,
@@ -345,6 +413,7 @@ class RewClient:
         metadata = {
             "sample_rate": float(sample_rate),
             "start_time_seconds": float(start_time),
+            "arrival_delay_seconds": self.measurement_arrival_delay_seconds(payload),
             "timing_reference": str(
                 _field(payload, "timingReference", "timingReferenceDescription", default="")
             ),

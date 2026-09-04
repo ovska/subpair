@@ -12,6 +12,7 @@ from typing import Any, Callable
 
 import numpy as np
 
+from .api import RewClient
 from .cache import load_cache, write_json
 from .dsp import (
     DEFAULT_SCORE_DIP_WEIGHT,
@@ -41,7 +42,7 @@ from .modal import ModalOptions, RoomModalSignature
 @dataclass(frozen=True)
 class SearchOptions:
     band: tuple[float, float] = (25.0, 150.0)
-    delay_range_ms: tuple[float, float, float] = (-10.0, 10.0, 0.1)
+    delay_range_ms: tuple[float, float, float] = (-10.0, 10.0, 0.05)
     gain_range_db: tuple[float, float, float] = (-3.0, 3.0, 0.5)
     ppo: int = 48
     eq_target: str = "trend"
@@ -55,14 +56,228 @@ class SearchOptions:
     low_shelf: bool = True
     modal: bool = False
     modal_tiebreak: bool = False
+    listener_position_m: tuple[float, float, float] | None = None
+    sub_positions_m: dict[int, tuple[float, float, float]] | None = None
+    room_dimensions_m: tuple[float, float, float] | None = None
+    listener_movement_m: float = 0.25
+    speed_of_sound_m_per_s: float = 343.0
+    physical_delay_window_ms: float = 1.5
 
     def __post_init__(self) -> None:
         if self.modal_tiebreak and not self.modal:
             raise ValueError("modal_tiebreak requires modal analysis to be enabled")
+        if self.delay_range_ms[2] <= 0.0:
+            raise ValueError("delay grid step must be positive")
+        if self.listener_movement_m <= 0.0:
+            raise ValueError("listener movement must be positive")
+        if self.speed_of_sound_m_per_s <= 0.0:
+            raise ValueError("speed of sound must be positive")
+        if self.physical_delay_window_ms <= 0.0:
+            raise ValueError("physical delay window must be positive")
+        coordinates = []
+        if self.listener_position_m is not None:
+            coordinates.append(("listener position", self.listener_position_m))
+        if self.sub_positions_m is not None:
+            coordinates.extend(
+                (f"sub position {position}", coordinate)
+                for position, coordinate in self.sub_positions_m.items()
+            )
+        for label, coordinate in coordinates:
+            if len(coordinate) != 3 or not all(math.isfinite(float(value)) for value in coordinate):
+                raise ValueError(f"{label} must contain three finite metre coordinates")
+        if self.room_dimensions_m is not None and (
+            len(self.room_dimensions_m) != 3
+            or not all(
+                math.isfinite(float(value)) and float(value) > 0.0
+                for value in self.room_dimensions_m
+            )
+        ):
+            raise ValueError("room dimensions must contain three positive finite metre values")
 
 
 PLATEAU_TOLERANCE_DB = 0.5
 SHORTLIST_PER_OBJECTIVE = 8
+MAX_DELAY_GRID_STEP_MS = 0.05
+GAIN_JITTER_SIGMA_DB = 0.5
+
+
+def _gaussian_expectation(values: np.ndarray, sigma_steps: float, axis: int = -1) -> np.ndarray:
+    """Gaussian expectation on an existing regular grid, without re-scoring."""
+
+    array = np.asarray(values, dtype=np.float64)
+    if not np.isfinite(sigma_steps) or sigma_steps <= 1e-12:
+        return array.copy()
+    radius = max(1, int(math.ceil(4.0 * sigma_steps)))
+    offsets = np.arange(-radius, radius + 1, dtype=np.float64)
+    kernel = np.exp(-0.5 * (offsets / sigma_steps) ** 2)
+    kernel /= np.sum(kernel)
+    moved = np.moveaxis(array, axis, -1)
+    flat = moved.reshape(-1, moved.shape[-1])
+    smoothed = np.empty_like(flat)
+    for index, row in enumerate(flat):
+        padded = np.pad(row, (radius, radius), mode="edge")
+        smoothed[index] = np.convolve(padded, kernel, mode="valid")
+    return np.moveaxis(smoothed.reshape(moved.shape), -1, axis)
+
+
+def _robust_objective_surface(
+    objective: np.ndarray,
+    delay_step_ms: float,
+    gain_step_db: float,
+    sigma_tau_ms: float,
+) -> np.ndarray:
+    """Fold independent timing and gain jitter into an objective surface."""
+
+    robust = _gaussian_expectation(objective, sigma_tau_ms / delay_step_ms, axis=1)
+    # A +/-1 dB gain excursion is represented by roughly +/-2 sigma. Gain
+    # jitter needs no separate output column, but belongs in the expectation.
+    if gain_step_db > 0.0:
+        robust = _gaussian_expectation(robust, GAIN_JITTER_SIGMA_DB / gain_step_db, axis=2)
+    return robust
+
+
+def _basin_width(
+    objective_1d: np.ndarray,
+    values: np.ndarray,
+    index: int,
+    tolerance_db: float,
+) -> float:
+    """Width of the contiguous below-threshold basin containing ``index``."""
+
+    objective = np.asarray(objective_1d, dtype=np.float64)
+    grid = np.asarray(values, dtype=np.float64)
+    threshold = objective[index] + tolerance_db
+    left = index
+    while left > 0 and objective[left - 1] <= threshold:
+        left -= 1
+    right = index
+    while right < objective.size - 1 and objective[right + 1] <= threshold:
+        right += 1
+    return float(grid[right] - grid[left])
+
+
+def _worst_case(
+    objective_1d: np.ndarray,
+    values: np.ndarray,
+    centre: float,
+    half_width: float,
+) -> float:
+    """Maximum interpolated objective over a closed interval."""
+
+    objective = np.asarray(objective_1d, dtype=np.float64)
+    grid = np.asarray(values, dtype=np.float64)
+    low = max(float(grid[0]), centre - half_width)
+    high = min(float(grid[-1]), centre + half_width)
+    interior = objective[(grid >= low) & (grid <= high)]
+    samples = np.concatenate(
+        [interior, np.asarray([np.interp(low, grid, objective), np.interp(high, grid, objective)])]
+    )
+    return float(np.max(samples))
+
+
+def _local_minima_indices(values: np.ndarray) -> np.ndarray:
+    """One deterministic index for each local-minimum plateau."""
+
+    array = np.asarray(values, dtype=np.float64)
+    if array.size == 1:
+        return np.asarray([0], dtype=int)
+    candidates = array <= np.minimum(
+        np.r_[np.inf, array[:-1]], np.r_[array[1:], np.inf]
+    )
+    indices: list[int] = []
+    start = 0
+    while start < array.size:
+        if not candidates[start]:
+            start += 1
+            continue
+        end = start
+        while end + 1 < array.size and candidates[end + 1] and array[end + 1] == array[start]:
+            end += 1
+        indices.append((start + end) // 2)
+        start = end + 1
+    return np.asarray(indices, dtype=int)
+
+
+def _metadata_arrival_delay_ms(metadata: dict[str, Any]) -> float | None:
+    """Read the normalized cached arrival delay, including older test caches."""
+
+    direct_ms = metadata.get("arrival_delay_ms")
+    direct_seconds = metadata.get("arrival_delay_seconds")
+    if direct_ms is not None:
+        value = float(direct_ms)
+        return value if math.isfinite(value) else None
+    if direct_seconds is not None:
+        value = 1000.0 * float(direct_seconds)
+        return value if math.isfinite(value) else None
+    parsed = RewClient.measurement_arrival_delay_seconds(metadata)
+    return None if parsed is None else 1000.0 * parsed
+
+
+def _arrival_outliers(
+    measurements: list[Any],
+    speed_of_sound_m_per_s: float,
+    room_dimensions_m: tuple[float, float, float] | None,
+) -> tuple[list[float | None], set[int], list[str]]:
+    delays = [_metadata_arrival_delay_ms(row.metadata) for row in measurements]
+    positive = [value for value in delays if value is not None and value > 0.0]
+    median = float(np.median(positive)) if positive else None
+    room_diagonal = (
+        math.sqrt(sum(dimension * dimension for dimension in room_dimensions_m))
+        if room_dimensions_m is not None
+        else None
+    )
+    outliers: set[int] = set()
+    warnings: list[str] = []
+    for index, (row, delay_ms) in enumerate(zip(measurements, delays)):
+        reasons = []
+        if delay_ms is None:
+            warnings.append(
+                f"Position {row.position} ({row.title}) has no parsed REW arrival delay; "
+                "physical delay constraints are unavailable for its pairs. Re-fetch with "
+                "a REW build that exposes loopback-referenced arrival metadata."
+            )
+            continue
+        if median is not None and delay_ms > 1.5 * median:
+            reasons.append(f"more than 1.5x the median ({median:.3f} ms)")
+        path_m = delay_ms * speed_of_sound_m_per_s / 1000.0
+        if room_diagonal is not None and path_m > room_diagonal:
+            reasons.append(
+                f"{path_m:.2f} m path exceeds the {room_diagonal:.2f} m room diagonal"
+            )
+        if reasons:
+            outliers.add(index)
+            warnings.append(
+                f"Arrival delay outlier: position {row.position} ({row.title}) reports "
+                f"{delay_ms:.3f} ms / {path_m:.2f} m; " + "; ".join(reasons) + "."
+            )
+    return delays, outliers, warnings
+
+
+def _geometry_jitter(
+    first: int,
+    second: int,
+    listener_position_m: tuple[float, float, float] | None,
+    sub_positions_m: dict[int, tuple[float, float, float]] | None,
+    movement_m: float,
+    speed_of_sound_m_per_s: float,
+) -> tuple[float, bool]:
+    """Return maximum differential delay excursion in ms and bound status."""
+
+    if listener_position_m is not None and sub_positions_m is not None:
+        a = sub_positions_m.get(first + 1)
+        b = sub_positions_m.get(second + 1)
+        if a is not None and b is not None:
+            listener = np.asarray(listener_position_m, dtype=np.float64)
+            vector_a = np.asarray(a, dtype=np.float64) - listener
+            vector_b = np.asarray(b, dtype=np.float64) - listener
+            norm_a = float(np.linalg.norm(vector_a))
+            norm_b = float(np.linalg.norm(vector_b))
+            if norm_a > 0.0 and norm_b > 0.0:
+                unit_difference = float(
+                    np.linalg.norm(vector_a / norm_a - vector_b / norm_b)
+                )
+                return 1000.0 * movement_m * unit_difference / speed_of_sound_m_per_s, False
+    return 1000.0 * 2.0 * movement_m / speed_of_sound_m_per_s, True
 
 
 def _plateau_width(scores_1d: np.ndarray, values: np.ndarray, index: int) -> float:
@@ -91,7 +306,10 @@ def _best_configurations(
     gains: np.ndarray,
     score_low_end_weight: float,
     score_dip_weight: float,
-) -> list[tuple[int, float, float, float, float, float]]:
+    sigma_tau_ms: float,
+    physical_tau_ms: float | None,
+    physical_window_ms: float,
+) -> list[tuple[int, float, float, float, float, float, dict[str, Any]]]:
     polarities = np.asarray([1.0, -1.0])
     gain_linear = 10.0 ** (gains / 20.0)
     shifted = context.trend_spectra[second][None, :] * np.exp(
@@ -126,27 +344,83 @@ def _best_configurations(
         score_low_end_weight,
         score_dip_weight,
     )
-    shape = candidates.shape[:-1]
-    flat_scores = np.asarray(scores).reshape(-1)
-    flat_dips = np.asarray(dip_db).reshape(-1)
-    count = min(SHORTLIST_PER_OBJECTIVE, flat_scores.size)
-    # Full EQ fitting is too expensive for every point in the exhaustive grid.
-    # Keep both the strongest raw usable-output candidates and the smoothest
-    # candidates: cuts and their required preamp can make a slightly quieter,
-    # smoother raw sum the best corrected result. Stable sorting plus sorted
-    # indices keeps the shortlist deterministic.
-    strongest = np.argsort(flat_scores, kind="stable")[-count:]
-    smoothest = np.argsort(flat_dips, kind="stable")[:count]
-    flat_indices = sorted(set(strongest.tolist() + smoothest.tolist()))
+    objective = -np.asarray(scores, dtype=np.float64)
+    delay_step_ms = float(delays[1] - delays[0]) if delays.size > 1 else 1.0
+    gain_step_db = float(gains[1] - gains[0]) if gains.size > 1 else 0.0
+    robust_objective = _robust_objective_surface(
+        objective, delay_step_ms, gain_step_db, sigma_tau_ms
+    )
+    eligible_delays = np.ones(delays.size, dtype=bool)
+    physical_window_in_scan = True
+    if physical_tau_ms is not None:
+        eligible_delays = np.abs(delays - physical_tau_ms) <= physical_window_ms + 1e-12
+        physical_window_in_scan = bool(np.any(eligible_delays))
+        if not physical_window_in_scan:
+            eligible_delays[:] = True
+
+    # Select delay by the jitter-averaged objective for every polarity/gain.
+    # Full EQ fitting remains limited to a deterministic two-objective shortlist.
+    candidate_indices: list[tuple[int, int, int]] = []
+    for polarity_index in range(polarities.size):
+        for gain_index in range(gains.size):
+            curve = robust_objective[polarity_index, :, gain_index]
+            delay_index = int(np.argmin(np.where(eligible_delays, curve, np.inf)))
+            candidate_indices.append((polarity_index, delay_index, gain_index))
+    count = min(SHORTLIST_PER_OBJECTIVE, len(candidate_indices))
+    robust_order = sorted(
+        candidate_indices,
+        key=lambda item: (float(robust_objective[item]), item),
+    )[:count]
+    smooth_order = sorted(
+        candidate_indices,
+        key=lambda item: (float(dip_db[item]), item),
+    )[:count]
+    selected_indices = sorted(set(robust_order + smooth_order))
     result = []
-    for flat_index in flat_indices:
-        polarity_index, delay_index, gain_index = np.unravel_index(int(flat_index), shape)
+    for polarity_index, delay_index, gain_index in selected_indices:
         delay_plateau_ms = _plateau_width(
             scores[polarity_index, :, gain_index], delays, delay_index
         )
         gain_plateau_db = _plateau_width(
             scores[polarity_index, delay_index, :], gains, gain_index
         )
+        raw_curve = objective[polarity_index, :, gain_index]
+        robust_curve = robust_objective[polarity_index, :, gain_index]
+        tau_star_index = int(np.argmin(raw_curve))
+        tau_star_ms = float(delays[tau_star_index])
+        tau_robust_ms = float(delays[delay_index])
+        minima = _local_minima_indices(raw_curve)
+        competing = int(
+            np.count_nonzero(raw_curve[minima] <= raw_curve[tau_star_index] + 0.3 + 1e-12)
+        )
+        worst_case = {
+            f"{dt:.1f}": _worst_case(raw_curve, delays, tau_star_ms, dt)
+            for dt in (0.5, 1.0, 1.5)
+        }
+        basin_w03 = _basin_width(raw_curve, delays, tau_star_index, 0.3)
+        basin_w05 = _basin_width(raw_curve, delays, tau_star_index, 0.5)
+        non_physical = (
+            physical_tau_ms is not None
+            and abs(tau_star_ms - physical_tau_ms) > physical_window_ms + 1e-12
+        )
+        robustness = {
+            "tau_grid_ms": [float(value) for value in delays],
+            "objective_db": [float(value) for value in raw_curve],
+            "robust_objective_db": [float(value) for value in robust_curve],
+            "tau_star_ms": tau_star_ms,
+            "tau_robust_ms": tau_robust_ms,
+            "f_tau_star_db": float(raw_curve[tau_star_index]),
+            "f_robust_tau_robust_db": float(robust_curve[delay_index]),
+            "fragility_db": float(robust_curve[tau_star_index] - raw_curve[tau_star_index]),
+            "basin_w03_ms": basin_w03,
+            "basin_w05_ms": basin_w05,
+            "worst_case_db": worst_case,
+            "n_competing": competing,
+            "physical_tau_ms": physical_tau_ms,
+            "physical_window_ms": physical_window_ms,
+            "physical_window_in_scan": physical_window_in_scan,
+            "non_physical_solution": non_physical,
+        }
         result.append(
             (
                 int(polarities[polarity_index]),
@@ -155,6 +429,7 @@ def _best_configurations(
                 float(scores[polarity_index, delay_index, gain_index]),
                 delay_plateau_ms,
                 gain_plateau_db,
+                robustness,
             )
         )
     return result
@@ -172,6 +447,9 @@ def _init_pair_worker(
     score_dip_weight: float,
     modal_signature: RoomModalSignature | None,
     modal_options: ModalOptions | None,
+    arrival_delays_ms: list[float | None],
+    arrival_outliers: set[int],
+    search_options: SearchOptions,
 ) -> None:
     """Stash shared read-only search state once per worker process.
 
@@ -188,6 +466,9 @@ def _init_pair_worker(
         score_dip_weight=score_dip_weight,
         modal_signature=modal_signature,
         modal_options=modal_options,
+        arrival_delays_ms=arrival_delays_ms,
+        arrival_outliers=arrival_outliers,
+        search_options=search_options,
     )
 
 
@@ -245,9 +526,39 @@ def _compute_pair(
     score_dip_weight = _worker_state["score_dip_weight"]
     modal_signature: RoomModalSignature | None = _worker_state["modal_signature"]
     modal_options: ModalOptions | None = _worker_state["modal_options"]
+    arrival_delays_ms: list[float | None] = _worker_state["arrival_delays_ms"]
+    arrival_outliers: set[int] = _worker_state["arrival_outliers"]
+    search_options: SearchOptions = _worker_state["search_options"]
+
+    first_arrival = arrival_delays_ms[first]
+    second_arrival = arrival_delays_ms[second]
+    # Delay is applied to sub 2, hence the physical compensation is t_A-t_B.
+    physical_tau_ms = (
+        float(first_arrival - second_arrival)
+        if first_arrival is not None and second_arrival is not None
+        else None
+    )
+    delta_tau_max_ms, conservative_bound = _geometry_jitter(
+        first,
+        second,
+        search_options.listener_position_m,
+        search_options.sub_positions_m,
+        search_options.listener_movement_m,
+        search_options.speed_of_sound_m_per_s,
+    )
+    sigma_tau_ms = delta_tau_max_ms / 2.0
 
     configurations = _best_configurations(
-        context, first, second, delays, gains, score_low_end_weight, score_dip_weight
+        context,
+        first,
+        second,
+        delays,
+        gains,
+        score_low_end_weight,
+        score_dip_weight,
+        sigma_tau_ms,
+        physical_tau_ms,
+        search_options.physical_delay_window_ms,
     )
     finalists = []
     for (
@@ -257,6 +568,7 @@ def _compute_pair(
         _fast_score_db,
         delay_plateau_ms,
         gain_plateau_db,
+        robustness,
     ) in configurations:
         diagnostics = pair_diagnostics(
             context,
@@ -273,6 +585,7 @@ def _compute_pair(
         )
         diagnostics["delay_plateau_ms"] = delay_plateau_ms
         diagnostics["gain_plateau_db"] = gain_plateau_db
+        diagnostics["robustness"] = robustness
         finalists.append((polarity, delay_ms, gain_db, diagnostics))
     polarity, delay_ms, gain_db, diagnostics = max(
         finalists,
@@ -282,6 +595,47 @@ def _compute_pair(
             -item[1],
             -item[2],
         ),
+    )
+    robustness = diagnostics["robustness"]
+    measurement_outlier = first in arrival_outliers or second in arrival_outliers
+    robustness.update(
+        {
+            "delta_tau_max_ms": delta_tau_max_ms,
+            "sigma_tau_ms": sigma_tau_ms,
+            "geometry_conservative_bound": conservative_bound,
+            "basin_covers_geometry": (
+                float(robustness["basin_w03_ms"]) + 1e-12 >= delta_tau_max_ms
+            ),
+            "arrival_delay_first_ms": first_arrival,
+            "arrival_delay_second_ms": second_arrival,
+            "measurement_delay_outlier": measurement_outlier,
+            "pair_valid": (
+                not measurement_outlier and bool(robustness["physical_window_in_scan"])
+            ),
+        }
+    )
+    # Stable top-level names keep the JSON convenient for tabular consumers;
+    # the full curves and units remain grouped in ``robustness``.
+    diagnostics.update(
+        {
+            "tau_star": robustness["tau_star_ms"],
+            "tau_robust": robustness["tau_robust_ms"],
+            "f_tau_star": robustness["f_tau_star_db"],
+            "f_robust_tau_robust": robustness["f_robust_tau_robust_db"],
+            "fragility": robustness["fragility_db"],
+            "basin_w03": robustness["basin_w03_ms"],
+            "basin_w05": robustness["basin_w05_ms"],
+            "worst_case": robustness["worst_case_db"],
+            "n_competing": robustness["n_competing"],
+            "geometric_pass": robustness["basin_covers_geometry"],
+            "delta_tau_max": robustness["delta_tau_max_ms"],
+            "sigma_tau": robustness["sigma_tau_ms"],
+            "geometry_conservative_bound": robustness["geometry_conservative_bound"],
+            "physical_tau": robustness["physical_tau_ms"],
+            "physical_constraint_available": robustness["physical_tau_ms"] is not None,
+            "non_physical_solution": robustness["non_physical_solution"],
+            "pair_valid": robustness["pair_valid"],
+        }
     )
     if modal_signature is not None and modal_options is not None:
         # Stage 2 (fixed-pole residue fit) is a single linear solve, so this
@@ -359,9 +713,18 @@ def run_search(
     progress: Callable[[int, int, str], None] | None = None,
 ) -> dict:
     measurements, manifest = load_cache(cache_dir)
-    delays = inclusive_range(*options.delay_range_ms)
+    requested_delay_step_ms = float(options.delay_range_ms[2])
+    effective_delay_step_ms = min(requested_delay_step_ms, MAX_DELAY_GRID_STEP_MS)
+    delays = inclusive_range(
+        options.delay_range_ms[0], options.delay_range_ms[1], effective_delay_step_ms
+    )
     gains = inclusive_range(*options.gain_range_db)
     context = AnalysisContext(measurements, options.band, options.ppo)
+    arrival_delays_ms, arrival_outliers, arrival_warnings = _arrival_outliers(
+        measurements,
+        options.speed_of_sound_m_per_s,
+        options.room_dimensions_m,
+    )
     # With no EQ bands to fit, the correction range has nothing to scope: score,
     # excess GD, and every other diagnostic should see the full analysis band
     # rather than a possibly narrower --eq-range left over from another run.
@@ -407,6 +770,9 @@ def run_search(
             options.score_dip_weight,
             modal_signature,
             modal_options,
+            arrival_delays_ms,
+            arrival_outliers,
+            options,
         ),
     ) as executor:
         for ordinal, (first, second, polarity, delay_ms, gain_db, diagnostics) in enumerate(
@@ -446,15 +812,23 @@ def run_search(
         )
 
     def _raw_sort_key(i: int) -> tuple:
-        base = (-pairs[i]["score_db"],)
+        # Invalid arrival metadata and a raw optimum outside the physical
+        # window are disqualifiers. Score remains the primary ordering among
+        # physically credible pairs and its formula is unchanged.
+        eligibility = (
+            0 if pairs[i].get("pair_valid", True) else 1,
+            1 if pairs[i].get("non_physical_solution", False) else 0,
+        )
+        base = eligibility + (-pairs[i]["score_db"],)
         tiebreak = _modal_tiebreak_key(pairs[i]) if options.modal_tiebreak else ()
         return base + tiebreak + (pairs[i]["first"], pairs[i]["second"])
 
     raw_order = sorted(range(len(pairs)), key=_raw_sort_key)
     pairs = [pairs[i] for i in raw_order]
-    reference_spl = pairs[0]["spl_db"]
-    reference_low_end_power = pairs[0]["low_end_power_db"]
-    reference_score = pairs[0]["score_db"]
+    raw_reference = max(pairs, key=lambda row: row["score_db"])
+    reference_spl = raw_reference["spl_db"]
+    reference_low_end_power = raw_reference["low_end_power_db"]
+    reference_score = raw_reference["score_db"]
     for rank, row in enumerate(pairs, start=1):
         row["rank"] = rank
         row["relative_score_db"] = float(row["score_db"] - reference_score)
@@ -463,15 +837,20 @@ def run_search(
             row["low_end_power_db"] - reference_low_end_power
         )
     def _eq_sort_key(i: int) -> tuple:
-        base = (-pairs[i]["post_eq_score_db"],)
+        eligibility = (
+            0 if pairs[i].get("pair_valid", True) else 1,
+            1 if pairs[i].get("non_physical_solution", False) else 0,
+        )
+        base = eligibility + (-pairs[i]["post_eq_score_db"],)
         tiebreak = _modal_tiebreak_key(pairs[i]) if options.modal_tiebreak else ()
         return base + tiebreak + (pairs[i]["first"], pairs[i]["second"])
 
     eq_order = sorted(range(len(pairs)), key=_eq_sort_key)
     eq_pairs = [pairs[i] for i in eq_order]
-    eq_reference_spl = eq_pairs[0]["post_eq_spl_db"]
-    eq_reference_low_end_power = eq_pairs[0]["post_eq_low_end_power_db"]
-    eq_reference_score = eq_pairs[0]["post_eq_score_db"]
+    eq_reference = max(eq_pairs, key=lambda row: row["post_eq_score_db"])
+    eq_reference_spl = eq_reference["post_eq_spl_db"]
+    eq_reference_low_end_power = eq_reference["post_eq_low_end_power_db"]
+    eq_reference_score = eq_reference["post_eq_score_db"]
     for eq_rank, row in enumerate(eq_pairs, start=1):
         row["eq_rank"] = eq_rank
         row["post_eq_relative_score_db"] = float(
@@ -519,7 +898,7 @@ def run_search(
     ]
 
     result = {
-        "format_version": 23,
+        "format_version": 24,
         "measurement_count": len(measurements),
         "sample_rate": measurements[0].sample_rate,
         "response_length": measurements[0].impulse.size,
@@ -527,7 +906,32 @@ def run_search(
             "band_hz": list(options.band),
             "ppo": options.ppo,
             "delay_range_ms": list(options.delay_range_ms),
+            "delay_grid_step_ms": effective_delay_step_ms,
             "gain_range_db": list(options.gain_range_db),
+            "robustness": {
+                "objective": "f = -raw usable-output score (lower is better)",
+                "listener_movement_m": options.listener_movement_m,
+                "speed_of_sound_m_per_s": options.speed_of_sound_m_per_s,
+                "physical_delay_window_ms": options.physical_delay_window_ms,
+                "gain_jitter_sigma_db": GAIN_JITTER_SIGMA_DB,
+                "geometry_configured": (
+                    options.listener_position_m is not None
+                    and options.sub_positions_m is not None
+                ),
+                "listener_position_m": options.listener_position_m,
+                "sub_positions_m": options.sub_positions_m,
+                "room_dimensions_m": options.room_dimensions_m,
+                "note": (
+                    "sigma_tau is half the pair-specific maximum differential "
+                    "arrival-time excursion for the configured listener movement. "
+                    "Without complete coordinates, 2d/c is used and each pair is "
+                    "marked geometry_conservative_bound. Basin width is only a "
+                    "disqualifier: a narrow basin proves timing fragility, but a "
+                    "wide basin does not model the magnitude-response change caused "
+                    "by moving through the room's modal pressure field. Only "
+                    "multi-position measurements can validate a listening area."
+                ),
+            },
             "eq": {
                 "target": eq_options.target,
                 "correction_range_hz": list(eq_range),
@@ -664,11 +1068,13 @@ def run_search(
                         "multiplier"
                     ),
                     "configuration_selection": (
-                        f"the exhaustive raw pass shortlists up to "
-                        f"{SHORTLIST_PER_OBJECTIVE} highest-score and "
-                        f"{SHORTLIST_PER_OBJECTIVE} lowest-dip configurations "
-                        "per pair; fitted post-EQ score selects the reported "
-                        "polarity/delay/gain tuple"
+                        "the exhaustive raw pass evaluates the full delay grid, "
+                        "Gaussian-averages f=-score over pair-specific timing jitter "
+                        "and +/-1 dB gain jitter, then chooses a robust delay for each "
+                        f"polarity/gain and shortlists up to {SHORTLIST_PER_OBJECTIVE} "
+                        f"lowest-robust-f and {SHORTLIST_PER_OBJECTIVE} lowest-dip "
+                        "configurations; fitted post-EQ score selects polarity/gain "
+                        "from that shortlist without changing the robust delay"
                     ),
                 },
                 "headroom": {
@@ -765,6 +1171,9 @@ def run_search(
             },
         },
         "cache_manifest_format": manifest.get("format_version"),
+        "warnings": arrival_warnings,
+        "measurement_arrival_delays_ms": arrival_delays_ms,
+        "measurement_arrival_delay_outliers": sorted(index + 1 for index in arrival_outliers),
         "modal_signature": modal_signature_json,
         "pairs": pairs,
     }

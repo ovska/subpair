@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import sys
 from pathlib import Path
@@ -81,6 +82,57 @@ def _parse_room_dimensions(value: str) -> tuple[float, float, float]:
     return length, width, height
 
 
+def _parse_geometry_config(
+    path: Path,
+) -> tuple[
+    tuple[float, float, float] | None,
+    dict[int, tuple[float, float, float]] | None,
+    tuple[float, float, float] | None,
+]:
+    """Read listener/sub coordinates in metres from a small JSON config."""
+
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Cannot read geometry config {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ValueError("Geometry config must be a JSON object")
+
+    def coordinate(raw: object, label: str) -> tuple[float, float, float]:
+        if not isinstance(raw, list) or len(raw) != 3:
+            raise ValueError(f"{label} must be a three-number [x, y, z] array in metres")
+        result = tuple(float(item) for item in raw)
+        if not all(math.isfinite(item) for item in result):
+            raise ValueError(f"{label} coordinates must be finite")
+        return result  # type: ignore[return-value]
+
+    listener_raw = value.get("listening_position_m", value.get("listener_position_m"))
+    listener = coordinate(listener_raw, "listening_position_m") if listener_raw is not None else None
+    subs_raw = value.get("sub_positions_m")
+    subs: dict[int, tuple[float, float, float]] | None = None
+    if subs_raw is not None:
+        subs = {}
+        if isinstance(subs_raw, list):
+            for position, raw in enumerate(subs_raw, start=1):
+                subs[position] = coordinate(raw, f"sub_positions_m[{position - 1}]")
+        elif isinstance(subs_raw, dict):
+            for key, raw in subs_raw.items():
+                try:
+                    position = int(key)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("sub_positions_m object keys must be 1-based positions") from exc
+                if position < 1:
+                    raise ValueError("sub_positions_m object keys must be positive")
+                subs[position] = coordinate(raw, f"sub_positions_m[{key!r}]")
+        else:
+            raise ValueError("sub_positions_m must be an array or object")
+    room_raw = value.get("room_dimensions_m")
+    room = coordinate(room_raw, "room_dimensions_m") if room_raw is not None else None
+    if room is not None and any(item <= 0.0 for item in room):
+        raise ValueError("room_dimensions_m values must be positive")
+    return listener, subs, room
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="subpair",
@@ -106,7 +158,38 @@ def _build_parser() -> argparse.ArgumentParser:
         nargs=3,
         type=float,
         metavar=("MIN_MS", "MAX_MS", "STEP_MS"),
-        default=(-10.0, 10.0, 0.1),
+        default=(-10.0, 10.0, 0.05),
+    )
+    search.add_argument(
+        "--geometry-config",
+        "--geometry",
+        dest="geometry_config",
+        type=Path,
+        help=(
+            "JSON geometry in metres: listening_position_m, sub_positions_m "
+            "(1-based array/object), and optional room_dimensions_m"
+        ),
+    )
+    search.add_argument(
+        "--listener-movement",
+        type=_bounded_float(0.001, 5.0),
+        default=0.25,
+        metavar="METRES",
+        help="listener displacement used for geometric timing jitter (default: 0.25)",
+    )
+    search.add_argument(
+        "--speed-of-sound",
+        type=_bounded_float(250.0, 400.0),
+        default=343.0,
+        metavar="M_PER_S",
+        help="speed of sound used for geometry and path checks (default: 343)",
+    )
+    search.add_argument(
+        "--physical-delay-window",
+        type=_bounded_float(0.05, 20.0),
+        default=1.5,
+        metavar="MS",
+        help="search window around measured relative arrival delay (default: 1.5 ms)",
     )
     search.add_argument(
         "--gain-range",
@@ -314,6 +397,9 @@ def _fetch(args: argparse.Namespace) -> int:
             flush=True,
         )
         impulse, metadata = client.fetch_impulse(index)
+        summary_arrival_delay = client.measurement_arrival_delay_seconds(summary)
+        if summary_arrival_delay is not None:
+            metadata["arrival_delay_seconds"] = summary_arrival_delay
         rows.append(
             {
                 "source_index": index,
@@ -356,20 +442,34 @@ def _format_tail(row: dict, eq: bool) -> str:
 
 
 def _print_ranking(result: dict, top: int) -> None:
+    for warning in result.get("warnings", []):
+        print(f"WARNING: {warning}", file=sys.stderr)
+
     def print_mode(rows: list[dict], eq: bool) -> None:
         label = "EQ'd" if eq else "Raw"
         print(f"\n{label} ranking")
         print(
-            "Score dB  Pair     Pol   Delay ms  Gain dB  Headroom  Dip dB  Excess ms  "
-            "Excess95 ms  Peak ms      Tail  LE power  Rel SPL"
+            "Score dB  Pair     Pol  Robust ms    Raw* ms  Gain dB  Frag dB  Basin03  "
+            "Worst1 f  Geo  Phys  Headroom  Dip dB  Excess ms  Excess95 ms  Peak ms  "
+            "    Tail  LE power  Rel SPL"
         )
         for row in rows[:top]:
             pair = f"{row['first']}+{row['second']}"
             polarity = "+" if row["polarity"] > 0 else "-"
+            physical_status = (
+                "N/A"
+                if not row.get("physical_constraint_available", row.get("physical_tau") is not None)
+                else ("OUT" if row["non_physical_solution"] else "OK")
+            )
             print(
                 f"{row['post_eq_relative_score_db' if eq else 'relative_score_db']:>+8.2f}  "
                 f"{pair:<7}  {polarity:>3}  "
-                f"{row['delay_ms']:>+9.3f}  {row['gain_db']:>+7.2f}  "
+                f"{row['delay_ms']:>+9.3f}  {row['tau_star']:>+9.3f}  "
+                f"{row['gain_db']:>+7.2f}  "
+                f"{row['fragility']:>7.2f}  {row['basin_w03']:>7.2f}  "
+                f"{row['worst_case']['1.0']:>8.2f}  "
+                f"{'PASS' if row['geometric_pass'] else 'FAIL':>4}  "
+                f"{physical_status:>4}  "
                 f"{row['post_eq_headroom_db' if eq else 'headroom_db']:>+8.2f}  "
                 f"{row['post_eq_dip_db' if eq else 'dip_db']:>6.3f}  "
                 f"{row['post_eq_excess_gd_ms' if eq else 'excess_gd_ms']:>9.3f}  "
@@ -386,6 +486,13 @@ def _print_ranking(result: dict, top: int) -> None:
 
 def _search(args: argparse.Namespace) -> int:
     output = _results_path(args.cache, args.results)
+    listener_position = None
+    sub_positions = None
+    room_dimensions = None
+    if args.geometry_config is not None:
+        listener_position, sub_positions, room_dimensions = _parse_geometry_config(
+            args.geometry_config
+        )
     options = SearchOptions(
         band=tuple(args.band),
         delay_range_ms=tuple(args.delay_range),
@@ -402,6 +509,12 @@ def _search(args: argparse.Namespace) -> int:
         low_shelf=args.low_shelf == "on",
         modal=args.modal == "on",
         modal_tiebreak=args.modal_tiebreak == "on",
+        listener_position_m=listener_position,
+        sub_positions_m=sub_positions,
+        room_dimensions_m=room_dimensions,
+        listener_movement_m=args.listener_movement,
+        speed_of_sound_m_per_s=args.speed_of_sound,
+        physical_delay_window_ms=args.physical_delay_window,
     )
 
     def progress(done: int, total: int, pair: str) -> None:
