@@ -144,17 +144,24 @@ The pair JSON and comparison table include:
   not the total duration of every disconnected near-optimal region;
 - `worst_case` at 0.5, 1.0, and 1.5 ms around `tau_star`;
 - `n_competing`: local minima within 0.3 dB of the raw global minimum; and
-- `basin_scaled`: the contiguous width at a degradation equal to a configured
-  fraction (5% by default) of the pair's objective range inside its physical
-  window; and
-- `geometric_pass`: whether `basin_scaled` covers the pair's geometric
-  excursion.
+- `excursion_penalty_db`: the worst degradation of `f` anywhere within
+  `+/-delta_tau_max/2` of the **recommended** delay, with
+  `excursion_half_width_ms` recording that half-width;
+- `basin_tolerance_ms`: the contiguous basin around the recommended delay at
+  the absolute `basin_tolerance_db` (0.5 dB by default); and
+- `geometric_pass`: whether `excursion_penalty_db` stays within
+  `basin_tolerance_db`.
 
-The fixed `basin_w03`/`basin_w05` values remain for comparison, but their
-absolute thresholds can be disproportionately narrow when different
-objectives span very different ranges. The scaled basin drives the geometric
-gate. The report plots raw and jitter-averaged `f(tau)`, shades that adaptive
-contiguous basin, and separately marks the measured physical delay,
+The excursion penalty is deliberately an absolute dB figure measured at the
+delay the pair actually recommends. Scaling the tolerance to each pair's own
+objective range normalises away exactly the property the gate is testing: a
+pair whose objective varies by only 1.4 dB across the entire physical window
+is maximally delay-insensitive, yet a 5%-of-range tolerance shrinks to 0.07 dB
+and fails it, while a pair spanning 17 dB gets a twelve-times-looser tolerance
+and passes with twice the real excursion penalty. `basin_w03`/`basin_w05`
+remain as fixed-threshold diagnostics around `tau_star`. The report plots raw
+and jitter-averaged `f(tau)`, shades the tolerance basin around the
+recommended delay, and separately marks the measured physical delay,
 `tau_star`, `tau_robust`, and the best-fit mirror axis of the detrended curve.
 Mirror correlation and axis offset are visual diagnostics only; they never
 affect the verdict.
@@ -164,9 +171,19 @@ time. Because delay is applied to sub 2, a pair's physical compensation is
 `arrival_1 - arrival_2`. Robust delay selection is restricted to that value
 +/- `--physical-delay-window` (1.5 ms by default). The unconstrained raw
 optimum is still reported and marked `non_physical_solution` when it lies
-outside the window. Such pairs, pairs whose window does not intersect the scan,
-and pairs involving an arrival-delay outlier are disqualified ahead of score;
-score remains the unchanged ordering within the physically credible group.
+outside the window; that marking is a **caution**, not a veto, because the
+recommended delay was already constrained into the window and never used the
+distant optimum.
+
+An arrival-delay outlier discards that pair's physical timing and says so,
+taking the same caution path as absent arrival metadata — a known-bad reading
+is not more informative than a missing one, so it cannot warrant a harsher
+verdict. What is then rejected is evidence from the data itself: a selected
+delay pinned to the edge of `--delay-range` is the limit of the search rather
+than an optimum, and every robustness figure around it is one-sided (the
+excursion penalty can even read 0 dB), so it is disqualified with a message
+naming the range to widen. Only pairs with no usable physical timing can reach
+the edge, since the rest are constrained to a window well inside the scan.
 Subpair warns about delays above 1.5 times the median and, when room dimensions
 are configured, path lengths longer than the room diagonal. Old caches without
 arrival metadata remain usable, but their affected pairs explicitly say the
@@ -224,11 +241,14 @@ The gates run in this order:
 - **B — ripple correlation:** correlation after subtracting each response's
   one-octave magnitude trend; reject reinforcing errors above +0.3 and label
   values below -0.1 complementary. This is a screen, never a ranking boost.
-- **C — physical-delay percentile:** the normal-polarity, equal-gain objective
-  at the header-derived arrival alignment within the pair's delay landscape;
-  reject above the 75th percentile and report the absolute gap to `f(tau*)`.
-- **Basin vs geometry:** reject when the adaptive contiguous basin is narrower
-  than the listener-movement delay excursion.
+- **C — physical-delay percentile:** the equal-gain objective at the
+  header-derived arrival alignment within the pair's delay landscape; reject
+  above the 75th percentile and report the absolute gap to `f(tau*)`. Also
+  rejects a delay pinned to the edge of the delay scan, and cautions on a
+  non-physical raw optimum or discarded arrival timing.
+- **Basin vs geometry:** reject when the worst degradation of `f` within
+  `+/-delta_tau_max/2` of the recommended delay exceeds `--gate-basin-tolerance`
+  (0.5 dB).
 - **D — cancellation deficit:** coherent mean level minus the corresponding
   incoherent power sum at both physical and selected alignment; caution below
   -1 dB and reject below -3 dB.
@@ -239,10 +259,28 @@ The gates run in this order:
 - **G — gain asymmetry:** caution above a 4 dB relative offset and record
   search-boundary/headroom achievability information.
 - **H — band-edge stability:** shift the evaluation band down and up by 1/6
-  octave; reject a score spread above 2 dB.
+  octave; reject when this pair's score spread exceeds the median spread across
+  every scored pair by more than 1 dB. The raw spread is nearly identical for
+  every pair — the subs roll off below the band and low-end power weights the
+  region at `f^-4`, so an up-shifted band always scores higher — and that
+  common-mode term is a property of the score, not of any pair. With a single
+  scored pair the excess is zero and the gate abstains.
 - **I — improvement localisation:** reject when more than 50% of positive
   detrended-ripple improvement over physical alignment lies in one sliding
-  1/6-octave region.
+  1/6-octave region, but only once that improvement is material: at least
+  `--gate-localization-min-improvement` (0.25 dB) of mean positive ripple
+  improvement per log-frequency bin. Below that floor the share is a ratio of
+  two noise-level sums, and it fires hardest on pairs whose tuned configuration
+  is indistinguishable from simply connecting both subs — the outcome that
+  depends on no delay trick at all.
+
+Gates C, D and I reference the pair at its measured arrival alignment with
+equal gain and **whichever polarity is better there**. A polarity flip is free,
+exact and immune to drift, so it belongs in the "no tuning applied" baseline;
+delay and gain are the fragile tuning these gates exist to police. Pinning the
+baseline to normal polarity instead scores every inverted-polarity pair in the
+one configuration it explicitly rejects, which is a systematic penalty rather
+than a diagnostic one.
 
 All thresholds live in `GateThresholds`, are exposed as `--gate-*` search
 arguments, and are serialized under `settings.gates.thresholds`. The HTML

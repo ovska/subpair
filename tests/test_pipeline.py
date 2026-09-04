@@ -20,11 +20,14 @@ from subpair.cli import (
 from subpair.engine import (
     GateThresholds,
     SearchOptions,
+    _apply_band_edge_population_status,
+    _score_wide_spectrum,
     _arrival_outliers,
     _baseline_objective_curve,
     _basin_width,
     _detrended_symmetry,
     _geometry_jitter,
+    _improvement_localization,
     _redundancy_residual,
     _ripple_deviation_correlation,
     run_search,
@@ -87,9 +90,10 @@ def _permissive_gates() -> GateThresholds:
         comb_index_caution=1.0,
         notch_depth_reject_db=300.0,
         gain_asymmetry_caution_db=100.0,
-        band_edge_spread_reject_db=300.0,
+        band_edge_excess_spread_reject_db=300.0,
         localization_fraction_reject=1.0,
-        basin_range_fraction=1.0,
+        localization_min_mean_improvement_db=0.0,
+        basin_tolerance_db=300.0,
     )
 
 
@@ -202,6 +206,109 @@ class PipelineTests(unittest.TestCase):
             gate_c["objective_at_physical_db"] - pair["f_tau_star"],
         )
         self.assertEqual(gate_c["gap_reference"], "f(tau_star)")
+
+    def _outlier_cache(
+        self,
+        cache: Path,
+        sample_rate: float,
+        length: int,
+        outlier_sample_delay: int,
+    ) -> None:
+        """Three positions where the third's arrival delay is a clear outlier.
+
+        ``outlier_sample_delay`` separates the two things a flagged arrival can
+        mean: metadata that is wrong while the impulse is fine (a delay close
+        to the others), or an impulse genuinely captured against a different
+        timing reference (a distant one).
+        """
+
+        rows = []
+        for index, (sample_delay, arrival_ms) in enumerate(
+            ((100, 10.0), (108, 11.0), (outlier_sample_delay, 40.0)), start=1
+        ):
+            rows.append(
+                {
+                    "source_index": index,
+                    "title": f"Position {index}",
+                    "uuid": f"uuid-{index}",
+                    "sample_rate": sample_rate,
+                    "start_time_seconds": -0.025,
+                    "impulse": _synthetic_ir(
+                        sample_rate, length, sample_delay, [(50, 0.2), (83, 0.15)]
+                    ),
+                    "metadata": {"arrival_delay_ms": arrival_ms},
+                }
+            )
+        write_cache(cache, rows, {"test": True})
+
+    def test_arrival_outlier_discards_physical_timing_instead_of_the_pair(self):
+        # A known-bad arrival reading is not more informative than a missing
+        # one, so it must take the same caution path rather than a harsher
+        # reject: it makes the physical constraint unusable, not the position
+        # unusable.
+        sample_rate = 4000.0
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = Path(temporary) / "cache"
+            # Impulse well aligned with the others; only the metadata is bad.
+            self._outlier_cache(cache, sample_rate, 4096, 104)
+            result = run_search(
+                cache,
+                cache / "results.json",
+                SearchOptions(
+                    delay_range_ms=(-6.0, 6.0, 0.25),
+                    gain_range_db=(0.0, 0.0, 1.0),
+                    eq_bands=0,
+                    gate_thresholds=_permissive_gates(),
+                ),
+            )
+        outlier_pairs = [
+            row for row in result["pairs"] if 3 in (row["first"], row["second"])
+        ]
+        self.assertEqual(len(outlier_pairs), 2)
+        for row in outlier_pairs:
+            gate_c = row["gates"]["gate_c_physical_percentile"]
+            self.assertNotEqual(gate_c["status"], "not_run")
+            self.assertIn("arrival-delay outlier", gate_c["detail"])
+            # The suspect figure is reported but never used to constrain.
+            self.assertIsNotNone(gate_c["reported_tau_ms"])
+            self.assertIsNone(row["physical_tau"])
+            self.assertTrue(row["robustness"]["measurement_delay_outlier"])
+            # The pair is scored rather than dropped before the optimiser.
+            self.assertTrue(row["optimized"])
+            self.assertIsNotNone(row["score_db"])
+
+    def test_delay_pinned_to_the_scan_edge_is_rejected(self):
+        # An unconstrained pair whose true optimum lies outside --delay-range
+        # runs to the boundary. That is the limit of the search, not an
+        # optimum, and every robustness figure around it is one-sided.
+        sample_rate = 4000.0
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = Path(temporary) / "cache"
+            # The third impulse really is 10 ms away from the others.
+            self._outlier_cache(cache, sample_rate, 4096, 140)
+            result = run_search(
+                cache,
+                cache / "results.json",
+                SearchOptions(
+                    # Far too narrow to reach the third position's alignment.
+                    delay_range_ms=(-0.5, 0.5, 0.25),
+                    gain_range_db=(0.0, 0.0, 1.0),
+                    eq_bands=0,
+                    gate_thresholds=_permissive_gates(),
+                ),
+            )
+        pinned = [
+            row
+            for row in result["pairs"]
+            if row["optimized"] and abs(abs(row["delay_ms"]) - 0.5) <= 1e-9
+        ]
+        self.assertTrue(pinned, "expected at least one boundary-pinned delay")
+        for row in pinned:
+            gate_c = row["gates"]["gate_c_physical_percentile"]
+            self.assertTrue(gate_c["delay_at_scan_boundary"])
+            self.assertEqual(gate_c["status"], "reject")
+            self.assertEqual(row["verdict"], "reject")
+            self.assertIn("--delay-range", gate_c["detail"])
 
     def test_selected_report_graphs_share_data_bounds_and_cap_negative_excess_gd(self):
         rows = [
@@ -321,7 +428,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(defaults.gate_redundancy_reject, 0.5)
         self.assertEqual(defaults.gate_ripple_reject, 0.3)
         self.assertEqual(defaults.gate_physical_percentile, 75.0)
-        self.assertEqual(defaults.gate_basin_range_fraction, 0.05)
+        self.assertEqual(defaults.gate_basin_tolerance, 0.5)
         overridden = parser.parse_args(
             [
                 "search",
@@ -333,7 +440,7 @@ class PipelineTests(unittest.TestCase):
                 "1.5",
                 "--gate-redundancy-reject",
                 "0.45",
-                "--gate-band-edge-spread",
+                "--gate-band-edge-excess-spread",
                 "2.5",
             ]
         )
@@ -341,7 +448,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(overridden.score_low_end_weight, 0.75)
         self.assertEqual(overridden.score_dip_weight, 1.5)
         self.assertEqual(overridden.gate_redundancy_reject, 0.45)
-        self.assertEqual(overridden.gate_band_edge_spread, 2.5)
+        self.assertEqual(overridden.gate_band_edge_excess_spread, 2.5)
 
     def test_delayed_scaled_copy_triggers_redundancy_and_has_expected_symmetry(self):
         sample_rate = 4000.0
@@ -381,7 +488,9 @@ class PipelineTests(unittest.TestCase):
             self.assertAlmostEqual(fitted_delay_ms, 2.0, delta=0.05)
             self.assertGreater(_ripple_deviation_correlation(context, 0, 1), 0.99)
 
-            objective = _baseline_objective_curve(context, 0, 1, delays, 0.5, 1.0)
+            objective, _polarity = _baseline_objective_curve(
+                context, 0, 1, delays, 0.5, 1.0
+            )
             symmetry = _detrended_symmetry(objective, delays, -2.0)
             self.assertGreater(symmetry["correlation"], 0.98)
             self.assertAlmostEqual(symmetry["axis_ms"], -2.0, delta=0.1)
@@ -1164,13 +1273,21 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(
                 sorted(row["eq_rank"] for row in result["pairs"]), list(range(1, 7))
             )
-            raw_scores = [row["score_db"] for row in result["pairs"]]
-            self.assertEqual(raw_scores, sorted(raw_scores, reverse=True))
-            eq_scores = [
-                row["post_eq_score_db"]
+            # The documented sort key is verdict first, then score, so assert
+            # exactly that rather than a flat score ordering: a gate that is not
+            # threshold-driven (the delay-scan-boundary reject) cannot be made
+            # permissive by _permissive_gates and legitimately reorders pairs.
+            verdict_rank = {"accept": 0, "caution": 1, "reject": 2}
+            raw_keys = [
+                (verdict_rank[row["verdict"]], -row["score_db"])
+                for row in result["pairs"]
+            ]
+            self.assertEqual(raw_keys, sorted(raw_keys))
+            eq_keys = [
+                (verdict_rank[row["verdict"]], -row["post_eq_score_db"])
                 for row in sorted(result["pairs"], key=lambda row: row["eq_rank"])
             ]
-            self.assertEqual(eq_scores, sorted(eq_scores, reverse=True))
+            self.assertEqual(eq_keys, sorted(eq_keys))
             loaded = json.loads(results_path.read_text())
             self.assertEqual(loaded["settings"]["ranking"]["raw"][0], "verdict")
             self.assertEqual(loaded["settings"]["ranking"]["raw"][1], "score_db")
@@ -1526,6 +1643,131 @@ class PipelineTests(unittest.TestCase):
             report_path = root / "report.html"
             build_report(cache, results_path, report_path, top=5, limit=15)
             self.assertIn("sub L", report_path.read_text())
+
+
+class GateCorrectionTests(unittest.TestCase):
+    """Each gate fires on the pair that is actually defective, not its opposite."""
+
+    def _gate_h_set(self, spread_db: float) -> dict:
+        return {"gate_h_band_edge_stability": {"status": "pass", "spread_db": spread_db}}
+
+    def test_band_edge_gate_ignores_a_spread_every_pair_shares(self):
+        # Shifting the evaluation band moves every pair by nearly the same
+        # amount, because the subs roll off below the band. A raw-spread
+        # threshold cutting through that cluster rejects pairs for a property
+        # of the score function; the excess over the population must not.
+        thresholds = GateThresholds(band_edge_excess_spread_reject_db=1.0)
+        gate_sets = [self._gate_h_set(value) for value in (1.75, 1.82, 1.89, 2.04, 2.05, 2.06)]
+        _apply_band_edge_population_status(gate_sets, thresholds)
+        self.assertTrue(
+            all(
+                gate_set["gate_h_band_edge_stability"]["status"] == "pass"
+                for gate_set in gate_sets
+            )
+        )
+        self.assertAlmostEqual(
+            gate_sets[0]["gate_h_band_edge_stability"]["population_median_spread_db"],
+            1.965,
+        )
+
+    def test_band_edge_gate_still_rejects_a_genuine_outlier(self):
+        thresholds = GateThresholds(band_edge_excess_spread_reject_db=1.0)
+        gate_sets = [self._gate_h_set(value) for value in (1.8, 1.9, 2.0, 2.1, 9.0)]
+        _apply_band_edge_population_status(gate_sets, thresholds)
+        statuses = [g["gate_h_band_edge_stability"]["status"] for g in gate_sets]
+        self.assertEqual(statuses, ["pass", "pass", "pass", "pass", "reject"])
+
+    def test_band_edge_gate_abstains_with_a_single_scored_pair(self):
+        thresholds = GateThresholds(band_edge_excess_spread_reject_db=0.0)
+        gate_sets = [self._gate_h_set(50.0)]
+        _apply_band_edge_population_status(gate_sets, thresholds)
+        self.assertEqual(gate_sets[0]["gate_h_band_edge_stability"]["status"], "pass")
+        self.assertEqual(gate_sets[0]["gate_h_band_edge_stability"]["excess_spread_db"], 0.0)
+
+    @staticmethod
+    def _two_position_context(second: np.ndarray, ppo: int = 48) -> AnalysisContext:
+        sample_rate = 4000.0
+        length = 4096
+        source = _synthetic_ir(sample_rate, length, 100, [(43.0, 0.20), (91.0, 0.20)])
+        rows = [
+            {
+                "source_index": index,
+                "title": title,
+                "uuid": str(index),
+                "sample_rate": sample_rate,
+                "start_time_seconds": -0.025,
+                "impulse": impulse,
+            }
+            for index, (title, impulse) in enumerate(
+                [("a", source), ("b", second(source))], start=1
+            )
+        ]
+        temporary = tempfile.mkdtemp()
+        cache = Path(temporary)
+        write_cache(cache, rows, {"test": True})
+        measurements, _manifest = load_cache(cache)
+        return AnalysisContext(measurements, (35.0, 150.0), ppo)
+
+    def test_physical_baseline_is_free_to_invert_polarity(self):
+        # The Gate C baseline must not be pinned to normal polarity: a polarity
+        # flip is free, exact and drift-immune, so scoring every
+        # inverted-polarity pair in the configuration it explicitly rejects
+        # produces a systematic penalty rather than a diagnostic one.
+        def shift(source: np.ndarray) -> np.ndarray:
+            out = np.zeros_like(source)
+            out[13:] = 0.85 * source[:-13]
+            return out
+
+        context = self._two_position_context(shift)
+        delays = np.arange(-5.0, 5.0001, 0.25)
+        envelope, polarity = _baseline_objective_curve(context, 0, 1, delays, 0.5, 1.0)
+        self.assertEqual(envelope.shape, delays.shape)
+        self.assertEqual(set(np.unique(polarity)).difference({1, -1}), set())
+        # Both polarities are the better choice somewhere in a 10 ms sweep, and
+        # the envelope is never worse than normal polarity alone.
+        self.assertTrue(np.any(polarity == -1))
+        self.assertTrue(np.any(polarity == 1))
+        phase = np.exp(
+            -2j * np.pi * delays[:, None] * context.trend_frequencies[None, :] / 1000.0
+        )
+        normal = -np.asarray(
+            _score_wide_spectrum(
+                context,
+                context.trend_spectra[0][None, :]
+                + context.trend_spectra[1][None, :] * phase,
+                0.5,
+                1.0,
+            ),
+            dtype=np.float64,
+        )
+        self.assertTrue(np.all(envelope <= normal + 1e-9))
+
+    def test_localization_reports_a_per_bin_mean_that_is_zero_without_improvement(self):
+        # The concentration fraction is a ratio of two sums of positive ripple
+        # improvement; once both collapse to noise it carries no information,
+        # so the gate needs an absolute floor to test against.
+        def shift(source: np.ndarray) -> np.ndarray:
+            out = np.zeros_like(source)
+            out[13:] = 0.85 * source[:-13]
+            return out
+
+        context = self._two_position_context(shift)
+        physical = context.sum_on_trend_grid(0, 1, 1, 0.0, 0.0)
+        identical = _improvement_localization(context, physical, physical, 0.5, 1.0)
+        self.assertEqual(identical["mean_ripple_improvement_db"], 0.0)
+        self.assertEqual(identical["positive_ripple_improvement_db_sum"], 0.0)
+
+        changed = _improvement_localization(
+            context, context.sum_on_trend_grid(0, 1, 1, 0.6, 0.0), physical, 0.5, 1.0
+        )
+        self.assertGreater(changed["mean_ripple_improvement_db"], 0.0)
+        # A per-bin mean keeps the materiality floor independent of band width
+        # and points-per-octave.
+        self.assertAlmostEqual(
+            changed["mean_ripple_improvement_db"] * context.frequencies.size,
+            changed["positive_ripple_improvement_db_sum"],
+            places=9,
+        )
 
 
 class RoomModeTests(unittest.TestCase):

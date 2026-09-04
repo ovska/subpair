@@ -56,9 +56,10 @@ class GateThresholds:
     notch_depth_reject_db: float = 8.0
     notch_max_width_octaves: float = 1.0 / 6.0
     gain_asymmetry_caution_db: float = 4.0
-    band_edge_spread_reject_db: float = 2.0
+    band_edge_excess_spread_reject_db: float = 1.0
     localization_fraction_reject: float = 0.50
-    basin_range_fraction: float = 0.05
+    localization_min_mean_improvement_db: float = 0.25
+    basin_tolerance_db: float = 0.5
 
     def __post_init__(self) -> None:
         values = asdict(self)
@@ -86,12 +87,14 @@ class GateThresholds:
             raise ValueError("Notch depth and width thresholds must be positive")
         if self.gain_asymmetry_caution_db < 0.0:
             raise ValueError("Gain-asymmetry threshold must be non-negative")
-        if self.band_edge_spread_reject_db < 0.0:
-            raise ValueError("Band-edge spread threshold must be non-negative")
+        if self.band_edge_excess_spread_reject_db < 0.0:
+            raise ValueError("Band-edge excess-spread threshold must be non-negative")
         if not 0.0 <= self.localization_fraction_reject <= 1.0:
             raise ValueError("Localization fraction threshold must be between 0 and 1")
-        if not 0.0 < self.basin_range_fraction <= 1.0:
-            raise ValueError("Basin range fraction must be in (0, 1]")
+        if self.localization_min_mean_improvement_db < 0.0:
+            raise ValueError("Localization minimum improvement must be non-negative")
+        if self.basin_tolerance_db <= 0.0:
+            raise ValueError("Basin tolerance must be positive")
 
 
 @dataclass(frozen=True)
@@ -300,8 +303,16 @@ def _baseline_objective_curve(
     delays_ms: np.ndarray,
     score_low_end_weight: float,
     score_dip_weight: float,
-) -> np.ndarray:
-    """Normal-polarity, equal-gain delay landscape used by physical Gate C."""
+) -> tuple[np.ndarray, np.ndarray]:
+    """Equal-gain delay landscape, free to pick either polarity, for Gate C.
+
+    Returns ``(objective, polarity)``.  Fixing the baseline to normal polarity
+    scores every inverted-polarity pair in the one configuration it explicitly
+    rejects, and the resulting penalty is systematic rather than diagnostic.
+    A polarity flip is free, exact and immune to drift, so it belongs in the
+    "no tuning applied" reference; only delay and gain are the fragile,
+    drift-sensitive tuning this gate exists to police.
+    """
 
     phase = np.exp(
         -2j
@@ -310,18 +321,24 @@ def _baseline_objective_curve(
         * context.trend_frequencies[None, :]
         / 1000.0
     )
-    sums = context.trend_spectra[first][None, :] + context.trend_spectra[
-        second
-    ][None, :] * phase
-    return -np.asarray(
-        _score_wide_spectrum(
-            context,
-            sums,
-            score_low_end_weight,
-            score_dip_weight,
-        ),
-        dtype=np.float64,
+    shifted = context.trend_spectra[second][None, :] * phase
+    reference = context.trend_spectra[first][None, :]
+    curves = np.vstack(
+        [
+            -np.asarray(
+                _score_wide_spectrum(
+                    context,
+                    reference + polarity * shifted,
+                    score_low_end_weight,
+                    score_dip_weight,
+                ),
+                dtype=np.float64,
+            )
+            for polarity in (1.0, -1.0)
+        ]
     )
+    best = np.argmin(curves, axis=0)
+    return curves[best, np.arange(curves.shape[1])], np.where(best == 0, 1, -1)
 
 
 def _redundancy_residual(
@@ -569,12 +586,16 @@ def _improvement_localization(
         0.0,
     )
     positive_total = float(np.sum(positive_improvement))
+    # Per-bin mean, so the materiality test below is independent of band width
+    # and points-per-octave.
+    mean_improvement_db = positive_total / max(1, int(positive_improvement.size))
     if positive_total <= 1e-9:
         return {
             "fraction": 0.0,
             "frequency_hz": None,
             "contribution_db_sum": 0.0,
             "positive_ripple_improvement_db_sum": positive_total,
+            "mean_ripple_improvement_db": mean_improvement_db,
             "score_improvement_db": improvement_db,
         }
     width_bins = max(1, int(round(context.ppo / 6.0)))
@@ -595,6 +616,7 @@ def _improvement_localization(
         "frequency_hz": best_frequency,
         "contribution_db_sum": best_contribution,
         "positive_ripple_improvement_db_sum": positive_total,
+        "mean_ripple_improvement_db": mean_improvement_db,
         "score_improvement_db": improvement_db,
     }
 
@@ -773,7 +795,8 @@ def _best_configurations(
     sigma_tau_ms: float,
     physical_tau_ms: float | None,
     physical_window_ms: float,
-    basin_range_fraction: float,
+    excursion_half_width_ms: float,
+    basin_tolerance_db: float,
 ) -> list[tuple[int, float, float, float, float, float, dict[str, Any]]]:
     polarities = np.asarray([1.0, -1.0])
     gain_linear = 10.0 ** (gains / 20.0)
@@ -864,18 +887,21 @@ def _best_configurations(
         }
         basin_w03 = _basin_width(raw_curve, delays, tau_star_index, 0.3)
         basin_w05 = _basin_width(raw_curve, delays, tau_star_index, 0.5)
-        basin_scope = (
-            raw_curve[eligible_delays]
-            if physical_tau_ms is not None and physical_window_in_scan
-            else raw_curve
+        # Fragility is an absolute question -- how many dB does this pair lose
+        # when the listener moves -- so it is measured in dB, at the delay the
+        # pair actually recommends.  A tolerance scaled to each pair's own
+        # objective range instead normalises away exactly the information the
+        # gate exists to test: a pair whose objective varies by 1.4 dB across
+        # the whole physical window is maximally delay-insensitive, yet a
+        # 5%-of-range tolerance shrinks to 0.07 dB and fails it, while a pair
+        # spanning 17 dB gets a 12x looser tolerance and passes with twice the
+        # real excursion penalty.
+        basin_tolerance_ms = _basin_width(
+            raw_curve, delays, delay_index, basin_tolerance_db
         )
-        basin_range_db = float(np.max(basin_scope) - np.min(basin_scope))
-        basin_threshold_db = max(1e-9, basin_range_fraction * basin_range_db)
-        basin_scaled_ms = _basin_width(
-            raw_curve,
-            delays,
-            tau_star_index,
-            basin_threshold_db,
+        excursion_penalty_db = float(
+            _worst_case(raw_curve, delays, tau_robust_ms, excursion_half_width_ms)
+            - raw_curve[delay_index]
         )
         non_physical = (
             physical_tau_ms is not None
@@ -892,10 +918,10 @@ def _best_configurations(
             "fragility_db": float(robust_curve[tau_star_index] - raw_curve[tau_star_index]),
             "basin_w03_ms": basin_w03,
             "basin_w05_ms": basin_w05,
-            "basin_scaled_ms": basin_scaled_ms,
-            "basin_threshold_db": basin_threshold_db,
-            "basin_range_db": basin_range_db,
-            "basin_range_fraction": basin_range_fraction,
+            "basin_tolerance_db": basin_tolerance_db,
+            "basin_tolerance_ms": basin_tolerance_ms,
+            "excursion_half_width_ms": excursion_half_width_ms,
+            "excursion_penalty_db": excursion_penalty_db,
             "worst_case_db": worst_case,
             "n_competing": competing,
             "physical_tau_ms": physical_tau_ms,
@@ -938,6 +964,13 @@ _GATE_ORDER = (
 
 def _not_run_gate(stage: str) -> dict[str, Any]:
     return {"status": "not_run", "stage": stage}
+
+
+def _append_detail(gate: dict[str, Any], text: str) -> None:
+    """Add a finding without erasing one an earlier stage already recorded."""
+
+    existing = gate.get("detail")
+    gate["detail"] = f"{existing}; {text}" if existing else text
 
 
 def _preoptimization_gates(
@@ -998,19 +1031,27 @@ def _preoptimization_gates(
     stage_one_reject = any(
         gate["status"] == "reject" for gate in gates.values()
     )
-    physical_tau_ms = (
+    # A flagged arrival delay is suspect timing metadata, not a condemned
+    # position: it makes the physical constraint unusable in exactly the way
+    # absent metadata does, and absent metadata is only a caution.  Treating a
+    # known-bad reading more harshly than a missing one is backwards, so both
+    # take the same path -- discard this pair's physical timing and say so.
+    physical_unreliable = first in arrival_outliers or second in arrival_outliers
+    reported_tau_ms = (
         float(first_arrival_ms - second_arrival_ms)
         if first_arrival_ms is not None and second_arrival_ms is not None
         else None
     )
+    physical_tau_ms = None if physical_unreliable else reported_tau_ms
+    # Same reasoning as the Gate C baseline: score the physical alignment with
+    # whichever polarity is better there, not with a hardcoded normal polarity
+    # that guarantees a cancellation deficit for every inverted-polarity pair.
     physical_deficit_db = (
-        _cancellation_deficit_db(
-            context,
-            first,
-            second,
-            1,
-            physical_tau_ms,
-            0.0,
+        max(
+            _cancellation_deficit_db(
+                context, first, second, polarity, physical_tau_ms, 0.0
+            )
+            for polarity in (1, -1)
         )
         if physical_tau_ms is not None
         else None
@@ -1026,6 +1067,18 @@ def _preoptimization_gates(
         gates["gate_c_physical_percentile"] = _not_run_gate(
             "skipped_after_stage_1_reject"
         )
+    elif physical_unreliable:
+        gates["gate_c_physical_percentile"] = {
+            "status": "caution",
+            "percentile": None,
+            "physical_tau_ms": None,
+            "reported_tau_ms": reported_tau_ms,
+            "objective_gap_db": None,
+            "reject_above_percentile": thresholds.physical_percentile_reject,
+            "detail": (
+                "arrival-delay outlier; physical timing discarded for this pair"
+            ),
+        }
     elif physical_tau_ms is None:
         gates["gate_c_physical_percentile"] = {
             "status": "caution",
@@ -1034,15 +1087,6 @@ def _preoptimization_gates(
             "objective_gap_db": None,
             "reject_above_percentile": thresholds.physical_percentile_reject,
             "detail": "arrival metadata unavailable",
-        }
-    elif first in arrival_outliers or second in arrival_outliers:
-        gates["gate_c_physical_percentile"] = {
-            "status": "reject",
-            "percentile": None,
-            "physical_tau_ms": physical_tau_ms,
-            "objective_gap_db": None,
-            "reject_above_percentile": thresholds.physical_percentile_reject,
-            "detail": "arrival-delay outlier",
         }
     elif physical_tau_ms < delays[0] or physical_tau_ms > delays[-1]:
         gates["gate_c_physical_percentile"] = {
@@ -1054,7 +1098,7 @@ def _preoptimization_gates(
             "detail": "physical delay lies outside the scan",
         }
     else:
-        objective = _baseline_objective_curve(
+        objective, baseline_polarity = _baseline_objective_curve(
             context,
             first,
             second,
@@ -1077,7 +1121,10 @@ def _preoptimization_gates(
             "objective_at_physical_db": physical_objective,
             "objective_gap_db": physical_objective - float(np.min(objective)),
             "reject_above_percentile": thresholds.physical_percentile_reject,
-            "baseline": "normal polarity, equal gain",
+            "baseline": "best polarity, equal gain",
+            "baseline_polarity_at_physical": int(
+                baseline_polarity[int(np.argmin(np.abs(delays - physical_tau_ms)))]
+            ),
         }
     for name in _GATE_ORDER:
         gates.setdefault(name, _not_run_gate("post_optimisation"))
@@ -1090,6 +1137,7 @@ def _postoptimization_gates(
     second: int,
     pair: dict[str, Any],
     gates: dict[str, dict[str, Any]],
+    delays: np.ndarray,
     options: SearchOptions,
 ) -> dict[str, dict[str, Any]]:
     """Complete the basin and D-I checks for one chosen configuration."""
@@ -1102,11 +1150,38 @@ def _postoptimization_gates(
         first, second, polarity, delay_ms, gain_db
     )
     physical_tau_ms = pair.get("physical_tau")
-    physical_wide = (
-        context.sum_on_trend_grid(first, second, 1, float(physical_tau_ms), 0.0)
-        if physical_tau_ms is not None
-        else None
-    )
+    physical_wide = None
+    physical_baseline_polarity = None
+    if physical_tau_ms is not None:
+        # "No tuning applied" includes the free polarity switch (see
+        # _baseline_objective_curve); otherwise this gate measures the polarity
+        # decision rather than the delay/gain tuning it is meant to police.
+        candidates = [
+            (
+                float(
+                    _score_wide_spectrum(
+                        context,
+                        candidate,
+                        options.score_low_end_weight,
+                        options.score_dip_weight,
+                    )
+                ),
+                candidate_polarity,
+                candidate,
+            )
+            for candidate_polarity, candidate in (
+                (
+                    baseline_polarity,
+                    context.sum_on_trend_grid(
+                        first, second, baseline_polarity, float(physical_tau_ms), 0.0
+                    ),
+                )
+                for baseline_polarity in (1, -1)
+            )
+        ]
+        _best_score, physical_baseline_polarity, physical_wide = max(
+            candidates, key=lambda item: (item[0], item[1])
+        )
 
     # The percentile remains defined against the cheap normal-polarity,
     # equal-gain delay scan from Stage 2.  Once the optimiser has run, replace
@@ -1121,18 +1196,47 @@ def _postoptimization_gates(
         )
         gates["gate_c_physical_percentile"]["gap_reference"] = "f(tau_star)"
 
-    if pair.get("non_physical_solution"):
+    # A delay sitting exactly on the edge of the scan is not an optimum, it is
+    # the furthest the search was allowed to go: the real minimum lies outside
+    # the configured range, and every robustness figure around it is one-sided
+    # (``_worst_case`` clips at the grid edge, so the excursion penalty can even
+    # read 0 dB).  Nothing about such a configuration has been established.
+    # Only pairs with no usable physical timing can reach this, since the rest
+    # are constrained to a window well inside the scan.
+    delay_at_boundary = bool(
+        abs(delay_ms - float(delays[0])) <= 1e-9
+        or abs(delay_ms - float(delays[-1])) <= 1e-9
+    )
+    gates["gate_c_physical_percentile"]["delay_at_scan_boundary"] = delay_at_boundary
+    if delay_at_boundary:
         gates["gate_c_physical_percentile"]["status"] = "reject"
-        gates["gate_c_physical_percentile"]["detail"] = (
-            "raw optimum lies outside the physical-delay window"
+        _append_detail(
+            gates["gate_c_physical_percentile"],
+            "the selected delay is pinned to the edge of the "
+            f"{float(delays[0]):g}..{float(delays[-1]):g} ms scan, so the real "
+            "optimum lies outside it; widen --delay-range to evaluate this pair",
+        )
+
+    if pair.get("non_physical_solution"):
+        # The recommended delay was already constrained into the physical
+        # window, so the pair is not relying on the distant unconstrained
+        # optimum.  Where that optimum happens to sit is worth surfacing, but
+        # it is not grounds to veto a recommendation that never used it.
+        if gates["gate_c_physical_percentile"].get("status") == "pass":
+            gates["gate_c_physical_percentile"]["status"] = "caution"
+        _append_detail(
+            gates["gate_c_physical_percentile"],
+            "raw optimum lies outside the physical-delay window; the "
+            "recommended delay is inside it",
         )
 
     gates["basin_geometry"] = {
         "status": "pass" if pair["geometric_pass"] else "reject",
-        "basin_width_ms": pair["basin_scaled"],
-        "basin_threshold_db": pair["basin_threshold_db"],
+        "excursion_penalty_db": pair["excursion_penalty_db"],
+        "excursion_half_width_ms": pair["excursion_half_width_ms"],
+        "tolerance_db": thresholds.basin_tolerance_db,
+        "basin_at_tolerance_ms": pair["basin_tolerance_ms"],
         "required_excursion_ms": pair["delta_tau_max"],
-        "range_fraction": thresholds.basin_range_fraction,
     }
 
     chosen_deficit = _cancellation_deficit_db(
@@ -1226,14 +1330,13 @@ def _postoptimization_gates(
         options.score_low_end_weight,
         options.score_dip_weight,
     )
+    # Provisional only: the excess over the population median decides this
+    # gate, so its status is set once every pair has been scored (see
+    # _apply_band_edge_population_status).
     gates["gate_h_band_edge_stability"] = {
-        "status": (
-            "reject"
-            if edge["spread_db"] > thresholds.band_edge_spread_reject_db
-            else "pass"
-        ),
+        "status": "pass",
         **edge,
-        "reject_above_db": thresholds.band_edge_spread_reject_db,
+        "reject_above_excess_db": thresholds.band_edge_excess_spread_reject_db,
     }
 
     if physical_wide is None:
@@ -1241,7 +1344,7 @@ def _postoptimization_gates(
             "status": "caution",
             "fraction": None,
             "frequency_hz": None,
-            "detail": "arrival metadata unavailable",
+            "detail": "physical alignment unavailable",
             "reject_above_fraction": thresholds.localization_fraction_reject,
         }
     else:
@@ -1253,16 +1356,82 @@ def _postoptimization_gates(
             options.score_dip_weight,
         )
         fraction = float(localization["fraction"] or 0.0)
+        mean_improvement_db = float(localization["mean_ripple_improvement_db"])
+        # The fraction is a ratio of two sums of positive ripple improvement.
+        # When the tuned configuration is barely distinguishable from the
+        # physical one -- the safest outcome a pair can have, since it relies
+        # on no delay trick at all -- both sums collapse to noise and the
+        # fraction stops meaning anything.  Judge how an improvement is
+        # distributed only once there is an improvement worth distributing.
+        immaterial = (
+            mean_improvement_db
+            < thresholds.localization_min_mean_improvement_db
+        )
         gates["gate_i_improvement_localization"] = {
             "status": (
-                "reject"
-                if fraction > thresholds.localization_fraction_reject
-                else "pass"
+                "pass"
+                if immaterial or fraction <= thresholds.localization_fraction_reject
+                else "reject"
             ),
             **localization,
+            "baseline_polarity": physical_baseline_polarity,
             "reject_above_fraction": thresholds.localization_fraction_reject,
+            "min_mean_improvement_db": (
+                thresholds.localization_min_mean_improvement_db
+            ),
+            **(
+                {
+                    "detail": (
+                        "improvement over the physical alignment is immaterial; "
+                        "its distribution carries no information"
+                    )
+                }
+                if immaterial
+                else {}
+            ),
         }
     return {name: gates[name] for name in _GATE_ORDER}
+
+
+def _apply_band_edge_population_status(
+    gate_sets: list[dict[str, dict[str, Any]]],
+    thresholds: GateThresholds,
+) -> None:
+    """Set Gate H from each pair's band-edge sensitivity *relative to its peers*.
+
+    Shifting the evaluation band moves every pair in the same direction by
+    almost the same amount: the subs roll off below the band and low-end power
+    weights that region at f^-4, so an up-shifted band always scores higher.
+    That common-mode term belongs to the score function, not to any pair, and
+    thresholding the raw spread rejects pairs for a property they all share --
+    in practice it cuts through the middle of a tight cluster while the pair
+    ordering is identical at every band position.  Subtracting the population
+    median leaves only the part that is specific to this pair, which is what
+    band-edge stability was supposed to mean.  With a single scored pair the
+    excess is zero by construction: there is nothing to compare against, so the
+    gate correctly abstains.
+    """
+
+    spreads = sorted(
+        float(gate_set["gate_h_band_edge_stability"]["spread_db"])
+        for gate_set in gate_sets
+        if gate_set["gate_h_band_edge_stability"].get("spread_db") is not None
+    )
+    if not spreads:
+        return
+    median = float(np.median(np.asarray(spreads, dtype=np.float64)))
+    for gate_set in gate_sets:
+        gate = gate_set["gate_h_band_edge_stability"]
+        if gate.get("spread_db") is None:
+            continue
+        excess = float(gate["spread_db"]) - median
+        gate["population_median_spread_db"] = median
+        gate["excess_spread_db"] = excess
+        gate["status"] = (
+            "reject"
+            if excess > thresholds.band_edge_excess_spread_reject_db
+            else "pass"
+        )
 
 
 def _verdict_and_reasons(
@@ -1313,9 +1482,15 @@ def _gate_summary_fields(gates: dict[str, dict[str, Any]]) -> dict[str, Any]:
         "worst_notch_frequency_hz": notch.get("frequency_hz"),
         "gain_asymmetry_db": gates["gate_g_gain_asymmetry"].get("gain_offset_db"),
         "band_edge_spread_db": gates["gate_h_band_edge_stability"].get("spread_db"),
+        "band_edge_excess_spread_db": gates["gate_h_band_edge_stability"].get(
+            "excess_spread_db"
+        ),
         "improvement_localization_fraction": gates[
             "gate_i_improvement_localization"
         ].get("fraction"),
+        "improvement_mean_db": gates["gate_i_improvement_localization"].get(
+            "mean_ripple_improvement_db"
+        ),
         "improvement_localization_frequency_hz": gates[
             "gate_i_improvement_localization"
         ].get("frequency_hz"),
@@ -1420,9 +1595,16 @@ def _compute_pair(
     first_arrival = arrival_delays_ms[first]
     second_arrival = arrival_delays_ms[second]
     # Delay is applied to sub 2, hence the physical compensation is t_A-t_B.
+    # A flagged arrival makes that figure untrustworthy, so it is discarded
+    # rather than used to constrain the delay search (see
+    # _preoptimization_gates); the pair is then treated exactly like one whose
+    # arrival metadata was never captured.
+    measurement_outlier = first in arrival_outliers or second in arrival_outliers
     physical_tau_ms = (
         float(first_arrival - second_arrival)
-        if first_arrival is not None and second_arrival is not None
+        if first_arrival is not None
+        and second_arrival is not None
+        and not measurement_outlier
         else None
     )
     delta_tau_max_ms, conservative_bound = _geometry_jitter(
@@ -1446,7 +1628,8 @@ def _compute_pair(
         sigma_tau_ms,
         physical_tau_ms,
         search_options.physical_delay_window_ms,
-        search_options.gate_thresholds.basin_range_fraction,
+        delta_tau_max_ms / 2.0,
+        search_options.gate_thresholds.basin_tolerance_db,
     )
     finalists = []
     for (
@@ -1485,21 +1668,19 @@ def _compute_pair(
         ),
     )
     robustness = diagnostics["robustness"]
-    measurement_outlier = first in arrival_outliers or second in arrival_outliers
     robustness.update(
         {
             "delta_tau_max_ms": delta_tau_max_ms,
             "sigma_tau_ms": sigma_tau_ms,
             "geometry_conservative_bound": conservative_bound,
-            "basin_covers_geometry": (
-                float(robustness["basin_scaled_ms"]) + 1e-12 >= delta_tau_max_ms
+            "excursion_penalty_ok": (
+                float(robustness["excursion_penalty_db"])
+                <= float(robustness["basin_tolerance_db"]) + 1e-12
             ),
             "arrival_delay_first_ms": first_arrival,
             "arrival_delay_second_ms": second_arrival,
             "measurement_delay_outlier": measurement_outlier,
-            "pair_valid": (
-                not measurement_outlier and bool(robustness["physical_window_in_scan"])
-            ),
+            "pair_valid": bool(robustness["physical_window_in_scan"]),
         }
     )
     # Stable top-level names keep the JSON convenient for tabular consumers;
@@ -1513,11 +1694,13 @@ def _compute_pair(
             "fragility": robustness["fragility_db"],
             "basin_w03": robustness["basin_w03_ms"],
             "basin_w05": robustness["basin_w05_ms"],
-            "basin_scaled": robustness["basin_scaled_ms"],
-            "basin_threshold_db": robustness["basin_threshold_db"],
+            "basin_tolerance_db": robustness["basin_tolerance_db"],
+            "basin_tolerance_ms": robustness["basin_tolerance_ms"],
+            "excursion_half_width_ms": robustness["excursion_half_width_ms"],
+            "excursion_penalty_db": robustness["excursion_penalty_db"],
             "worst_case": robustness["worst_case_db"],
             "n_competing": robustness["n_competing"],
-            "geometric_pass": robustness["basin_covers_geometry"],
+            "geometric_pass": robustness["excursion_penalty_ok"],
             "delta_tau_max": robustness["delta_tau_max_ms"],
             "sigma_tau": robustness["sigma_tau_ms"],
             "geometry_conservative_bound": robustness["geometry_conservative_bound"],
@@ -1700,7 +1883,7 @@ def run_search(
                     diagnostics,
                 )
 
-    pairs: list[dict] = []
+    pair_records: list[tuple[dict, dict[str, dict[str, Any]]]] = []
     for ordinal, (first, second) in enumerate(combinations, start=1):
         gates = pre_gates[(first, second)]
         result = optimized.get((first, second))
@@ -1723,6 +1906,7 @@ def run_search(
                 second,
                 pair,
                 gates,
+                delays,
                 options,
             )
         else:
@@ -1736,6 +1920,18 @@ def run_search(
                 "delay_ms": None,
                 "gain_db": None,
             }
+        pair_records.append((pair, gates))
+        if progress:
+            progress(ordinal, len(combinations), f"{first + 1}+{second + 1}")
+
+    # Gate H is a comparison against the other pairs, so it can only be decided
+    # once every pair has been scored.
+    _apply_band_edge_population_status(
+        [gates for _pair, gates in pair_records], options.gate_thresholds
+    )
+
+    pairs: list[dict] = []
+    for pair, gates in pair_records:
         verdict, reasons = _verdict_and_reasons(gates)
         pair.update(
             {
@@ -1746,8 +1942,6 @@ def run_search(
             }
         )
         pairs.append(pair)
-        if progress:
-            progress(ordinal, len(combinations), f"{first + 1}+{second + 1}")
 
     def _modal_tiebreak_key(pair: dict) -> tuple[float, float]:
         """``(n_highQ, sum_modal_energy_db)``, both lower-is-better.
@@ -1891,7 +2085,7 @@ def run_search(
     ]
 
     result = {
-        "format_version": 25,
+        "format_version": 26,
         "measurement_count": len(measurements),
         "optimized_pair_count": len(optimized_pairs),
         "sample_rate": measurements[0].sample_rate,
@@ -1913,6 +2107,48 @@ def run_search(
                     "means no configured single-position failure mode was detected; "
                     "only multi-position measurements validate a listening area."
                 ),
+                "physical_baseline": (
+                    "Gates C, D and I reference the pair at its measured arrival "
+                    "alignment with equal gain and whichever polarity is better "
+                    "there. Polarity is free, exact and drift-immune, so it is "
+                    "part of 'no tuning applied'; delay and gain are the fragile "
+                    "tuning these gates police. An arrival-delay outlier discards "
+                    "that pair's physical timing entirely -- the same caution path "
+                    "as absent arrival metadata, since a known-bad reading is not "
+                    "more informative than a missing one."
+                ),
+                "delay_scan_boundary": (
+                    "A selected delay pinned to the edge of --delay-range is "
+                    "rejected under Gate C: it is the limit of the search, not "
+                    "an optimum, and every robustness figure around it is "
+                    "one-sided. Only pairs with no usable physical timing can "
+                    "reach the edge."
+                ),
+                "basin_geometry": (
+                    "excursion_penalty_db is the worst degradation of f over "
+                    "+/-delta_tau_max/2 around the recommended delay; reject above "
+                    "basin_tolerance_db. The tolerance is absolute in dB and "
+                    "measured at the recommended delay: a tolerance scaled to each "
+                    "pair's own objective range normalises away the very "
+                    "delay-insensitivity the gate is testing for."
+                ),
+                "band_edge_stability": (
+                    "Gate H rejects on excess_spread_db -- this pair's +/-1/6-octave "
+                    "band-shift score spread minus the population median -- above "
+                    "band_edge_excess_spread_reject_db. Shifting the band moves "
+                    "every pair by nearly the same amount (the subs roll off below "
+                    "the band and low-end power weights f^-4), so the raw spread is "
+                    "a property of the score, not of a pair. With one scored pair "
+                    "the excess is zero and the gate abstains."
+                ),
+                "improvement_localization": (
+                    "Gate I rejects only when the improvement over the physical "
+                    "baseline is material -- mean positive ripple improvement at "
+                    "or above localization_min_mean_improvement_db per log-frequency "
+                    "bin -- and more than localization_fraction_reject of it falls "
+                    "in one 1/6-octave window. Below that floor the fraction is a "
+                    "ratio of two noise-level sums and carries no information."
+                ),
             },
             "robustness": {
                 "objective": "f = -raw usable-output score (lower is better)",
@@ -1931,15 +2167,15 @@ def run_search(
                     "sigma_tau is half the pair-specific maximum differential "
                     "arrival-time excursion for the configured listener movement. "
                     "Without complete coordinates, 2d/c is used and each pair is "
-                    "marked geometry_conservative_bound. Basin width is only a "
-                    "disqualifier. geometric_pass uses basin_scaled_ms, whose "
-                    "degradation threshold is the configured fraction of this "
-                    "pair's f range inside the physical window; basin_w03/w05 are "
-                    "retained as fixed-threshold diagnostics. A narrow basin proves "
-                    "timing fragility, but a "
-                    "wide basin does not model the magnitude-response change caused "
-                    "by moving through the room's modal pressure field. Only "
-                    "multi-position measurements can validate a listening area."
+                    "marked geometry_conservative_bound. geometric_pass is "
+                    "excursion_penalty_db -- the worst degradation of f over "
+                    "+/-delta_tau_max/2 around the recommended delay -- against the "
+                    "absolute basin_tolerance_db; basin_w03/w05 remain as "
+                    "fixed-threshold diagnostics around tau_star. A large excursion "
+                    "penalty proves timing fragility, but a small one does not model "
+                    "the magnitude-response change caused by moving through the "
+                    "room's modal pressure field. Only multi-position measurements "
+                    "can validate a listening area."
                 ),
             },
             "eq": {
