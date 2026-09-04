@@ -24,7 +24,9 @@ from .dsp import (
     LOW_END_POWER_UPPER_HZ,
     MIN_RELIABLE_NATIVE_BINS,
     SCORE_DIP_SMOOTHING_OCTAVES,
+    ARRIVAL_ONSET_THRESHOLD_DB,
     AnalysisContext,
+    arrival_onset_index,
     EqOptions,
     broad_trend_db,
     db20,
@@ -699,44 +701,168 @@ def _metadata_arrival_delay_ms(metadata: dict[str, Any]) -> float | None:
     return None if parsed is None else 1000.0 * parsed
 
 
-def _arrival_outliers(
+def _sweep_band_hz(
+    measurements: list[Any], analysis_band: tuple[float, float], sample_rate: float
+) -> tuple[float, float]:
+    """Widest band the cache actually excited, for onset detection.
+
+    Onset timing wants every octave the sweep really covered, not just the
+    scored band: doubling the bandwidth halves the width of the leading edge.
+    REW reports the sweep range per measurement, so read it rather than
+    assuming one; fall back to an octave above the analysis band.
+    """
+
+    lows: list[float] = []
+    highs: list[float] = []
+    for row in measurements:
+        summary = row.metadata.get("summary", {})
+        low, high = summary.get("startFreq"), summary.get("endFreq")
+        if low is None or high is None:
+            continue
+        low, high = float(low), float(high)
+        if math.isfinite(low) and math.isfinite(high) and 0.0 < low < high:
+            lows.append(low)
+            highs.append(high)
+    if not lows:
+        return analysis_band[0], min(2.0 * analysis_band[1], 0.45 * sample_rate)
+    # The intersection, so no measurement is asked for bandwidth it lacks.
+    return max(lows), min(min(highs), 0.45 * sample_rate)
+
+
+ARRIVAL_SLIP_TOLERANCE_MS = 1.5
+# A repaired arrival is a reconstruction, not a measurement. The onset it is
+# built from creeps later as the slipped lobe grows relative to the direct
+# arrival, so the repaired value can sit a few milliseconds late. Widening the
+# delay window for those pairs keeps the constraint doing its real job --
+# excluding delays no room geometry could produce -- without letting a
+# reconstruction dictate a narrow answer.
+ARRIVAL_REPAIRED_WINDOW_FACTOR = 3.0
+
+
+def _resolve_arrival_delays(
     measurements: list[Any],
+    analysis_band: tuple[float, float],
     speed_of_sound_m_per_s: float,
     room_dimensions_m: tuple[float, float, float] | None,
-) -> tuple[list[float | None], set[int], list[str]]:
+) -> tuple[list[float | None], set[int], set[int], list[str], dict[str, Any]]:
+    """Arrival delays with cycle-slipped peak picks detected and repaired.
+
+    REW's arrival delay is the position of the largest sample in the impulse
+    response.  Over a subwoofer's two or three octaves that impulse is a slow
+    oscillatory blob, so at any position with strong modal reinforcement a
+    later half-cycle can outgrow the direct arrival and the pick jumps a whole
+    cycle -- tens of milliseconds, and silently.
+
+    The leading edge does not jump.  So the lag between a measurement's peak
+    and its own onset is near-constant across a cache (same loudspeaker, same
+    room, one microphone), and a measurement whose lag departs from the
+    population median has a slipped pick.  Repair rebuilds its peak from its
+    own onset plus the median lag, which keeps that position's genuine
+    distance rather than flattening it to the median arrival.
+
+    Only differences between arrivals are ever used downstream, so a bias
+    common to every onset cancels and is not corrected here.
+
+    Returns ``(delays, repaired, unusable, warnings, diagnostics)``.
+    """
+
     delays = [_metadata_arrival_delay_ms(row.metadata) for row in measurements]
-    positive = [value for value in delays if value is not None and value > 0.0]
-    median = float(np.median(positive)) if positive else None
-    room_diagonal = (
-        math.sqrt(sum(dimension * dimension for dimension in room_dimensions_m))
-        if room_dimensions_m is not None
-        else None
-    )
-    outliers: set[int] = set()
+    sample_rate = float(measurements[0].sample_rate)
+    onset_band = _sweep_band_hz(measurements, analysis_band, sample_rate)
     warnings: list[str] = []
-    for index, (row, delay_ms) in enumerate(zip(measurements, delays)):
-        reasons = []
-        if delay_ms is None:
+    onsets: list[float | None] = []
+    for row in measurements:
+        try:
+            index = arrival_onset_index(row.impulse, sample_rate, onset_band)
+        except ValueError:
+            onsets.append(None)
+            continue
+        onsets.append(1000.0 * (row.start_time_seconds + index / sample_rate))
+
+    lags = [
+        peak - onset
+        for peak, onset in zip(delays, onsets)
+        if peak is not None and onset is not None
+    ]
+    median_lag = float(np.median(lags)) if lags else None
+
+    repaired: set[int] = set()
+    unusable: set[int] = set()
+    resolved: list[float | None] = list(delays)
+    details: list[dict[str, Any]] = []
+    for index, row in enumerate(measurements):
+        peak, onset = delays[index], onsets[index]
+        entry: dict[str, Any] = {
+            "position": row.position,
+            "title": row.title,
+            "reported_ms": peak,
+            "onset_ms": onset,
+            "peak_minus_onset_ms": (
+                peak - onset if peak is not None and onset is not None else None
+            ),
+            "repaired": False,
+        }
+        if peak is None:
             warnings.append(
                 f"Position {row.position} ({row.title}) has no parsed REW arrival delay; "
                 "physical delay constraints are unavailable for its pairs. Re-fetch with "
                 "a REW build that exposes loopback-referenced arrival metadata."
             )
+            unusable.add(index)
+            details.append(entry)
             continue
-        if median is not None and delay_ms > 1.5 * median:
-            reasons.append(f"more than 1.5x the median ({median:.3f} ms)")
-        path_m = delay_ms * speed_of_sound_m_per_s / 1000.0
-        if room_diagonal is not None and path_m > room_diagonal:
-            reasons.append(
-                f"{path_m:.2f} m path exceeds the {room_diagonal:.2f} m room diagonal"
-            )
-        if reasons:
-            outliers.add(index)
-            warnings.append(
-                f"Arrival delay outlier: position {row.position} ({row.title}) reports "
-                f"{delay_ms:.3f} ms / {path_m:.2f} m; " + "; ".join(reasons) + "."
-            )
-    return delays, outliers, warnings
+        if onset is not None and median_lag is not None:
+            deviation = (peak - onset) - median_lag
+            entry["lag_deviation_ms"] = deviation
+            if abs(deviation) > ARRIVAL_SLIP_TOLERANCE_MS:
+                corrected = onset + median_lag
+                resolved[index] = corrected
+                repaired.add(index)
+                entry.update({"repaired": True, "resolved_ms": corrected})
+                warnings.append(
+                    f"Arrival delay repaired: position {row.position} ({row.title}) "
+                    f"reported {peak:.3f} ms, but its peak sits {deviation:+.3f} ms "
+                    f"further from its own onset than the other measurements "
+                    f"({median_lag:.3f} ms) -- REW's peak pick slipped a cycle on a "
+                    f"strongly resonant position. Using {corrected:.3f} ms, "
+                    "reconstructed from this measurement's leading edge. Pair gates "
+                    "that depend on physical timing are advisory for this position."
+                )
+        details.append(entry)
+
+    # Whatever survives repair still has to be physically possible.
+    room_diagonal = (
+        math.sqrt(sum(dimension * dimension for dimension in room_dimensions_m))
+        if room_dimensions_m is not None
+        else None
+    )
+    if room_diagonal is not None:
+        spread_limit_ms = 1000.0 * room_diagonal / speed_of_sound_m_per_s
+        usable = [value for value in resolved if value is not None]
+        reference = float(np.median(usable)) if usable else None
+        for index, row in enumerate(measurements):
+            value = resolved[index]
+            if value is None or reference is None:
+                continue
+            # A common timing offset cancels in the differences that matter, so
+            # test the spread between measurements rather than each absolute
+            # delay: only the spread is bounded by the room.
+            if abs(value - reference) > spread_limit_ms:
+                unusable.add(index)
+                warnings.append(
+                    f"Arrival delay unusable: position {row.position} ({row.title}) "
+                    f"sits {abs(value - reference):.3f} ms from the cache median, "
+                    f"more than the {spread_limit_ms:.3f} ms a {room_diagonal:.2f} m "
+                    "room diagonal allows. Physical timing is discarded for its pairs."
+                )
+    diagnostics = {
+        "onset_band_hz": list(onset_band),
+        "onset_threshold_db": ARRIVAL_ONSET_THRESHOLD_DB,
+        "median_peak_minus_onset_ms": median_lag,
+        "slip_tolerance_ms": ARRIVAL_SLIP_TOLERANCE_MS,
+        "measurements": details,
+    }
+    return resolved, repaired, unusable, warnings, diagnostics
 
 
 def _geometry_jitter(
@@ -981,6 +1107,7 @@ def _preoptimization_gates(
     first_arrival_ms: float | None,
     second_arrival_ms: float | None,
     arrival_outliers: set[int],
+    arrival_repaired: set[int],
     options: SearchOptions,
 ) -> dict[str, dict[str, Any]]:
     """Run A/B and, when they pass, the delay-only physical Gate C."""
@@ -1037,6 +1164,11 @@ def _preoptimization_gates(
     # known-bad reading more harshly than a missing one is backwards, so both
     # take the same path -- discard this pair's physical timing and say so.
     physical_unreliable = first in arrival_outliers or second in arrival_outliers
+    # A repaired arrival is good enough to aim the delay search with, but not
+    # good enough to disqualify a pair on: the user's point is that a poor REW
+    # timing pick must not change which pairs are recommended, only how exact
+    # the reported delay figure is.
+    physical_repaired = first in arrival_repaired or second in arrival_repaired
     reported_tau_ms = (
         float(first_arrival_ms - second_arrival_ms)
         if first_arrival_ms is not None and second_arrival_ms is not None
@@ -1126,6 +1258,15 @@ def _preoptimization_gates(
                 baseline_polarity[int(np.argmin(np.abs(delays - physical_tau_ms)))]
             ),
         }
+    gates["gate_c_physical_percentile"]["arrival_repaired"] = physical_repaired
+    if physical_repaired and gates["gate_c_physical_percentile"]["status"] == "reject":
+        gates["gate_c_physical_percentile"]["status"] = "caution"
+        _append_detail(
+            gates["gate_c_physical_percentile"],
+            "advisory only: this pair's physical timing was reconstructed from a "
+            "slipped REW peak pick, so it aims the delay search but cannot "
+            "disqualify the pair",
+        )
     for name in _GATE_ORDER:
         gates.setdefault(name, _not_run_gate("post_optimisation"))
     return {name: gates[name] for name in _GATE_ORDER}
@@ -1471,6 +1612,7 @@ def _gate_summary_fields(gates: dict[str, dict[str, Any]]) -> dict[str, Any]:
         "redundancy_residual": gates["gate_a_redundancy"].get("residual"),
         "ripple_correlation": gates["gate_b_ripple_correlation"].get("correlation"),
         "physical_percentile": gates["gate_c_physical_percentile"].get("percentile"),
+        "arrival_repaired": gates["gate_c_physical_percentile"].get("arrival_repaired"),
         "physical_objective_gap_db": gates["gate_c_physical_percentile"].get(
             "objective_gap_db"
         ),
@@ -1511,6 +1653,7 @@ def _init_pair_worker(
     modal_options: ModalOptions | None,
     arrival_delays_ms: list[float | None],
     arrival_outliers: set[int],
+    arrival_repaired: set[int],
     search_options: SearchOptions,
 ) -> None:
     """Stash shared read-only search state once per worker process.
@@ -1530,6 +1673,7 @@ def _init_pair_worker(
         modal_options=modal_options,
         arrival_delays_ms=arrival_delays_ms,
         arrival_outliers=arrival_outliers,
+        arrival_repaired=arrival_repaired,
         search_options=search_options,
     )
 
@@ -1590,6 +1734,7 @@ def _compute_pair(
     modal_options: ModalOptions | None = _worker_state["modal_options"]
     arrival_delays_ms: list[float | None] = _worker_state["arrival_delays_ms"]
     arrival_outliers: set[int] = _worker_state["arrival_outliers"]
+    arrival_repaired: set[int] = _worker_state["arrival_repaired"]
     search_options: SearchOptions = _worker_state["search_options"]
 
     first_arrival = arrival_delays_ms[first]
@@ -1600,6 +1745,7 @@ def _compute_pair(
     # _preoptimization_gates); the pair is then treated exactly like one whose
     # arrival metadata was never captured.
     measurement_outlier = first in arrival_outliers or second in arrival_outliers
+    measurement_repaired = first in arrival_repaired or second in arrival_repaired
     physical_tau_ms = (
         float(first_arrival - second_arrival)
         if first_arrival is not None
@@ -1616,6 +1762,9 @@ def _compute_pair(
         search_options.speed_of_sound_m_per_s,
     )
     sigma_tau_ms = delta_tau_max_ms / 2.0
+    physical_window_ms = search_options.physical_delay_window_ms * (
+        ARRIVAL_REPAIRED_WINDOW_FACTOR if measurement_repaired else 1.0
+    )
 
     configurations = _best_configurations(
         context,
@@ -1627,7 +1776,7 @@ def _compute_pair(
         score_dip_weight,
         sigma_tau_ms,
         physical_tau_ms,
-        search_options.physical_delay_window_ms,
+        physical_window_ms,
         delta_tau_max_ms / 2.0,
         search_options.gate_thresholds.basin_tolerance_db,
     )
@@ -1680,6 +1829,8 @@ def _compute_pair(
             "arrival_delay_first_ms": first_arrival,
             "arrival_delay_second_ms": second_arrival,
             "measurement_delay_outlier": measurement_outlier,
+            "arrival_delay_repaired": measurement_repaired,
+            "physical_window_widened": measurement_repaired,
             "pair_valid": bool(robustness["physical_window_in_scan"]),
         }
     )
@@ -1793,8 +1944,15 @@ def run_search(
     )
     gains = inclusive_range(*options.gain_range_db)
     context = AnalysisContext(measurements, options.band, options.ppo)
-    arrival_delays_ms, arrival_outliers, arrival_warnings = _arrival_outliers(
+    (
+        arrival_delays_ms,
+        arrival_repaired,
+        arrival_outliers,
+        arrival_warnings,
+        arrival_diagnostics,
+    ) = _resolve_arrival_delays(
         measurements,
+        options.band,
         options.speed_of_sound_m_per_s,
         options.room_dimensions_m,
     )
@@ -1831,6 +1989,7 @@ def run_search(
             arrival_delays_ms[first],
             arrival_delays_ms[second],
             arrival_outliers,
+            arrival_repaired,
             options,
         )
         pre_gates[(first, second)] = gates
@@ -1870,6 +2029,7 @@ def run_search(
                 modal_options,
                 arrival_delays_ms,
                 arrival_outliers,
+                arrival_repaired,
                 options,
             ),
         ) as executor:
@@ -2106,6 +2266,24 @@ def run_search(
                     "rejects skip the expensive optimiser. Passing all gates only "
                     "means no configured single-position failure mode was detected; "
                     "only multi-position measurements validate a listening area."
+                ),
+                "arrival_timing": (
+                    "REW's arrival delay is the position of the largest sample in "
+                    "the impulse response. Across a subwoofer's two or three "
+                    "octaves that impulse is a slow oscillatory blob, so wherever a "
+                    "room mode rings hard a later half-cycle can outgrow the direct "
+                    "arrival and the pick jumps a whole cycle. The leading edge does "
+                    "not jump, so a measurement whose peak-minus-onset lag departs "
+                    "from the cache median by more than slip_tolerance_ms is "
+                    "repaired: its peak is rebuilt from its own onset plus the "
+                    "median lag, keeping that position's genuine distance instead of "
+                    "flattening it to the median arrival. Only differences between "
+                    "arrivals are used downstream, so a bias common to every onset "
+                    "cancels and is left uncorrected. A repaired arrival still aims "
+                    "the delay search, but Gate C is capped at caution for its pairs "
+                    "-- a poor timing pick must not change which pairs are "
+                    "recommended, only how exact the reported delay figure is. See "
+                    "the top-level arrival_timing block for per-measurement values."
                 ),
                 "physical_baseline": (
                     "Gates C, D and I reference the pair at its measured arrival "
@@ -2422,6 +2600,8 @@ def run_search(
         "warnings": arrival_warnings,
         "measurement_arrival_delays_ms": arrival_delays_ms,
         "measurement_arrival_delay_outliers": sorted(index + 1 for index in arrival_outliers),
+        "measurement_arrival_delay_repaired": sorted(index + 1 for index in arrival_repaired),
+        "arrival_timing": arrival_diagnostics,
         "modal_signature": modal_signature_json,
         "pairs": pairs,
     }

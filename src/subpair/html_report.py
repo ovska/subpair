@@ -1651,7 +1651,12 @@ def build_report(
             if robustness.get("geometry_conservative_bound")
             else "configured coordinates"
         )
-        if robustness.get("measurement_delay_outlier"):
+        if robustness.get("arrival_delay_repaired"):
+            physical_warning = (
+                " <strong>ARRIVAL TIMING REPAIRED — delay window widened, "
+                "Gate C advisory</strong>"
+            )
+        elif robustness.get("measurement_delay_outlier"):
             physical_warning = (
                 " <strong>ARRIVAL-DELAY OUTLIER: PHYSICAL TIMING DISCARDED</strong>"
             )
@@ -1825,6 +1830,59 @@ function copyPeq(button) {
         </details>
         """.strip()
 
+    timing = results.get("arrival_timing") or {}
+    timing_rows = timing.get("measurements") or []
+    repaired_any = any(row.get("repaired") for row in timing_rows)
+    if timing_rows:
+        def _cell(value: object, digits: int = 3) -> str:
+            return "—" if value is None else f"{float(value):.{digits}f}"
+
+        body_rows = "".join(
+            "<tr class=\"{cls}\"><td>{pos}</td><td>{title}</td><td>{rep}</td>"
+            "<td>{onset}</td><td>{lag}</td><td>{dev}</td><td>{res}</td></tr>".format(
+                cls="timing-repaired" if row.get("repaired") else "",
+                pos=int(row.get("position", 0)),
+                title=html.escape(str(row.get("title", ""))),
+                rep=_cell(row.get("reported_ms")),
+                onset=_cell(row.get("onset_ms")),
+                lag=_cell(row.get("peak_minus_onset_ms")),
+                dev=_cell(row.get("lag_deviation_ms")),
+                res=(
+                    f"<strong>{_cell(row.get('resolved_ms'))} (repaired)</strong>"
+                    if row.get("repaired")
+                    else "as reported"
+                ),
+            )
+            for row in timing_rows
+        )
+        band_hz = timing.get("onset_band_hz") or [0.0, 0.0]
+        timing_section = f"""
+        <details class="card timing-card"{' open' if repaired_any else ''}>
+        <summary><strong>Arrival timing</strong> — {'repairs applied' if repaired_any else 'all peaks consistent'}</summary>
+        <p class="note">REW reports arrival delay as the position of the largest sample in the
+        impulse response. Across a subwoofer's two or three octaves that impulse is a slow
+        oscillatory blob, so wherever a room mode rings hard a later half-cycle can outgrow the
+        direct arrival and the pick jumps a whole cycle. The leading edge does not jump, so a
+        measurement whose peak-minus-onset lag departs from the cache median by more than
+        {float(timing.get('slip_tolerance_ms', 0.0)):g} ms is rebuilt from its own onset plus the
+        median lag ({_cell(timing.get('median_peak_minus_onset_ms'))} ms), which keeps that
+        position's real distance instead of flattening it to the median arrival. Onsets are taken
+        over {band_hz[0]:g}–{band_hz[1]:g} Hz at {float(timing.get('onset_threshold_db', 0.0)):g} dB.
+        Only differences between arrivals are used downstream, so a bias common to every onset
+        cancels and is left uncorrected.</p>
+        <p class="note">A repaired arrival still aims the delay search, on a window widened to
+        reflect that it is a reconstruction, and its pairs' Gate C is capped at caution: a poor
+        timing pick changes how exact the reported delay figure is, never which pairs are
+        recommended.</p>
+        <table class="timing-table"><thead><tr>
+        <th>Pos</th><th>Title</th><th>REW peak (ms)</th><th>Onset (ms)</th>
+        <th>Peak−onset (ms)</th><th>Deviation (ms)</th><th>Used</th>
+        </tr></thead><tbody>{body_rows}</tbody></table>
+        </details>
+        """.strip()
+    else:
+        timing_section = ""
+
     settings_json = html.escape(json.dumps(settings, sort_keys=True, indent=2))
     warning_html = "".join(
         f'<p class="warning"><strong>Warning:</strong> {html.escape(str(warning))}</p>'
@@ -1844,6 +1902,12 @@ main {{ width:min(1500px,96vw); margin:0 auto; padding:36px 0 80px; }}
 h1 {{ font-size:2.2rem; margin:0 0 4px; }} h2 {{ margin-top:0; }}
 .lede,.configuration,.note {{ color:var(--muted); }}
 .warning {{ color:#fecaca; border-left:3px solid #fb7185; padding-left:10px; }}
+.timing-card {{ background:var(--card); border:1px solid var(--line); border-radius:8px; padding:12px 16px; margin:14px 0; }}
+.timing-card summary {{ cursor:pointer; }}
+.timing-table {{ border-collapse:collapse; margin-top:10px; font-variant-numeric:tabular-nums; }}
+.timing-table th, .timing-table td {{ border-bottom:1px solid var(--line); padding:4px 12px 4px 0; text-align:right; }}
+.timing-table th:nth-child(2), .timing-table td:nth-child(2) {{ text-align:left; }}
+.timing-table tr.timing-repaired {{ color:#fed7aa; }}
 .chart-tabs,.pair-tabs {{ display:flex; flex-wrap:wrap; gap:6px; margin:14px 0; }}
 .chart-tab,.pair-tab {{ border:1px solid #3b506d; border-radius:7px; padding:7px 13px; color:var(--muted); background:#101e31; cursor:pointer; font-weight:650; }}
 .chart-tab.active,.pair-tab.active {{ color:#07111f; border-color:#7dd3fc; background:#7dd3fc; }}
@@ -1893,6 +1957,7 @@ details {{ margin:22px 0; }} details pre {{ overflow:auto; color:var(--muted); }
 <p class="lede">{results['measurement_count']} positions · {band[0]:g}–{band[1]:g} Hz · {settings['ppo']} points/octave · {mode_label} usable-output score · showing up to {limit} pairs</p>
 <p class="note">Check table rows to choose comparison pairs. The top {default_count} start selected; the pair tabs below the table open one full diagnostic at a time. Hotkeys 1–9 open the first nine selected tabs.</p>
 {warning_html}
+{timing_section}
 {f'<p class="note">Room {room_dimensions_cm[0]:g}×{room_dimensions_cm[1]:g}×{room_dimensions_cm[2]:g} cm: theoretical rigid-box mode frequencies are overlaid on frequency charts (vertical) and CSD heatmaps (horizontal) — solid axial, dashed tangential, dotted oblique. Click a &ldquo;Room mode: …&rdquo; legend entry to hide/show that type; a purely geometric reference, not the measured poles from <code>--modal</code>.</p>' if room_modes is not None else ''}
 <div class="chart-tabs" role="tablist" aria-label="{mode_label} overview chart">
   <button class="chart-tab active" data-overview-view="magnitude" role="tab" aria-selected="true" onclick="setOverviewView('magnitude')">Magnitude</button>

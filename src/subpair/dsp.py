@@ -1130,6 +1130,60 @@ def _band_centres(low: float, high: float, ppo: int) -> np.ndarray:
     return log_frequency_grid(low, high, ppo)
 
 
+ARRIVAL_ONSET_THRESHOLD_DB = -10.0
+
+
+def arrival_onset_index(
+    impulse: np.ndarray,
+    sample_rate: float,
+    band: tuple[float, float],
+    threshold_db: float = ARRIVAL_ONSET_THRESHOLD_DB,
+    search_seconds: float = 0.060,
+) -> float:
+    """Leading edge of the impulse, as a sub-sample index.
+
+    The peak of a band-limited impulse is a poor arrival marker: across two or
+    three octaves the response is a slow oscillatory blob many milliseconds
+    long, and wherever a room mode rings hard a later half-cycle can exceed the
+    direct arrival's, so a peak pick silently jumps a whole cycle.  The leading
+    edge does not move when that happens -- the direct sound is still the first
+    energy to arrive regardless of which lobe ends up tallest.
+
+    This deliberately returns the threshold crossing, not a physical arrival:
+    band-limiting spreads energy earlier than the true onset, so the value sits
+    a fixed distance ahead of it.  That bias is common to every measurement in
+    a cache and cancels in the differences that are actually used, which is why
+    no attempt is made to correct it.
+    """
+
+    impulse = np.asarray(impulse, dtype=np.float64)
+    if impulse.size < 16:
+        raise ValueError("Impulse is too short for onset detection")
+    nyquist = 0.5 * sample_rate
+    low = max(1.0, min(band[0], 0.45 * nyquist))
+    high = min(max(low * 1.5, band[1]), 0.9 * nyquist)
+    sos = signal.butter(4, [low, high], btype="bandpass", fs=sample_rate, output="sos")
+    filtered = (
+        signal.sosfiltfilt(sos, impulse)
+        if impulse.size > 3 * (2 * sos.shape[0] + 1)
+        else signal.sosfilt(sos, impulse)
+    )
+    envelope = np.abs(signal.hilbert(filtered))
+    peak = int(np.argmax(envelope))
+    limit = envelope[peak] * 10.0 ** (threshold_db / 20.0)
+    start = max(0, peak - int(round(search_seconds * sample_rate)))
+    window = envelope[start : peak + 1]
+    crossings = np.flatnonzero(window >= limit)
+    if not crossings.size:
+        return float(peak)
+    index = start + int(crossings[0])
+    if index > 0:
+        previous, current = envelope[index - 1], envelope[index]
+        fraction = 0.0 if current == previous else (limit - previous) / (current - previous)
+        index = index - 1 + float(np.clip(fraction, 0.0, 1.0))
+    return float(index)
+
+
 def csd_style_decay(
     impulse: np.ndarray,
     sample_rate: float,

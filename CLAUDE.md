@@ -64,6 +64,14 @@ the real logic. Data flows strictly one-way through `.subpair-cache/`:
    measurement-list and impulse-response routes. Never hardcode a REW path;
    route resolution must stay data-driven from the spec.
 
+   Arrival timing is repaired before any pairing: REW's arrival delay is the
+   impulse's largest sample, which slips a whole cycle on strongly resonant
+   positions, so `engine._resolve_arrival_delays` compares each measurement's
+   peak-minus-onset lag (via `dsp.arrival_onset_index`, over the full swept
+   range) against the cache median and rebuilds slipped arrivals from their own
+   onset. Repaired pairs get a widened physical-delay window and an advisory
+   Gate C — timing quality must never change which pairs are recommended.
+
 2. **`cache.py`** — validates and atomically persists fetched measurements as
    `.subpair-cache/measurement-*.npz` + `manifest.json`. Enforces the core
    invariant used everywhere downstream: every cached measurement must share

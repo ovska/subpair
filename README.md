@@ -175,10 +175,41 @@ outside the window; that marking is a **caution**, not a veto, because the
 recommended delay was already constrained into the window and never used the
 distant optimum.
 
-An arrival-delay outlier discards that pair's physical timing and says so,
-taking the same caution path as absent arrival metadata — a known-bad reading
-is not more informative than a missing one, so it cannot warrant a harsher
-verdict. What is then rejected is evidence from the data itself: a selected
+REW derives arrival delay from the position of the largest sample in the
+impulse response. Across a subwoofer's two or three octaves that impulse is a
+slow oscillatory blob many milliseconds long, so wherever a room mode rings
+hard a later half-cycle can outgrow the direct arrival and the pick jumps a
+whole cycle — tens of milliseconds, silently, and worst at exactly the corner
+positions a sub search cares about.
+
+The leading edge does not jump. Subpair therefore measures each impulse's
+onset over the full sweep range REW reports (not just the scored band —
+doubling the bandwidth halves the width of that edge) and compares the
+peak-minus-onset lag against the cache median. A measurement whose lag departs
+by more than 1.5 ms had its peak slip: its arrival is rebuilt from its own
+onset plus the median lag, which keeps that position's real distance rather
+than flattening it to the median arrival. Only differences between arrivals
+are ever used downstream, so a bias common to every onset — including any
+fixed impulse-reference offset dialled into REW — cancels and is left
+uncorrected.
+
+A repaired arrival still aims the delay search, but on a window widened by
+`ARRIVAL_REPAIRED_WINDOW_FACTOR`, and Gate C is capped at caution for its
+pairs. The reconstruction creeps late as the slipped lobe grows relative to
+the direct arrival, so it is good enough to exclude delays no room geometry
+could produce and not good enough to dictate a narrow answer. The intent is
+that a poor REW timing pick changes how exact the reported delay figure is,
+never which pairs are recommended — this stage prunes positions, and final
+alignment is set with both subs physically in place. The report carries an
+"Arrival timing" table showing every measurement's reported peak, onset, lag,
+deviation and the value actually used.
+
+What survives repair still has to be physically possible: because a common
+offset cancels, the room diagonal bounds the *spread* between arrivals rather
+than any absolute delay, and a measurement outside that spread has its
+physical timing discarded entirely — the same caution path as absent arrival
+metadata, since a known-bad reading is not more informative than a missing
+one. What is then rejected is evidence from the data itself: a selected
 delay pinned to the edge of `--delay-range` is the limit of the search rather
 than an optimum, and every robustness figure around it is one-sided (the
 excursion penalty can even read 0 dB), so it is disqualified with a message

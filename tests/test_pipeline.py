@@ -18,11 +18,13 @@ from subpair.cli import (
     _parse_room_dimensions,
 )
 from subpair.engine import (
+    ARRIVAL_REPAIRED_WINDOW_FACTOR,
+    ARRIVAL_SLIP_TOLERANCE_MS,
     GateThresholds,
     SearchOptions,
     _apply_band_edge_population_status,
     _score_wide_spectrum,
-    _arrival_outliers,
+    _resolve_arrival_delays,
     _baseline_objective_curve,
     _basin_width,
     _detrended_symmetry,
@@ -148,23 +150,105 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(subs[2], (4.0, 0.0, 0.0))
         self.assertEqual(room, (5.0, 4.0, 2.5))
 
-    def test_arrival_delay_outlier_is_flagged_with_path_length_warning(self):
-        measurements = [
-            type(
-                "Measurement",
-                (),
+    @staticmethod
+    def _timing_cache(cache: Path, specs: list[tuple[int, int | None]]) -> None:
+        """Impulses with a direct arrival and an optional larger later lobe.
+
+        ``specs`` is ``(direct_index, slipped_lobe_index)``. The reported arrival
+        is taken from the impulse's own largest sample, exactly as REW derives
+        it, so a later lobe that outgrows the direct arrival produces a genuine
+        cycle-slipped pick rather than a hand-written wrong number.
+        """
+
+        sample_rate, length, start = 3000.0, 4096, -0.5
+        rows = []
+        for index, (direct, slipped) in enumerate(specs, start=1):
+            ir = np.zeros(length, dtype=np.float64)
+            time = np.arange(length - direct) / sample_rate
+            ir[direct:] += np.sin(2 * np.pi * 60.0 * time) * np.exp(-time / 0.05)
+            if slipped is not None:
+                t2 = np.arange(length - slipped) / sample_rate
+                ir[slipped:] += 2.5 * np.sin(2 * np.pi * 60.0 * t2) * np.exp(-t2 / 0.05)
+            reported_ms = 1000.0 * (start + int(np.argmax(np.abs(ir))) / sample_rate)
+            rows.append(
                 {
-                    "position": index,
+                    "source_index": index,
                     "title": f"Position {index}",
-                    "metadata": {"arrival_delay_ms": delay},
-                },
-            )()
-            for index, delay in enumerate((10.0, 11.0, 12.0, 25.0), start=1)
-        ]
-        delays, outliers, warnings = _arrival_outliers(measurements, 343.0, (5.0, 4.0, 2.5))
-        self.assertEqual(delays[-1], 25.0)
-        self.assertEqual(outliers, {3})
-        self.assertIn("8.57 m", warnings[0])
+                    "uuid": f"uuid-{index}",
+                    "sample_rate": sample_rate,
+                    "start_time_seconds": start,
+                    "impulse": ir,
+                    "metadata": {"arrival_delay_ms": reported_ms},
+                }
+            )
+        write_cache(cache, rows, {"test": True})
+
+    def test_clean_arrival_peaks_are_left_alone(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = Path(temporary) / "cache"
+            self._timing_cache(cache, [(300, None), (306, None), (312, None), (309, None)])
+            measurements, _ = load_cache(cache)
+            delays, repaired, unusable, warnings, diag = _resolve_arrival_delays(
+                measurements, (35.0, 150.0), 343.0, None
+            )
+        self.assertEqual(repaired, set())
+        self.assertEqual(unusable, set())
+        self.assertEqual(warnings, [])
+        reported = [row.metadata["arrival_delay_ms"] for row in measurements]
+        for actual, expected in zip(delays, reported):
+            self.assertAlmostEqual(actual, expected)
+        # The lag between peak and onset is what makes a slip detectable, so it
+        # must be near-constant when nothing has slipped.
+        lags = [entry["peak_minus_onset_ms"] for entry in diag["measurements"]]
+        self.assertLess(max(lags) - min(lags), ARRIVAL_SLIP_TOLERANCE_MS)
+
+    def test_cycle_slipped_peak_is_repaired_from_its_own_onset(self):
+        # Position 3's impulse has a later lobe 2.5x the direct arrival, so its
+        # largest sample -- and therefore REW's reported delay -- lands a full
+        # cycle late. Its leading edge does not move, which is what the repair
+        # keys on.
+        slip_samples = 50
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = Path(temporary) / "cache"
+            self._timing_cache(
+                cache,
+                [(300, None), (306, None), (312, 312 + slip_samples), (309, None)],
+            )
+            measurements, _ = load_cache(cache)
+            delays, repaired, unusable, warnings, diag = _resolve_arrival_delays(
+                measurements, (35.0, 150.0), 343.0, None
+            )
+        self.assertEqual(repaired, {2})
+        self.assertEqual(unusable, set())
+        reported = measurements[2].metadata["arrival_delay_ms"]
+        expected_slip_ms = 1000.0 * slip_samples / measurements[0].sample_rate
+        # The repair recovers most of the slip but not all of it: the onset it
+        # rebuilds from creeps later as the slipped lobe grows relative to the
+        # direct arrival (here 2.5x). That residual bias is why a repaired
+        # pair's delay window is widened and its Gate C is advisory, rather
+        # than the reconstruction being trusted outright.
+        recovered = reported - delays[2]
+        self.assertGreater(recovered, 0.5 * expected_slip_ms)
+        self.assertLessEqual(recovered, expected_slip_ms + 1.0)
+        # Repair keeps this position's own distance rather than flattening it
+        # to the median arrival: it sits later than 300/306 as its onset says.
+        self.assertGreater(delays[2], delays[0])
+        self.assertEqual(delays[0], measurements[0].metadata["arrival_delay_ms"])
+        self.assertTrue(any("peak pick slipped" in text for text in warnings))
+        self.assertTrue(diag["measurements"][2]["repaired"])
+
+    def test_arrival_spread_beyond_the_room_diagonal_is_discarded(self):
+        # A common timing offset cancels in the differences that are used, so
+        # the room bounds the spread between arrivals, not each absolute value.
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = Path(temporary) / "cache"
+            self._timing_cache(cache, [(300, None), (306, None), (2400, None)])
+            measurements, _ = load_cache(cache)
+            _delays, _repaired, unusable, warnings, _diag = _resolve_arrival_delays(
+                measurements, (35.0, 150.0), 343.0, (5.0, 4.0, 2.5)
+            )
+        self.assertIn(2, unusable)
+        self.assertTrue(any("room diagonal" in text for text in warnings))
 
     def test_search_constrains_robust_delay_to_measured_physical_window(self):
         sample_rate = 4000.0
@@ -241,15 +325,14 @@ class PipelineTests(unittest.TestCase):
             )
         write_cache(cache, rows, {"test": True})
 
-    def test_arrival_outlier_discards_physical_timing_instead_of_the_pair(self):
-        # A known-bad arrival reading is not more informative than a missing
-        # one, so it must take the same caution path rather than a harsher
-        # reject: it makes the physical constraint unusable, not the position
-        # unusable.
+    def test_bad_arrival_metadata_is_repaired_rather_than_discarding_the_pair(self):
+        # Metadata wrong, impulse fine -- exactly the cycle-slip case. The
+        # arrival is rebuilt from the leading edge, the pair is scored, and the
+        # timing gate is demoted to advisory so a poor REW pick can change how
+        # exact the reported delay is but never which pairs are recommended.
         sample_rate = 4000.0
         with tempfile.TemporaryDirectory() as temporary:
             cache = Path(temporary) / "cache"
-            # Impulse well aligned with the others; only the metadata is bad.
             self._outlier_cache(cache, sample_rate, 4096, 104)
             result = run_search(
                 cache,
@@ -261,19 +344,23 @@ class PipelineTests(unittest.TestCase):
                     gate_thresholds=_permissive_gates(),
                 ),
             )
-        outlier_pairs = [
-            row for row in result["pairs"] if 3 in (row["first"], row["second"])
-        ]
-        self.assertEqual(len(outlier_pairs), 2)
-        for row in outlier_pairs:
+        self.assertIn(3, result["measurement_arrival_delay_repaired"])
+        reported = result["arrival_timing"]["measurements"][2]["reported_ms"]
+        resolved = result["measurement_arrival_delays_ms"][2]
+        self.assertLess(resolved, reported)
+        affected = [row for row in result["pairs"] if 3 in (row["first"], row["second"])]
+        self.assertEqual(len(affected), 2)
+        for row in affected:
             gate_c = row["gates"]["gate_c_physical_percentile"]
-            self.assertNotEqual(gate_c["status"], "not_run")
-            self.assertIn("arrival-delay outlier", gate_c["detail"])
-            # The suspect figure is reported but never used to constrain.
-            self.assertIsNotNone(gate_c["reported_tau_ms"])
-            self.assertIsNone(row["physical_tau"])
-            self.assertTrue(row["robustness"]["measurement_delay_outlier"])
-            # The pair is scored rather than dropped before the optimiser.
+            self.assertTrue(gate_c["arrival_repaired"])
+            self.assertNotEqual(gate_c["status"], "reject")
+            # Repaired timing still aims the search, on a widened window.
+            self.assertIsNotNone(row["physical_tau"])
+            self.assertTrue(row["robustness"]["physical_window_widened"])
+            self.assertAlmostEqual(
+                row["robustness"]["physical_window_ms"],
+                1.5 * ARRIVAL_REPAIRED_WINDOW_FACTOR,
+            )
             self.assertTrue(row["optimized"])
             self.assertIsNotNone(row["score_db"])
 
