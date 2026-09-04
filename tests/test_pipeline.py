@@ -6,6 +6,7 @@ import re
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -17,10 +18,15 @@ from subpair.cli import (
     _parse_room_dimensions,
 )
 from subpair.engine import (
+    GateThresholds,
     SearchOptions,
     _arrival_outliers,
+    _baseline_objective_curve,
     _basin_width,
+    _detrended_symmetry,
     _geometry_jitter,
+    _redundancy_residual,
+    _ripple_deviation_correlation,
     run_search,
 )
 from subpair.dsp import (
@@ -64,6 +70,27 @@ def _synthetic_ir(sample_rate: float, length: int, delay: int, modes: list[tuple
     for frequency, amplitude in modes:
         result[delay:] += amplitude * np.sin(2 * np.pi * frequency * time) * np.exp(-time / 0.12)
     return result
+
+
+def _permissive_gates() -> GateThresholds:
+    """Keep legacy pipeline tests focused on scoring rather than gate fixtures."""
+
+    return GateThresholds(
+        redundancy_reject=0.0,
+        redundancy_caution=0.0,
+        ripple_correlation_reject=1.0,
+        ripple_complementary=-1.0,
+        physical_percentile_reject=100.0,
+        cancellation_deficit_reject_db=-300.0,
+        cancellation_deficit_caution_db=-300.0,
+        comb_index_reject=1.0,
+        comb_index_caution=1.0,
+        notch_depth_reject_db=300.0,
+        gain_asymmetry_caution_db=100.0,
+        band_edge_spread_reject_db=300.0,
+        localization_fraction_reject=1.0,
+        basin_range_fraction=1.0,
+    )
 
 
 class PipelineTests(unittest.TestCase):
@@ -162,12 +189,19 @@ class PipelineTests(unittest.TestCase):
                     gain_range_db=(0.0, 0.0, 1.0),
                     eq_bands=0,
                     physical_delay_window_ms=0.5,
+                    gate_thresholds=_permissive_gates(),
                 ),
             )
         pair = result["pairs"][0]
         self.assertEqual(pair["physical_tau"], -2.0)
         self.assertLessEqual(abs(pair["tau_robust"] + 2.0), 0.5 + 1e-12)
         self.assertTrue(pair["pair_valid"])
+        gate_c = pair["gates"]["gate_c_physical_percentile"]
+        self.assertAlmostEqual(
+            pair["physical_objective_gap_db"],
+            gate_c["objective_at_physical_db"] - pair["f_tau_star"],
+        )
+        self.assertEqual(gate_c["gap_reference"], "f(tau_star)")
 
     def test_selected_report_graphs_share_data_bounds_and_cap_negative_excess_gd(self):
         rows = [
@@ -284,6 +318,10 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(defaults.max_cut, 18.0)
         self.assertEqual(defaults.score_low_end_weight, 0.5)
         self.assertEqual(defaults.score_dip_weight, 1.0)
+        self.assertEqual(defaults.gate_redundancy_reject, 0.5)
+        self.assertEqual(defaults.gate_ripple_reject, 0.3)
+        self.assertEqual(defaults.gate_physical_percentile, 75.0)
+        self.assertEqual(defaults.gate_basin_range_fraction, 0.05)
         overridden = parser.parse_args(
             [
                 "search",
@@ -293,11 +331,103 @@ class PipelineTests(unittest.TestCase):
                 "0.75",
                 "--score-dip-weight",
                 "1.5",
+                "--gate-redundancy-reject",
+                "0.45",
+                "--gate-band-edge-spread",
+                "2.5",
             ]
         )
         self.assertEqual(overridden.max_cut, 24.0)
         self.assertEqual(overridden.score_low_end_weight, 0.75)
         self.assertEqual(overridden.score_dip_weight, 1.5)
+        self.assertEqual(overridden.gate_redundancy_reject, 0.45)
+        self.assertEqual(overridden.gate_band_edge_spread, 2.5)
+
+    def test_delayed_scaled_copy_triggers_redundancy_and_has_expected_symmetry(self):
+        sample_rate = 4000.0
+        length = 4096
+        source = _synthetic_ir(
+            sample_rate,
+            length,
+            100,
+            [(43.0, 0.20), (91.0, 0.20)],
+        )
+        delayed = np.zeros_like(source)
+        delayed[8:] = 0.7 * source[:-8]
+        rows = [
+            {
+                "source_index": index,
+                "title": title,
+                "uuid": str(index),
+                "sample_rate": sample_rate,
+                "start_time_seconds": -0.025,
+                "impulse": impulse,
+            }
+            for index, (title, impulse) in enumerate(
+                [("reference", source), ("delayed copy", delayed)],
+                start=1,
+            )
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = Path(temporary)
+            write_cache(cache, rows, {"test": True})
+            measurements, _manifest = load_cache(cache)
+            context = AnalysisContext(measurements, (35.0, 150.0), 64)
+            delays = np.arange(-10.0, 10.0001, 0.05)
+            residual, fitted_delay_ms, _scale = _redundancy_residual(
+                context, 0, 1, delays
+            )
+            self.assertLess(residual, 0.01)
+            self.assertAlmostEqual(fitted_delay_ms, 2.0, delta=0.05)
+            self.assertGreater(_ripple_deviation_correlation(context, 0, 1), 0.99)
+
+            objective = _baseline_objective_curve(context, 0, 1, delays, 0.5, 1.0)
+            symmetry = _detrended_symmetry(objective, delays, -2.0)
+            self.assertGreater(symmetry["correlation"], 0.98)
+            self.assertAlmostEqual(symmetry["axis_ms"], -2.0, delta=0.1)
+
+    def test_stage_one_rejection_skips_the_expensive_optimizer(self):
+        sample_rate = 4000.0
+        length = 4096
+        source = _synthetic_ir(sample_rate, length, 100, [(48.0, 0.2)])
+        rows = [
+            {
+                "source_index": index,
+                "title": f"copy {index}",
+                "uuid": str(index),
+                "sample_rate": sample_rate,
+                "start_time_seconds": -0.025,
+                "impulse": source.copy(),
+            }
+            for index in (1, 2)
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = Path(temporary)
+            results_path = cache / "search-results.json"
+            write_cache(cache, rows, {"test": True})
+            with mock.patch("subpair.engine._best_configurations") as optimizer:
+                result = run_search(
+                    cache,
+                    results_path,
+                    SearchOptions(
+                        band=(35.0, 150.0),
+                        delay_range_ms=(-3.0, 3.0, 0.05),
+                        gain_range_db=(-1.0, 1.0, 1.0),
+                        ppo=48,
+                        eq_bands=0,
+                    ),
+                )
+            optimizer.assert_not_called()
+            pair = result["pairs"][0]
+            self.assertFalse(pair["optimized"])
+            self.assertEqual(pair["verdict"], "reject")
+            self.assertEqual(pair["gates"]["gate_a_redundancy"]["status"], "reject")
+            self.assertEqual(pair["gates"]["gate_b_ripple_correlation"]["status"], "reject")
+            self.assertEqual(result["optimized_pair_count"], 0)
+            self.assertEqual(
+                result["settings"]["gates"]["thresholds"]["redundancy_reject"],
+                0.5,
+            )
 
     def test_automatic_low_shelf_cli_flag_defaults_on_for_search_only(self):
         parser = _build_parser()
@@ -1026,6 +1156,7 @@ class PipelineTests(unittest.TestCase):
                     delay_range_ms=(-2.0, 2.0, 1.0),
                     gain_range_db=(-1.0, 1.0, 1.0),
                     ppo=24,
+                    gate_thresholds=_permissive_gates(),
                 ),
             )
             self.assertEqual(len(result["pairs"]), 6)
@@ -1041,12 +1172,11 @@ class PipelineTests(unittest.TestCase):
             ]
             self.assertEqual(eq_scores, sorted(eq_scores, reverse=True))
             loaded = json.loads(results_path.read_text())
+            self.assertEqual(loaded["settings"]["ranking"]["raw"][0], "verdict")
+            self.assertEqual(loaded["settings"]["ranking"]["raw"][1], "score_db")
+            self.assertEqual(loaded["settings"]["ranking"]["eq"][0], "verdict")
             self.assertEqual(
-                loaded["settings"]["ranking"]["raw"][0], "score_db"
-            )
-            self.assertEqual(
-                loaded["settings"]["ranking"]["eq"][0],
-                "post_eq_score_db",
+                loaded["settings"]["ranking"]["eq"][1], "post_eq_score_db"
             )
             self.assertEqual(
                 loaded["settings"]["ranking"]["excess_gd_range_hz"],
@@ -1198,6 +1328,7 @@ class PipelineTests(unittest.TestCase):
                     gain_range_db=(-1.0, 1.0, 1.0),
                     ppo=24,
                     low_shelf=False,
+                    gate_thresholds=_permissive_gates(),
                 ),
             )
             self.assertFalse(no_shelf_result["settings"]["eq"]["shelf"]["enabled"])
@@ -1275,22 +1406,23 @@ class PipelineTests(unittest.TestCase):
             visible_eq_pairs = sorted(
                 result["pairs"], key=lambda row: row["eq_rank"]
             )[:3]
-            # Six established score/response metrics plus the four numeric or
-            # categorical robustness metrics. Physical status is N/A in this
-            # fixture (no arrival metadata), so it deliberately stays grey.
-            expected_colored_metrics = 10 * len(visible_eq_pairs)
-            self.assertTrue(
-                all(
-                    table.count("background:hsla(") == expected_colored_metrics
+            # Every sortable score, gate, and robustness metric is coloured.
+            # Gate C, Gate I, and physical status are N/A in this fixture (no
+            # arrival metadata), so those three cells per row stay grey.
+            expected_colored_metrics = 19 * len(visible_eq_pairs)
+            self.assertEqual(
+                [
+                    table.count("background:hsla(")
                     for table in ranking_tables(page)
-                )
+                ],
+                [expected_colored_metrics],
             )
-            self.assertTrue(
-                all(
+            self.assertEqual(
+                [
                     table.count('class="metric-cell is-empty"')
-                    == len(visible_eq_pairs)
                     for table in ranking_tables(page)
-                )
+                ],
+                [3 * len(visible_eq_pairs)],
             )
             self.assertNotIn(".plotly-graph-div { width:100% !important; }", page)
             self.assertIn(".overview-panels,#pair-details { position:relative; }", page)
@@ -1307,13 +1439,19 @@ class PipelineTests(unittest.TestCase):
             self.assertIn("Fragility (dB)", page)
             self.assertIn("Basin +0.3 (ms)", page)
             self.assertIn("Delay robustness (lower f is better)", page)
+            self.assertIn("detrended mirror axis", page)
+            self.assertIn("<summary>Score &amp; metric notes</summary>", page)
             self.assertIn("disqualifier, not a certificate", page)
+            self.assertIn("Verdict pipeline.", page)
+            self.assertIn("A — redundancy residual.", page)
+            self.assertIn("I — improvement localisation.", page)
             self.assertIn("Delay-robustness basis.", page)
             self.assertIn("Robustness columns.", page)
             self.assertIn("Geometry and physical status.", page)
             self.assertIn("Robustness graph.", page)
             self.assertIn("Table colors.", page)
             self.assertIn("green with an inset outline is best and red is worst", page)
+            self.assertIn("A residual and D deficit prefer higher values", page)
             self.assertIn(
                 'data-key="geometric_pass" data-type="number"', page
             )
@@ -1377,6 +1515,7 @@ class PipelineTests(unittest.TestCase):
                     delay_range_ms=(-2.0, 2.0, 1.0),
                     gain_range_db=(-1.0, 1.0, 1.0),
                     ppo=24,
+                    gate_thresholds=_permissive_gates(),
                 ),
             )
             self.assertEqual(len(result["pairs"]), 1)
@@ -1535,6 +1674,7 @@ class RoomModeTests(unittest.TestCase):
                     delay_range_ms=(-2.0, 2.0, 1.0),
                     gain_range_db=(-1.0, 1.0, 1.0),
                     ppo=24,
+                    gate_thresholds=_permissive_gates(),
                 ),
             ),
         }

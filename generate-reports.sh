@@ -20,11 +20,11 @@ fi
 
 SEARCH_ARGS=(
   --cache "${SUBPAIR_CACHE_DIR}"
-  --band 20 250
+  --band 35 150
   --delay-range -10 10 0.05
   --gain-range -6 6 0.1
   --ppo 64
-  --eq-range 30 120
+  --eq-range 35 120
   --eq-range-slope 48
   --max-boost 6
   --max-cut 18

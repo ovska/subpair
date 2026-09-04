@@ -58,12 +58,14 @@ when those query parameters are advertised.
 
 ### `subpair search`
 
-All pair, polarity, relative-delay, and relative-gain settings are enumerated.
-The first sub is the 0 dB reference; the second receives the reported gain,
-polarity, and delay. The grid includes both range endpoints when they lie on
-the requested step. Delay is always evaluated at 0.05 ms resolution or finer;
-if a coarser step is requested, subpair automatically uses 0.05 ms and records
-the effective step as `settings.delay_grid_step_ms`.
+Every measurement pair first passes the inexpensive disqualifier screens
+described below. Surviving pairs enumerate polarity, relative delay, and
+relative gain. The first sub is the 0 dB reference; the second receives the
+reported gain, polarity, and delay. The grid includes both range endpoints
+when they lie on the requested step. Delay is always evaluated at 0.05 ms
+resolution or finer; if a coarser step is requested, subpair automatically
+uses 0.05 ms and records the effective step as
+`settings.delay_grid_step_ms`.
 
 Raw and EQ'd results are both rated with one scalar **usable-output
 score**. Higher is better, and the displayed score is relative to the best
@@ -142,11 +144,20 @@ The pair JSON and comparison table include:
   not the total duration of every disconnected near-optimal region;
 - `worst_case` at 0.5, 1.0, and 1.5 ms around `tau_star`;
 - `n_competing`: local minima within 0.3 dB of the raw global minimum; and
-- `geometric_pass`: whether `basin_w03` covers the pair's geometric excursion.
+- `basin_scaled`: the contiguous width at a degradation equal to a configured
+  fraction (5% by default) of the pair's objective range inside its physical
+  window; and
+- `geometric_pass`: whether `basin_scaled` covers the pair's geometric
+  excursion.
 
-The report plots raw and jitter-averaged `f(tau)`, shades the +0.3 dB
+The fixed `basin_w03`/`basin_w05` values remain for comparison, but their
+absolute thresholds can be disproportionately narrow when different
+objectives span very different ranges. The scaled basin drives the geometric
+gate. The report plots raw and jitter-averaged `f(tau)`, shades that adaptive
 contiguous basin, and separately marks the measured physical delay,
-`tau_star`, and `tau_robust`.
+`tau_star`, `tau_robust`, and the best-fit mirror axis of the detrended curve.
+Mirror correlation and axis offset are visual diagnostics only; they never
+affect the verdict.
 
 REW's loopback-referenced arrival delay is normalized into the cache at fetch
 time. Because delay is applied to sub 2, a pair's physical compensation is
@@ -196,6 +207,49 @@ pair is robust across seats: moving the microphone also changes each sub's
 magnitude response as it samples a different point in the room's modal pressure
 field, and this delay-only test cannot capture that. Only multi-position
 measurements can validate a listening area.
+
+#### Pair disqualifier gates
+
+Each row has a reproducible `verdict` (`accept`, `caution`, or `reject`), a
+structured `gates` block, and `reasons` for every non-passing gate. Verdict is
+the primary sort key, so rejected pairs remain visible at the bottom even when
+their raw or post-EQ score is high. An early A, B, or C rejection skips the
+expensive polarity/delay/gain optimizer but retains the measurements that
+caused the decision.
+
+The gates run in this order:
+
+- **A — redundancy residual:** best complex scaled/delayed-copy fit between
+  the two solo responses; reject below 0.5 and caution below 0.6.
+- **B — ripple correlation:** correlation after subtracting each response's
+  one-octave magnitude trend; reject reinforcing errors above +0.3 and label
+  values below -0.1 complementary. This is a screen, never a ranking boost.
+- **C — physical-delay percentile:** the normal-polarity, equal-gain objective
+  at the header-derived arrival alignment within the pair's delay landscape;
+  reject above the 75th percentile and report the absolute gap to `f(tau*)`.
+- **Basin vs geometry:** reject when the adaptive contiguous basin is narrower
+  than the listener-movement delay excursion.
+- **D — cancellation deficit:** coherent mean level minus the corresponding
+  incoherent power sum at both physical and selected alignment; caution below
+  -1 dB and reject below -3 dB.
+- **E — comb signature:** linear-frequency autocorrelation at `1/abs(tau)` and
+  harmonics; caution at 0.4 and reject at 0.65.
+- **F — residual notches:** reject summed-response nulls deeper than 8 dB below
+  the local trend and no wider than 1/6 octave at their -3 dB edges.
+- **G — gain asymmetry:** caution above a 4 dB relative offset and record
+  search-boundary/headroom achievability information.
+- **H — band-edge stability:** shift the evaluation band down and up by 1/6
+  octave; reject a score spread above 2 dB.
+- **I — improvement localisation:** reject when more than 50% of positive
+  detrended-ripple improvement over physical alignment lies in one sliding
+  1/6-octave region.
+
+All thresholds live in `GateThresholds`, are exposed as `--gate-*` search
+arguments, and are serialized under `settings.gates.thresholds`. The HTML
+report gives every populated numeric gate column the same sortable green-to-red
+best/worst treatment as the established score and robustness columns. The
+complete definitions, directions, limits, and the single-position caveat are
+repeated in **Score & metric notes** at the bottom of each report.
 
 Low-end power replaces the old F3/F6 thresholds. It energy-averages the
 one-octave broad response over the analyzed range through 100 Hz and weights

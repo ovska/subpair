@@ -12,7 +12,7 @@ import numpy as np
 
 from subpair.cache import write_cache
 from subpair.cli import _build_parser, main
-from subpair.engine import SearchOptions, run_search
+from subpair.engine import GateThresholds, SearchOptions, run_search
 from subpair.modal import (
     ModalOptions,
     RoomMode,
@@ -61,6 +61,25 @@ def _synthetic_modal_impulse(
         rng = np.random.default_rng(seed)
         result += rng.normal(scale=noise_amplitude, size=n)
     return result
+
+
+def _permissive_gates() -> GateThresholds:
+    return GateThresholds(
+        redundancy_reject=0.0,
+        redundancy_caution=0.0,
+        ripple_correlation_reject=1.0,
+        ripple_complementary=-1.0,
+        physical_percentile_reject=100.0,
+        cancellation_deficit_reject_db=-300.0,
+        cancellation_deficit_caution_db=-300.0,
+        comb_index_reject=1.0,
+        comb_index_caution=1.0,
+        notch_depth_reject_db=300.0,
+        gain_asymmetry_caution_db=100.0,
+        band_edge_spread_reject_db=300.0,
+        localization_fraction_reject=1.0,
+        basin_range_fraction=1.0,
+    )
 
 
 class MatrixPencilTests(unittest.TestCase):
@@ -581,9 +600,10 @@ class EngineIntegrationTests(unittest.TestCase):
                     eq_bands=0,
                     modal=True,
                     modal_tiebreak=True,
+                    gate_thresholds=_permissive_gates(),
                 ),
             )
-            self.assertEqual(result["format_version"], 24)
+            self.assertEqual(result["format_version"], 25)
             signature = result["modal_signature"]
             self.assertIsNotNone(signature)
             self.assertTrue(signature["valid"])
@@ -645,6 +665,7 @@ class EngineIntegrationTests(unittest.TestCase):
                     gain_range_db=(0.0, 0.0, 1.0),
                     ppo=24,
                     eq_bands=0,
+                    gate_thresholds=_permissive_gates(),
                 ),
             )
             for pair in result["pairs"]:
@@ -675,6 +696,7 @@ class EngineIntegrationTests(unittest.TestCase):
                     eq_bands=4,
                     max_cut_db=18.0,
                     modal=True,
+                    gate_thresholds=_permissive_gates(),
                 ),
             )
             for pair in result["pairs"]:
@@ -703,6 +725,7 @@ class EngineIntegrationTests(unittest.TestCase):
                     gain_range_db=(0.0, 0.0, 1.0),
                     ppo=24,
                     eq_bands=0,
+                    gate_thresholds=_permissive_gates(),
                 ),
             )
             self.assertIsNone(result["modal_signature"])
@@ -732,6 +755,7 @@ class EngineIntegrationTests(unittest.TestCase):
                     ppo=24,
                     eq_bands=0,
                     modal=True,
+                    gate_thresholds=_permissive_gates(),
                 ),
             )
             output = root / "report.html"
@@ -758,6 +782,7 @@ class EngineIntegrationTests(unittest.TestCase):
                     gain_range_db=(0.0, 0.0, 1.0),
                     ppo=24,
                     eq_bands=0,
+                    gate_thresholds=_permissive_gates(),
                 ),
             )
             output = root / "report.html"
