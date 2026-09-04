@@ -583,7 +583,7 @@ class EngineIntegrationTests(unittest.TestCase):
                     modal_tiebreak=True,
                 ),
             )
-            self.assertEqual(result["format_version"], 23)
+            self.assertEqual(result["format_version"], 24)
             signature = result["modal_signature"]
             self.assertIsNotNone(signature)
             self.assertTrue(signature["valid"])

@@ -70,6 +70,22 @@ class ApiTests(unittest.TestCase):
         np.testing.assert_allclose(impulse, [0.125, 0.25, 0.375, 0.5])
         self.assertEqual(metadata["sample_rate"], 48000)
 
+    def test_extracts_nested_arrival_delay_with_explicit_or_rew_display_units(self):
+        self.assertAlmostEqual(
+            RewClient.measurement_arrival_delay_seconds(
+                {"timing": {"arrivalDelaySeconds": 0.025}}
+            ),
+            0.025,
+        )
+        self.assertAlmostEqual(
+            RewClient.measurement_arrival_delay_seconds({"delay": "25.00 ms"}),
+            0.025,
+        )
+        self.assertAlmostEqual(
+            RewClient.measurement_arrival_delay_seconds({"delay": 0.025}),
+            0.025,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

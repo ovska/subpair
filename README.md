@@ -24,7 +24,7 @@ Then:
 ```sh
 subpair fetch --count 12
 subpair search --band 25 150 \
-  --delay-range -10 10 0.1 --gain-range -3 3 0.5 --eq-bands 7 --top 10
+  --delay-range -10 10 0.05 --gain-range -3 3 0.5 --eq-bands 7 --top 10
 subpair report --top 5 --limit 15 --output subpair-report.html
 ```
 
@@ -61,7 +61,9 @@ when those query parameters are advertised.
 All pair, polarity, relative-delay, and relative-gain settings are enumerated.
 The first sub is the 0 dB reference; the second receives the reported gain,
 polarity, and delay. The grid includes both range endpoints when they lie on
-the requested step.
+the requested step. Delay is always evaluated at 0.05 ms resolution or finer;
+if a coarser step is requested, subpair automatically uses 0.05 ms and records
+the effective step as `settings.delay_grid_step_ms`.
 
 Raw and EQ'd results are both rated with one scalar **usable-output
 score**. Higher is better, and the displayed score is relative to the best
@@ -99,9 +101,10 @@ dip or act as score tie-breakers.
 
 The exhaustive polarity/delay/gain grid uses the same equal-drive raw formula
 as a fast first pass. Full EQ fitting for every grid point would be
-prohibitively expensive, so each pair retains up to eight highest-raw-score
-configurations and eight lowest-residual-dip configurations. Fitted post-EQ
-score then selects the pair's reported polarity, delay, and gain tuple. This
+prohibitively expensive, so each pair first chooses the robust delay for every
+polarity/gain and retains up to eight lowest-robust-objective configurations
+and eight lowest-residual-dip configurations. Fitted post-EQ score then selects
+the pair's reported polarity and gain from that robust-delay shortlist. This
 two-objective shortlist matters because a slightly quieter, smoother raw sum
 can require less attenuation and win after EQ. Raw and EQ'd tables report the
 same selected physical configuration so their before/after values remain
@@ -111,6 +114,88 @@ Each pair also reports `delay_plateau_ms`/`gain_plateau_db`: how far delay
 or gain can drift while the raw score remains within 0.5 dB of its value at
 the selected configuration. A wide plateau is forgiving; a narrow one is
 more sensitive to real-world delay drift, temperature, or DSP quantization.
+
+#### Delay-basin robustness and physical timing
+
+A sharp single-position timing cancellation can score as well as genuinely
+complementary room coupling, so the raw optimum is not automatically the delay
+subpair recommends. For each shortlisted polarity/gain, subpair defines the
+lower-is-better objective `f = -raw usable-output score` and evaluates
+
+```text
+f_robust(tau) = E[f(tau + epsilon)]
+epsilon ~ Normal(0, sigma_tau^2)
+```
+
+by Gaussian convolution of the already-computed exhaustive delay curve. It
+does not re-run the acoustic sum for jitter samples. Independent gain jitter
+with sigma 0.5 dB (roughly a +/-1 dB excursion at two sigma) is folded into
+the same expectation. The result reports both the unconstrained raw `tau_star`
+and the physically constrained `tau_robust`; `delay_ms` is the latter for
+backward compatibility. It also keeps `f_tau_star` and
+`f_robust_tau_robust` explicit so disagreement is visible.
+
+The pair JSON and comparison table include:
+
+- `fragility`: `f_robust(tau_star) - f(tau_star)` in dB;
+- `basin_w03` and `basin_w05`: the contiguous basin containing `tau_star`,
+  not the total duration of every disconnected near-optimal region;
+- `worst_case` at 0.5, 1.0, and 1.5 ms around `tau_star`;
+- `n_competing`: local minima within 0.3 dB of the raw global minimum; and
+- `geometric_pass`: whether `basin_w03` covers the pair's geometric excursion.
+
+The report plots raw and jitter-averaged `f(tau)`, shades the +0.3 dB
+contiguous basin, and separately marks the measured physical delay,
+`tau_star`, and `tau_robust`.
+
+REW's loopback-referenced arrival delay is normalized into the cache at fetch
+time. Because delay is applied to sub 2, a pair's physical compensation is
+`arrival_1 - arrival_2`. Robust delay selection is restricted to that value
++/- `--physical-delay-window` (1.5 ms by default). The unconstrained raw
+optimum is still reported and marked `non_physical_solution` when it lies
+outside the window. Such pairs, pairs whose window does not intersect the scan,
+and pairs involving an arrival-delay outlier are disqualified ahead of score;
+score remains the unchanged ordering within the physically credible group.
+Subpair warns about delays above 1.5 times the median and, when room dimensions
+are configured, path lengths longer than the room diagonal. Old caches without
+arrival metadata remain usable, but their affected pairs explicitly say the
+physical constraint is unavailable; re-run `subpair fetch` to populate it.
+
+Timing jitter comes from the change in differential arrival time for a listener
+displacement `d`:
+
+```text
+delta_tau_max = (d / c) * |u_A - u_B|
+sigma_tau = delta_tau_max / 2
+```
+
+`d` defaults to 0.25 m (`--listener-movement`) and `c` to 343 m/s
+(`--speed-of-sound`). Pass coordinates with `--geometry-config` (or
+`--geometry`):
+
+```json
+{
+  "listening_position_m": [2.5, 2.0, 1.0],
+  "sub_positions_m": {
+    "1": [0.0, 0.0, 0.0],
+    "2": [5.0, 0.0, 0.0],
+    "3": [0.0, 4.0, 0.0]
+  },
+  "room_dimensions_m": [5.0, 4.0, 2.5]
+}
+```
+
+Sub-position keys are the 1-based cached positions. A simple array in cache
+order is also accepted. If either coordinate is unavailable, subpair uses the
+conservative `2d/c` bound and marks that fact. Opposite-side pairs reach this
+bound; same-direction pairs can have much smaller differential jitter.
+
+These metrics are intentionally a disqualifier, not a certificate. A narrow
+basin proves that the tuning is fragile. A wide basin does **not** prove that a
+pair is robust across seats: moving the microphone also changes each sub's
+magnitude response as it samples a different point in the room's modal pressure
+field, and this delay-only test cannot capture that. Only multi-position
+measurements can validate a listening area.
 
 Low-end power replaces the old F3/F6 thresholds. It energy-averages the
 one-octave broad response over the analyzed range through 100 Hz and weights
