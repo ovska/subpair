@@ -803,8 +803,8 @@ def _ranking_table(
         ("fragility", "Fragility (dB)", "number"),
         ("basin_w03", "Basin +0.3 (ms)", "number"),
         ("worst_case_1", "Worst f +/-1 ms (dB)", "number"),
-        ("geometric_pass", "Basin vs geometry", "text"),
-        ("physical_status", "Physical", "text"),
+        ("geometric_pass", "Basin vs geometry", "number"),
+        ("physical_status", "Physical", "number"),
         ("polarity", "Pol 2", "number"),
         ("delay_ms", "Delay 2 (ms)", "number"),
         ("gain_db", "Gain 2 (dB)", "number"),
@@ -825,21 +825,63 @@ def _ranking_table(
     )
     metric_directions = {
         score_key: "high",
+        "fragility": "low",
+        "basin_w03": "high",
+        "worst_case_1": "low",
+        "geometric_pass": "high",
+        "physical_status": "low",
         dip_key: "low",
         excess_key: "low",
         tail_key: "low",
         low_end_power_key: "high",
         spl_key: "high",
     }
+
+    def physical_status(pair: dict[str, Any]) -> tuple[str, str, float | None]:
+        """Display text, best-first sort rank, and colour rank for physical status."""
+
+        if not pair.get("pair_valid", True):
+            return "INVALID", "3", 3.0
+        if pair.get("physical_tau") is None:
+            # Missing arrival metadata is unknown, not good or bad. It sorts
+            # between OK and known failures but remains neutral grey.
+            return "N/A", "1", None
+        if pair.get("non_physical_solution"):
+            return "OUT", "2", 2.0
+        return "OK", "0", 0.0
+
+    def metric_value(pair: dict[str, Any], key: str) -> float | None:
+        if key == tail_key:
+            return tail_display[id(pair)][0]
+        if key == "worst_case_1":
+            value = pair.get("worst_case", {}).get("1.0")
+        elif key == "geometric_pass":
+            value = 1.0 if pair.get("geometric_pass") else 0.0
+        elif key == "physical_status":
+            return physical_status(pair)[2]
+        else:
+            value = pair.get(key)
+        return float(value) if value is not None else None
+
     # Keep missing future metrics out of the colour-scaled range rather than
     # coercing them to numbers that could skew the best/worst endpoints.
+    # Status columns use fixed ranges so an all-FAIL table cannot make FAIL
+    # look green merely because it is the best value currently visible.
+    fixed_metric_ranges = {
+        "geometric_pass": (0.0, 1.0),
+        "physical_status": (0.0, 3.0),
+    }
     metric_ranges: dict[str, tuple[float, float]] = {}
     for key in metric_directions:
-        if key == tail_key:
-            numeric = [value for value, _ in tail_display.values() if value is not None]
-        else:
-            numeric = [float(pair[key]) for pair in pairs if pair[key] is not None]
-        metric_ranges[key] = (min(numeric), max(numeric)) if numeric else (0.0, 0.0)
+        numeric = [
+            value
+            for pair in pairs
+            if (value := metric_value(pair, key)) is not None
+        ]
+        metric_ranges[key] = fixed_metric_ranges.get(
+            key,
+            (min(numeric), max(numeric)) if numeric else (0.0, 0.0),
+        )
 
     def score_style(key: str, value: float | None) -> str:
         if key not in metric_directions or value is None:
@@ -860,6 +902,7 @@ def _ranking_table(
     for pair in pairs:
         key_value = f"{int(pair['first'])}-{int(pair['second'])}"
         tail_value, tail_unit = tail_display[id(pair)]
+        physical_text, physical_sort_value, _ = physical_status(pair)
         tail_display_text = (
             (f"{tail_value:+.1f} dB" if tail_unit == "dB" else f"{tail_value:.1f} ms")
             if tail_value is not None
@@ -890,26 +933,7 @@ def _ranking_table(
                 "PASS" if pair.get("geometric_pass") else "FAIL",
                 "1" if pair.get("geometric_pass") else "0",
             ),
-            "physical_status": (
-                (
-                    "INVALID"
-                    if not pair.get("pair_valid", True)
-                    else (
-                        "N/A"
-                        if pair.get("physical_tau") is None
-                        else ("OUT" if pair.get("non_physical_solution") else "OK")
-                    )
-                ),
-                (
-                    "3"
-                    if not pair.get("pair_valid", True)
-                    else (
-                        "2"
-                        if pair.get("physical_tau") is None
-                        else ("1" if pair.get("non_physical_solution") else "0")
-                    )
-                ),
-            ),
+            "physical_status": (physical_text, physical_sort_value),
             "polarity": ("+" if pair["polarity"] > 0 else "−", str(pair["polarity"])),
             "delay_ms": (f"{pair['delay_ms']:+.3f}", str(pair["delay_ms"])),
             "gain_db": (f"{pair['gain_db']:+.2f}", str(pair["gain_db"])),
@@ -929,11 +953,7 @@ def _ranking_table(
         cells = []
         for key, _, _ in columns:
             is_metric = key in metric_directions
-            if key == tail_key:
-                numeric_value = tail_value
-            else:
-                raw_value = pair.get(key) if is_metric else None
-                numeric_value = float(raw_value) if raw_value is not None else None
+            numeric_value = metric_value(pair, key) if is_metric else None
             style = score_style(key, numeric_value) if is_metric else ""
             empty_class = " is-empty" if is_metric and numeric_value is None else ""
             style_attribute = f' style="{style}"' if style else ""
@@ -1304,6 +1324,69 @@ def build_report(
             else ""
         )
     )
+    robustness_settings = settings.get("robustness", {})
+    listener_movement_cm = 100.0 * float(
+        robustness_settings.get("listener_movement_m", 0.25)
+    )
+    gain_jitter_sigma_db = float(
+        robustness_settings.get("gain_jitter_sigma_db", 0.5)
+    )
+    physical_delay_window_ms = float(
+        robustness_settings.get("physical_delay_window_ms", 1.5)
+    )
+    robustness_foundations_note = (
+        "<strong>Delay-robustness basis.</strong> These are raw, pre-EQ diagnostics "
+        "for the polarity and gain shown in the row. <strong>f(τ)</strong> is the "
+        "negative raw usable-output score as delay τ is swept, so lower is better. "
+        "<strong>τ*</strong> is the delay at the minimum of raw f. "
+        "<strong>f_robust(τ)</strong> Gaussian-averages f over timing and gain "
+        f"uncertainty: the timing σ is half each pair’s geometric delay-excursion "
+        f"bound, and gain σ is {gain_jitter_sigma_db:g} dB (approximately "
+        f"±{2.0 * gain_jitter_sigma_db:g} dB at ±2σ). The reported robust delay "
+        "minimizes f_robust inside the measured physical-delay window when that "
+        "window is available."
+    )
+    robustness_columns_note = (
+        "<strong>Robustness columns.</strong> <strong>Fragility</strong> is "
+        "f_robust(τ*) − f(τ*): the score penalty created by jitter at the raw "
+        "optimum; lower is better. <strong>Basin +0.3</strong> is the width of the "
+        "single contiguous delay interval containing τ* whose raw f stays within "
+        "+0.3 dB of its minimum; disconnected good regions do not count, and wider "
+        "is better. <strong>Worst f ±1 ms</strong> is the largest raw f encountered "
+        "from τ* − 1 ms through τ* + 1 ms, including interpolated interval edges; "
+        "lower is better. Competing minima, shown in each pair summary, counts "
+        "distinct local minima within +0.3 dB of the best raw minimum."
+    )
+    robustness_status_note = (
+        "<strong>Geometry and physical status.</strong> The geometric delay-excursion "
+        f"bound models up to {listener_movement_cm:g} cm of listener movement from "
+        "configured source/listener coordinates; without complete coordinates it "
+        "uses the conservative 2d/c bound. <strong>Basin vs geometry</strong> is "
+        "PASS when the +0.3 dB basin is at least as wide as that bound. "
+        "<strong>Physical</strong> compares τ* with the loopback-referenced arrival "
+        "difference (first arrival − second arrival, because delay is applied to "
+        f"sub 2): OK is within ±{physical_delay_window_ms:g} ms, OUT is outside, "
+        "INVALID marks an arrival-delay outlier or a physical window outside the "
+        "scan, and N/A means arrival metadata is unavailable."
+    )
+    robustness_graph_note = (
+        "<strong>Robustness graph.</strong> The blue curve is raw f(τ), the purple "
+        "curve is jitter-averaged f_robust(τ), the yellow diamond is τ*, and the "
+        "green circle is the reported robust delay. The green band is the contiguous "
+        "+0.3 dB basin; the dashed red line is the arrival-derived physical delay "
+        "when available. Lower curves and a broad, shallow basin are preferable. "
+        "Several similarly deep valleys indicate competing alignment solutions. "
+        "Hover the curves and markers for exact delay/objective values."
+    )
+    table_colour_note = (
+        "<strong>Table colors.</strong> Colored metric cells compare the rows shown "
+        "in this report: green with an inset outline is best and red is worst. "
+        "Fragility, Worst f, residual dip, excess GD, and Tail prefer lower values; "
+        "Score, Basin width, low-end power, and Relative SPL prefer higher values. "
+        "PASS/OK use fixed categorical scales so a table full of failures cannot "
+        "appear green; unavailable values remain grey. Click any heading to sort "
+        "ascending, then click it again for descending order."
+    )
     detail_sections = []
     for pair in pairs:
         key = pair_key(pair)
@@ -1567,7 +1650,7 @@ details {{ margin:22px 0; }} details pre {{ overflow:auto; color:var(--muted); }
     )}
   </div>
 </div>
-<p class="note">Score: higher is better, and 0 dB marks the highest numeric score. Arrival-delay outliers and non-physical raw optima are placed after eligible pairs without changing their displayed score. Click a heading to sort; score cells run green (best) to red (worst).</p>
+<p class="note">Score: higher is better, and 0 dB marks the highest numeric score. Arrival-delay outliers and non-physical raw optima are placed after eligible pairs without changing their displayed score. Click a heading to sort; colored metric cells run green (best) to red (worst), while unavailable values are grey.</p>
 <div class="table-controls">
   <button type="button" onclick="selectTopN(0)">Clear</button>
   <button type="button" onclick="selectTopN(3)">Top 3</button>
@@ -1581,6 +1664,11 @@ details {{ margin:22px 0; }} details pre {{ overflow:auto; color:var(--muted); }
 <p>{headroom_note}</p>
 <p>Low-end power weights the broad response through 100 Hz by the amplifier/excursion cost of producing pressure at each frequency (+12.04 dB per octave downward). Excess GD and tail remain diagnostics; they do not alter Score.</p>
 <p>{tail_note}</p>
+<p>{robustness_foundations_note}</p>
+<p>{robustness_columns_note}</p>
+<p>{robustness_status_note}</p>
+<p>{robustness_graph_note}</p>
+<p>{table_colour_note}</p>
 <p>Delay fragility is a disqualifier, not a certificate. A narrow basin proves the timing solution cannot survive the configured listener excursion. A wide basin only shows timing tolerance: it does not model how each sub’s magnitude response changes as the microphone moves through the modal pressure field. Validate a listening area with multi-position measurements.</p>
 {f'<p>{eq_notes}</p>' if eq_notes else ''}
 <p>CSD overlay (in each pair's excess-GD and decay charts): excess GD with common delay removed; a vertical line is frequency-independent delay.</p>

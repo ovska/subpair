@@ -1275,10 +1275,20 @@ class PipelineTests(unittest.TestCase):
             visible_eq_pairs = sorted(
                 result["pairs"], key=lambda row: row["eq_rank"]
             )[:3]
-            expected_colored_metrics = 6 * len(visible_eq_pairs)
+            # Six established score/response metrics plus the four numeric or
+            # categorical robustness metrics. Physical status is N/A in this
+            # fixture (no arrival metadata), so it deliberately stays grey.
+            expected_colored_metrics = 10 * len(visible_eq_pairs)
             self.assertTrue(
                 all(
                     table.count("background:hsla(") == expected_colored_metrics
+                    for table in ranking_tables(page)
+                )
+            )
+            self.assertTrue(
+                all(
+                    table.count('class="metric-cell is-empty"')
+                    == len(visible_eq_pairs)
                     for table in ranking_tables(page)
                 )
             )
@@ -1298,6 +1308,18 @@ class PipelineTests(unittest.TestCase):
             self.assertIn("Basin +0.3 (ms)", page)
             self.assertIn("Delay robustness (lower f is better)", page)
             self.assertIn("disqualifier, not a certificate", page)
+            self.assertIn("Delay-robustness basis.", page)
+            self.assertIn("Robustness columns.", page)
+            self.assertIn("Geometry and physical status.", page)
+            self.assertIn("Robustness graph.", page)
+            self.assertIn("Table colors.", page)
+            self.assertIn("green with an inset outline is best and red is worst", page)
+            self.assertIn(
+                'data-key="geometric_pass" data-type="number"', page
+            )
+            self.assertIn(
+                'data-key="physical_status" data-type="number"', page
+            )
             self.assertNotIn(">Rank</th>", page)
             self.assertIn("Fitted EQ filters", page)
             self.assertIn("Post-EQ excess GD", page)
