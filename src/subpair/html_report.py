@@ -758,6 +758,154 @@ def _decay_figure(
     return figure
 
 
+GATE_LABELS = {
+    "gate_a_redundancy": "A · redundancy residual",
+    "gate_b_ripple_correlation": "B · ripple correlation",
+    "gate_c_physical_percentile": "C · physical-delay percentile",
+    "basin_geometry": "Basin vs geometry",
+    "gate_d_cancellation_deficit": "D · cancellation deficit",
+    "gate_e_comb_signature": "E · comb signature",
+    "gate_f_residual_notches": "F · residual notches",
+    "gate_g_gain_asymmetry": "G · gain asymmetry",
+    "gate_h_band_edge_stability": "H · band-edge stability",
+    "gate_i_improvement_localization": "I · improvement localisation",
+}
+
+# What each gate is actually asking, in one sentence, so a fired reason can be
+# understood from the table without opening the spec.
+GATE_MEANINGS = {
+    "gate_a_redundancy": (
+        "How much of one position's response is just a delayed, rescaled copy "
+        "of the other. A low residual means the two are near-duplicates, so "
+        "pairing them buys nothing."
+    ),
+    "gate_b_ripple_correlation": (
+        "Whether the two positions' peaks and dips fall at the same "
+        "frequencies. Positive correlation means they reinforce the same room "
+        "errors instead of filling each other's."
+    ),
+    "gate_c_physical_percentile": (
+        "How well the pair does at its measured arrival alignment, ranked "
+        "within its own delay landscape. A poor rank means the benefit rests "
+        "on a delay far from where the geometry puts it."
+    ),
+    "basin_geometry": (
+        "How many dB the pair loses when the listener moves, evaluated at the "
+        "recommended delay. A large excursion penalty means razor-edge tuning."
+    ),
+    "gate_d_cancellation_deficit": (
+        "Coherent sum level minus the matching incoherent power sum. Negative "
+        "means the two subs are partly cancelling rather than adding."
+    ),
+    "gate_e_comb_signature": (
+        "Periodic ripple spaced at 1/delay -- the fingerprint of a plain time "
+        "offset rather than genuine modal complementarity."
+    ),
+    "gate_f_residual_notches": (
+        "Deep, narrow nulls left in the summed response, too sharp to EQ and "
+        "too deep to ignore."
+    ),
+    "gate_g_gain_asymmetry": (
+        "How far apart the two subs' drive levels have to be. A large offset "
+        "wastes one sub's headroom."
+    ),
+    "gate_h_band_edge_stability": (
+        "How much this pair's score moves when the evaluation band shifts "
+        "+/-1/6 octave, measured against how much every other pair moves."
+    ),
+    "gate_i_improvement_localization": (
+        "What share of the pair's gain over its physical alignment comes from "
+        "a single 1/6-octave region, once that gain is large enough to judge."
+    ),
+}
+
+
+def _gate_evidence(gate_key: str, gate: dict[str, Any]) -> str:
+    """The measured figure and the limit it was compared against."""
+
+    def number(key: str, digits: int = 3) -> str | None:
+        value = gate.get(key)
+        return None if value is None else f"{float(value):.{digits}f}"
+
+    pairs = {
+        "gate_a_redundancy": ("residual", "reject_below", "residual %s (reject below %s)"),
+        "gate_b_ripple_correlation": (
+            "correlation",
+            "reject_above",
+            "correlation %s (reject above %s)",
+        ),
+        "gate_c_physical_percentile": (
+            "percentile",
+            "reject_above_percentile",
+            "percentile %s (reject above %s)",
+        ),
+        "basin_geometry": (
+            "excursion_penalty_db",
+            "tolerance_db",
+            "excursion penalty %s dB (tolerance %s dB)",
+        ),
+        "gate_d_cancellation_deficit": (
+            "worst_deficit_db",
+            "caution_below_db",
+            "worst deficit %s dB (caution below %s dB)",
+        ),
+        "gate_e_comb_signature": (
+            "comb_index",
+            "caution_at_or_above",
+            "comb index %s (caution at %s)",
+        ),
+        "gate_g_gain_asymmetry": (
+            "gain_offset_db",
+            "caution_above_db",
+            "offset %s dB (caution above %s dB)",
+        ),
+        "gate_h_band_edge_stability": (
+            "excess_spread_db",
+            "reject_above_excess_db",
+            "excess spread %s dB (reject above %s dB)",
+        ),
+        "gate_i_improvement_localization": (
+            "fraction",
+            "reject_above_fraction",
+            "concentration %s (reject above %s)",
+        ),
+    }
+    if gate_key == "gate_f_residual_notches":
+        worst = gate.get("worst") or {}
+        if not worst:
+            return "no notch deeper than the limit"
+        return (
+            f"worst {float(worst['depth_db']):.1f} dB at "
+            f"{float(worst['frequency_hz']):.1f} Hz, "
+            f"{float(worst['width_octaves']):.3f} octave wide"
+        )
+    entry = pairs.get(gate_key)
+    if entry is None:
+        return ""
+    measured_key, limit_key, template = entry
+    measured, limit = number(measured_key), number(limit_key)
+    if measured is None:
+        return str(gate.get("detail") or "not evaluated")
+    return template % (measured, limit if limit is not None else "—")
+
+
+def _gate_tooltip(gate_key: str, gate: dict[str, Any], include_status: bool) -> str:
+    """Plain-language explanation of one gate, for a title attribute."""
+
+    status = str(gate.get("status", "not_run")).upper()
+    head = GATE_LABELS.get(gate_key, gate_key)
+    if include_status:
+        head = f"{head} — {status}"
+    parts = [head, GATE_MEANINGS.get(gate_key, "")]
+    evidence = _gate_evidence(gate_key, gate)
+    if evidence:
+        parts.append(f"Measured: {evidence}.")
+    detail = gate.get("detail")
+    if detail and gate_key != "gate_f_residual_notches":
+        parts.append(str(detail))
+    return "\n".join(part for part in parts if part)
+
+
 def _gate_value_html(value: Any) -> str:
     """One measured gate value, formatted for reading rather than for parsing.
 
@@ -909,17 +1057,10 @@ def _ranking_table(
     }
 
     verdict_rank = {"accept": 0.0, "caution": 1.0, "reject": 2.0}
+    # Short forms for the narrow column; GATE_LABELS carries the full names the
+    # tooltip and the per-pair sheet use.
     gate_labels = {
-        "gate_a_redundancy": "A",
-        "gate_b_ripple_correlation": "B",
-        "gate_c_physical_percentile": "C",
-        "basin_geometry": "Basin",
-        "gate_d_cancellation_deficit": "D",
-        "gate_e_comb_signature": "E",
-        "gate_f_residual_notches": "F",
-        "gate_g_gain_asymmetry": "G",
-        "gate_h_band_edge_stability": "H",
-        "gate_i_improvement_localization": "I",
+        key: label.split(" · ")[0] for key, label in GATE_LABELS.items()
     }
 
     def physical_status(pair: dict[str, Any]) -> tuple[str, str, float | None]:
@@ -1006,6 +1147,17 @@ def _ranking_table(
         tail_value, tail_unit = tail_display[id(pair)]
         physical_text, physical_sort_value, _ = physical_status(pair)
         verdict = str(pair.get("verdict", "reject"))
+        reason_tooltip = "\n\n".join(
+            _gate_tooltip(
+                str(reason.get("gate")),
+                pair.get("gates", {}).get(str(reason.get("gate")), {}),
+                include_status=True,
+            )
+            for reason in pair.get("reasons", [])
+        ) or (
+            "Every evaluated gate passed. A clean sheet is not validation: these "
+            "are single-position disqualifiers only."
+        )
         reason_text = ", ".join(
             f"{gate_labels.get(str(reason.get('gate')), str(reason.get('gate')))} "
             f"{str(reason.get('status', '')).upper()}"
@@ -1088,9 +1240,15 @@ def _ranking_table(
             style = score_style(key, numeric_value) if is_metric else ""
             empty_class = " is-empty" if is_metric and numeric_value is None else ""
             style_attribute = f' style="{style}"' if style else ""
+            title_attribute = (
+                f' title="{html.escape(reason_tooltip)}"'
+                if key == "gate_reasons"
+                else ""
+            )
             cells.append(
                 f'<td class="metric-cell{empty_class}" '
-                f'data-value="{html.escape(values[key][1])}"{style_attribute}>'
+                f'data-value="{html.escape(values[key][1])}"'
+                f'{style_attribute}{title_attribute}>'
                 f'{html.escape(values[key][0])}</td>'
             )
         if pair.get("optimized", True):
@@ -1710,21 +1868,10 @@ def build_report(
             f"{pair['n_competing']} competing minima · "
             f"physical tau {physical_text} · geometric excursion "
             f"{robustness['delta_tau_max_ms']:.2f} ms ({geometry_text}) · "
-            f"basin {'PASS' if pair['geometric_pass'] else 'FAIL'}{physical_warning}"
+            f"basin {'PASS' if pair['geometric_pass'] else 'FAIL'}"
         )
         gate_rows = []
-        gate_names = {
-            "gate_a_redundancy": "A · redundancy residual",
-            "gate_b_ripple_correlation": "B · ripple correlation",
-            "gate_c_physical_percentile": "C · physical-delay percentile",
-            "basin_geometry": "Basin vs geometry",
-            "gate_d_cancellation_deficit": "D · cancellation deficit",
-            "gate_e_comb_signature": "E · comb signature",
-            "gate_f_residual_notches": "F · residual notches",
-            "gate_g_gain_asymmetry": "G · gain asymmetry",
-            "gate_h_band_edge_stability": "H · band-edge stability",
-            "gate_i_improvement_localization": "I · improvement localisation",
-        }
+        gate_names = GATE_LABELS
         for gate_key, gate_name in gate_names.items():
             gate = pair["gates"][gate_key]
             measured = {
@@ -1737,9 +1884,12 @@ def build_report(
                 f"<dt>{html.escape(str(name))}</dt><dd>{_gate_value_html(value)}</dd>"
                 for name, value in sorted(measured.items())
             )
+            tooltip = html.escape(_gate_tooltip(gate_key, gate, include_status=False))
             gate_rows.append(
-                f'<li class="gate-{html.escape(status)}"><strong>{html.escape(gate_name)}: '
+                f'<li class="gate-{html.escape(status)}" title="{tooltip}">'
+                f'<strong>{html.escape(gate_name)}: '
                 f'{html.escape(status.upper())}</strong>'
+                f'<p class="gate-meaning">{html.escape(GATE_MEANINGS.get(gate_key, ""))}</p>'
                 + (f"<dl>{terms}</dl>" if terms else "")
                 + "</li>"
             )
@@ -1806,8 +1956,15 @@ def build_report(
                 {html.escape(pair['first_name'])} + {html.escape(pair['second_name'])}</h2>
               <p class="configuration">Sub 2: {'normal' if pair['polarity'] > 0 else 'inverted'},
                 robust delay {pair['delay_ms']:+.3f} ms, gain {pair['gain_db']:+.2f} dB,
-                headroom {pair['post_eq_headroom_db' if not raw else 'headroom_db']:+.2f} dB<br>
-                {metric_summary}<br>{robustness_summary}</p>
+                headroom {pair['post_eq_headroom_db' if not raw else 'headroom_db']:+.2f} dB{
+                  f'<br>{physical_warning.strip()}' if physical_warning else ''
+                }</p>
+              <details class="measured-card">
+                <summary><strong>Measured values</strong> — score components, delay
+                  robustness and physical timing</summary>
+                <p class="configuration">{metric_summary}</p>
+                <p class="configuration">{robustness_summary}</p>
+              </details>
               {gate_sheet_html}
               {_plot_html(
                   _magnitude_figure(pair, data, raw=raw, y_range=magnitude_range, room_modes=room_modes),
@@ -1991,6 +2148,11 @@ th:hover {{ background:#1b2d48; }} tbody tr:hover {{ background:#132238; }}
 .peq button {{ position:absolute; right:14px; top:14px; border:1px solid #49607e; border-radius:6px; padding:6px 11px; color:var(--text); background:#1c2d47; cursor:pointer; }}
 .gate-sheet {{ margin:16px 0; padding:16px; background:#091322; border-radius:9px; }}
 .gate-sheet > summary {{ cursor:pointer; font-size:1.05rem; }}
+.measured-card {{ margin:12px 0; padding:12px 16px; background:#091322; border-radius:9px; }}
+.measured-card > summary {{ cursor:pointer; }}
+.measured-card p {{ margin:10px 0 0; font-size:.9rem; }}
+.gate-meaning {{ margin:6px 0 0; color:var(--muted); font-size:.86rem; }}
+.metric-cell[title] {{ cursor:help; }}
 .gate-sheet ul {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:8px; padding:0; list-style:none; }}
 .gate-sheet li {{ padding:10px; border:1px solid var(--line); border-left-width:4px; border-radius:7px; overflow-wrap:anywhere; }}
 .gate-sheet li span {{ color:var(--muted); font-size:.86rem; }}
