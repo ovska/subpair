@@ -856,6 +856,7 @@ def _resolve_arrival_delays(
                     "room diagonal allows. Physical timing is discarded for its pairs."
                 )
     diagnostics = {
+        "warnings": list(warnings),
         "onset_band_hz": list(onset_band),
         "onset_threshold_db": ARRIVAL_ONSET_THRESHOLD_DB,
         "median_peak_minus_onset_ms": median_lag,
@@ -1254,7 +1255,7 @@ def _preoptimization_gates(
             "objective_gap_db": physical_objective - float(np.min(objective)),
             "reject_above_percentile": thresholds.physical_percentile_reject,
             "baseline": "best polarity, equal gain",
-            "baseline_polarity_at_physical": int(
+            "baseline_polarity": int(
                 baseline_polarity[int(np.argmin(np.abs(delays - physical_tau_ms)))]
             ),
         }

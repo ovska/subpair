@@ -5,6 +5,7 @@ from __future__ import annotations
 import html
 import json
 import math
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -755,6 +756,36 @@ def _decay_figure(
         margin={"l": 66, "r": 70, "t": 72, "b": 82},
     )
     return figure
+
+
+def _gate_value_html(value: Any) -> str:
+    """One measured gate value, formatted for reading rather than for parsing.
+
+    Gate blocks mix scalars, nested dicts (Gate H's three band-shift scores,
+    Gate F's worst notch) and nulls, so a single JSON blob per gate is dense
+    and hard to scan. Keys stay exactly as they appear in the result JSON so a
+    figure in the report can be looked up there without translation.
+    """
+
+    if value is None:
+        return "—"
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return html.escape(str(value))
+        text = f"{value:.4f}".rstrip("0").rstrip(".")
+        return html.escape(text if text not in {"", "-"} else "0")
+    if isinstance(value, int):
+        return html.escape(str(value))
+    if isinstance(value, dict):
+        return " · ".join(
+            f"{html.escape(str(name))} {_gate_value_html(entry)}"
+            for name, entry in sorted(value.items())
+        )
+    if isinstance(value, (list, tuple)):
+        return " · ".join(_gate_value_html(entry) for entry in value)
+    return html.escape(str(value))
 
 
 def _peq_text(
@@ -1701,20 +1732,33 @@ def build_report(
                 for key, value in gate.items()
                 if key not in {"status", "stage", "offenders"}
             }
-            measured_text = html.escape(
-                json.dumps(measured, sort_keys=True, separators=(", ", ": "))
-            )
             status = str(gate.get("status", "not_run"))
+            terms = "".join(
+                f"<dt>{html.escape(str(name))}</dt><dd>{_gate_value_html(value)}</dd>"
+                for name, value in sorted(measured.items())
+            )
             gate_rows.append(
                 f'<li class="gate-{html.escape(status)}"><strong>{html.escape(gate_name)}: '
-                f'{html.escape(status.upper())}</strong><br><span>{measured_text}</span></li>'
+                f'{html.escape(status.upper())}</strong>'
+                + (f"<dl>{terms}</dl>" if terms else "")
+                + "</li>"
             )
+        counts = Counter(
+            str(pair["gates"][key].get("status", "not_run")) for key in gate_names
+        )
+        tally = " · ".join(
+            f"{counts[name]} {name}"
+            for name in ("reject", "caution", "pass", "not_run")
+            if counts[name]
+        )
         gate_sheet_html = (
-            f'<div class="gate-sheet"><h3>Verdict: {html.escape(pair["verdict"].upper())}</h3>'
+            '<details class="gate-sheet"><summary><strong>Verdict: '
+            f'{html.escape(pair["verdict"].upper())}</strong> — {html.escape(tally)}'
+            "</summary>"
             '<p class="note">A clean sheet is not validation; these are single-position '
             'disqualifiers only.</p><ul>'
             + "".join(gate_rows)
-            + "</ul></div>"
+            + "</ul></details>"
         )
         peq_html = ""
         if not raw:
@@ -1765,7 +1809,6 @@ def build_report(
                 headroom {pair['post_eq_headroom_db' if not raw else 'headroom_db']:+.2f} dB<br>
                 {metric_summary}<br>{robustness_summary}</p>
               {gate_sheet_html}
-              {_plot_html(_robustness_figure(pair), f'robustness-{key}')}
               {_plot_html(
                   _magnitude_figure(pair, data, raw=raw, y_range=magnitude_range, room_modes=room_modes),
                   f'magnitude-{key}',
@@ -1775,6 +1818,7 @@ def build_report(
                   f'decay-{key}',
                   static=not room_modes,
               )}
+              {_plot_html(_robustness_figure(pair), f'robustness-{key}')}
               {_plot_html(
                   _excess_figure(data, raw=raw, y_range=excess_range, room_modes=room_modes),
                   f'excess-{key}',
@@ -1856,9 +1900,17 @@ function copyPeq(button) {
             for row in timing_rows
         )
         band_hz = timing.get("onset_band_hz") or [0.0, 0.0]
+        timing_warning_html = "".join(
+            f'<p class="warning"><strong>Warning:</strong> {html.escape(str(text))}</p>'
+            for text in timing.get("warnings", [])
+        )
+        repaired_count = sum(1 for row in timing_rows if row.get("repaired"))
         timing_section = f"""
-        <details class="card timing-card"{' open' if repaired_any else ''}>
-        <summary><strong>Arrival timing</strong> — {'repairs applied' if repaired_any else 'all peaks consistent'}</summary>
+        <details class="card timing-card">
+        <summary><strong>Arrival timing</strong> — {
+            f'{repaired_count} repaired' if repaired_any else 'all peaks consistent'
+        }</summary>
+        {timing_warning_html}
         <p class="note">REW reports arrival delay as the position of the largest sample in the
         impulse response. Across a subwoofer's two or three octaves that impulse is a slow
         oscillatory blob, so wherever a room mode rings hard a later half-cycle can outgrow the
@@ -1884,9 +1936,13 @@ function copyPeq(button) {
         timing_section = ""
 
     settings_json = html.escape(json.dumps(settings, sort_keys=True, indent=2))
+    # Arrival warnings are rendered inside the Arrival timing card next to the
+    # table that explains them, so they are not repeated at the top of the page.
+    timing_warnings = set(timing.get("warnings", []))
     warning_html = "".join(
         f'<p class="warning"><strong>Warning:</strong> {html.escape(str(warning))}</p>'
         for warning in results.get("warnings", [])
+        if warning not in timing_warnings
     )
     document = f"""<!doctype html>
 <html lang="en">
@@ -1934,10 +1990,13 @@ th:hover {{ background:#1b2d48; }} tbody tr:hover {{ background:#132238; }}
 .peq h3 {{ margin:0 0 10px; }} .peq pre {{ margin:0; white-space:pre-wrap; color:#a7f3d0; }}
 .peq button {{ position:absolute; right:14px; top:14px; border:1px solid #49607e; border-radius:6px; padding:6px 11px; color:var(--text); background:#1c2d47; cursor:pointer; }}
 .gate-sheet {{ margin:16px 0; padding:16px; background:#091322; border-radius:9px; }}
-.gate-sheet h3 {{ margin:0; }}
+.gate-sheet > summary {{ cursor:pointer; font-size:1.05rem; }}
 .gate-sheet ul {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:8px; padding:0; list-style:none; }}
 .gate-sheet li {{ padding:10px; border:1px solid var(--line); border-left-width:4px; border-radius:7px; overflow-wrap:anywhere; }}
 .gate-sheet li span {{ color:var(--muted); font-size:.86rem; }}
+.gate-sheet dl {{ display:grid; grid-template-columns:auto 1fr; gap:2px 10px; margin:8px 0 0; font-size:.86rem; }}
+.gate-sheet dt {{ color:var(--muted); font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }}
+.gate-sheet dd {{ margin:0; font-variant-numeric:tabular-nums; }}
 .gate-pass {{ border-left-color:#22c55e !important; }}
 .gate-caution {{ border-left-color:#f59e0b !important; }}
 .gate-reject {{ border-left-color:#ef4444 !important; }}
