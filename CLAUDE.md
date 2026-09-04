@@ -128,9 +128,13 @@ the real logic. Data flows strictly one-way through `.subpair-cache/`:
    but skip the expensive optimiser. Surviving pairs exhaustively grid-search
    polarity × delay × gain (vectorised NumPy) to form the bounded
    high-score/low-dip shortlist, run the expensive per-finalist diagnostics
-   (`dsp.pair_diagnostics`), then apply the scaled-basin and D–I post-search
-   disqualifiers. Verdict sorts before score and every configured threshold is
-   serialized under `settings.gates`. Writes `search-results.json`
+   (`dsp.pair_diagnostics`), then apply the excursion-penalty basin and D–I
+   post-search disqualifiers. Gate H is decided in a second pass over every
+   scored pair, since it thresholds each pair's band-shift spread against the
+   population median rather than an absolute value. Gates C, D and I reference
+   the physical alignment at whichever polarity is better there, never a
+   hardcoded normal polarity. Verdict sorts before score and every configured
+   threshold is serialized under `settings.gates`. Writes `search-results.json`
    (`format_version` is bumped whenever the result schema changes — keep
    `verification.py`/`html_report.py` in sync with it). When
    `SearchOptions.modal` is set, also computes `modal.estimate_room_poles`

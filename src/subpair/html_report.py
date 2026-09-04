@@ -409,12 +409,12 @@ def _robustness_figure(pair: dict[str, Any]) -> go.Figure:
     robust = np.asarray(robustness["robust_objective_db"], dtype=np.float64)
     star_index = int(np.argmin(np.abs(tau - float(robustness["tau_star_ms"]))))
     robust_index = int(np.argmin(np.abs(tau - float(robustness["tau_robust_ms"]))))
-    basin_delta_db = float(robustness.get("basin_threshold_db", 0.3))
-    threshold = objective[star_index] + basin_delta_db
-    left = star_index
+    basin_delta_db = float(robustness.get("basin_tolerance_db", 0.5))
+    threshold = objective[robust_index] + basin_delta_db
+    left = robust_index
     while left > 0 and objective[left - 1] <= threshold:
         left -= 1
-    right = star_index
+    right = robust_index
     while right + 1 < tau.size and objective[right + 1] <= threshold:
         right += 1
 
@@ -826,10 +826,10 @@ def _ranking_table(
         ("comb_index", "E comb", "number"),
         ("notch_count", "F notches", "number"),
         ("gain_asymmetry_db", "G gain (dB)", "number"),
-        ("band_edge_spread_db", "H edge (dB)", "number"),
+        ("band_edge_excess_spread_db", "H edge excess (dB)", "number"),
         ("localization_pct", "I local (%)", "number"),
         ("fragility", "Fragility (dB)", "number"),
-        ("basin_scaled", "Basin adaptive (ms)", "number"),
+        ("excursion_penalty_db", "Excursion penalty (dB)", "number"),
         ("basin_w03", "Basin +0.3 (ms)", "number"),
         ("worst_case_1", "Worst f +/-1 ms (dB)", "number"),
         ("geometric_pass", "Basin vs geometry", "number"),
@@ -862,10 +862,10 @@ def _ranking_table(
         "comb_index": "low",
         "notch_count": "low",
         "gain_asymmetry_db": "low",
-        "band_edge_spread_db": "low",
+        "band_edge_excess_spread_db": "low",
         "localization_pct": "low",
         "fragility": "low",
-        "basin_scaled": "high",
+        "excursion_penalty_db": "low",
         "basin_w03": "high",
         "worst_case_1": "low",
         "geometric_pass": "high",
@@ -1012,10 +1012,12 @@ def _ranking_table(
             "comb_index": number_value("comb_index", ".3f"),
             "notch_count": number_value("notch_count", ".0f"),
             "gain_asymmetry_db": number_value("gain_asymmetry_db", ".2f"),
-            "band_edge_spread_db": number_value("band_edge_spread_db", ".2f"),
+            "band_edge_excess_spread_db": number_value(
+                "band_edge_excess_spread_db", ".2f"
+            ),
             "localization_pct": number_value("localization_pct", ".1f", suffix="%"),
             "fragility": number_value("fragility", ".2f"),
-            "basin_scaled": number_value("basin_scaled", ".2f"),
+            "excursion_penalty_db": number_value("excursion_penalty_db", ".2f"),
             "basin_w03": number_value("basin_w03", ".2f"),
             "worst_case_1": number_value("worst_case_1", ".2f"),
             "geometric_pass": (
@@ -1277,8 +1279,10 @@ def build_report(
         "post_eq_relative_low_end_power_db",
         "robustness",
         "fragility",
-        "basin_scaled",
-        "basin_threshold_db",
+        "basin_tolerance_db",
+        "basin_tolerance_ms",
+        "excursion_half_width_ms",
+        "excursion_penalty_db",
         "basin_w03",
         "worst_case",
         "geometric_pass",
@@ -1481,11 +1485,14 @@ def build_report(
         "optimum; lower is better. <strong>Basin +0.3</strong> is the width of the "
         "single contiguous delay interval containing τ* whose raw f stays within "
         "+0.3 dB of its minimum; disconnected good regions do not count, and wider "
-        "is better. <strong>Basin adaptive</strong> uses a degradation equal to "
-        f"{100.0 * float(gate_thresholds.get('basin_range_fraction', 0.05)):g}% "
-        "of that pair’s raw-f range inside its physical-delay window; this scaled "
-        "width drives the geometry gate while the fixed +0.3/+0.5 dB fields remain "
-        "unchanged for comparison. <strong>Worst f ±1 ms</strong> is the largest raw f encountered "
+        "is better. <strong>Excursion penalty</strong> is the largest raw-f "
+        "degradation over ±Δτ_max/2 around the <em>recommended</em> delay, and it "
+        "drives the geometry gate: reject above "
+        f"{float(gate_thresholds.get('basin_tolerance_db', 0.5)):g} dB. It is an "
+        "absolute dB figure on purpose — a tolerance scaled to each pair’s own "
+        "objective range normalises away the delay-insensitivity the gate is "
+        "testing for, and can fail a pair whose score barely moves with delay at "
+        "all. <strong>Worst f ±1 ms</strong> is the largest raw f encountered "
         "from τ* − 1 ms through τ* + 1 ms, including interpolated interval edges; "
         "lower is better. Competing minima, shown in each pair summary, counts "
         "distinct local minima within +0.3 dB of the best raw minimum."
@@ -1576,13 +1583,20 @@ def build_report(
         "report records boundary/headroom information, while actual hardware limits "
         "remain unknown without amplifier/driver data. <strong>H — band-edge "
         "stability.</strong> Shifts the whole scoring window down and up by 1/6 octave "
-        "and rejects a score spread above "
-        f"{float(gate_thresholds.get('band_edge_spread_reject_db', 2.0)):g} dB. "
+        "and rejects when this pair’s score spread exceeds the median spread across "
+        "every scored pair by more than "
+        f"{float(gate_thresholds.get('band_edge_excess_spread_reject_db', 1.0)):g} dB. "
+        "The raw spread is nearly identical for every pair — the subs roll off below "
+        "the band and low-end power weights f⁻⁴, so an up-shifted band always scores "
+        "higher — and that common-mode term belongs to the score, not to any pair. "
         "<strong>I — improvement localisation.</strong> Compares detrended ripple "
-        "against the physical-alignment response and reports the largest share of "
-        "all positive improvement concentrated in a sliding 1/6-octave region, "
-        "alongside the total score change; reject above "
-        f"{100.0 * float(gate_thresholds.get('localization_fraction_reject', 0.5)):g}%."
+        "against the physical-alignment response (equal gain, better polarity) and "
+        "reports the largest share of all positive improvement concentrated in a "
+        "sliding 1/6-octave region, alongside the total score change; reject above "
+        f"{100.0 * float(gate_thresholds.get('localization_fraction_reject', 0.5)):g}%, "
+        "but only once the mean improvement reaches "
+        f"{float(gate_thresholds.get('localization_min_mean_improvement_db', 0.25)):g} dB "
+        "per bin — below that the share is a ratio of two noise-level sums."
     )
     detail_sections = []
     for pair in optimized_pairs:
@@ -1638,7 +1652,9 @@ def build_report(
             else "configured coordinates"
         )
         if robustness.get("measurement_delay_outlier"):
-            physical_warning = " <strong>INVALID: ARRIVAL-DELAY OUTLIER</strong>"
+            physical_warning = (
+                " <strong>ARRIVAL-DELAY OUTLIER: PHYSICAL TIMING DISCARDED</strong>"
+            )
         elif not robustness.get("physical_window_in_scan", True):
             physical_warning = " <strong>INVALID: PHYSICAL WINDOW OUTSIDE SCAN</strong>"
         elif pair.get("non_physical_solution"):
@@ -1650,8 +1666,10 @@ def build_report(
             f"f(tau*) {pair['f_tau_star']:.2f} dB · "
             f"f_robust(tau_robust) {pair['f_robust_tau_robust']:.2f} dB · "
             f"fragility {pair['fragility']:.2f} dB · +0.3 dB basin {pair['basin_w03']:.2f} ms · "
-            f"adaptive +{pair['basin_threshold_db']:.2f} dB basin "
-            f"{pair['basin_scaled']:.2f} ms · "
+            f"+{pair['basin_tolerance_db']:.2f} dB basin at the recommended delay "
+            f"{pair['basin_tolerance_ms']:.2f} ms · "
+            f"excursion penalty (+/-{pair['excursion_half_width_ms']:.2f} ms) "
+            f"{pair['excursion_penalty_db']:.2f} dB · "
             f"worst f (+/-1 ms) {pair['worst_case']['1.0']:.2f} dB · "
             f"{pair['n_competing']} competing minima · "
             f"physical tau {physical_text} · geometric excursion "

@@ -375,9 +375,10 @@ def _add_gate_arguments(subparser: argparse.ArgumentParser) -> None:
         ("--gate-notch-depth", "gate_notch_depth", defaults.notch_depth_reject_db),
         ("--gate-notch-width", "gate_notch_width", defaults.notch_max_width_octaves),
         ("--gate-gain-asymmetry", "gate_gain_asymmetry", defaults.gain_asymmetry_caution_db),
-        ("--gate-band-edge-spread", "gate_band_edge_spread", defaults.band_edge_spread_reject_db),
+        ("--gate-band-edge-excess-spread", "gate_band_edge_excess_spread", defaults.band_edge_excess_spread_reject_db),
         ("--gate-localization-fraction", "gate_localization_fraction", defaults.localization_fraction_reject),
-        ("--gate-basin-range-fraction", "gate_basin_range_fraction", defaults.basin_range_fraction),
+        ("--gate-localization-min-improvement", "gate_localization_min_improvement", defaults.localization_min_mean_improvement_db),
+        ("--gate-basin-tolerance", "gate_basin_tolerance", defaults.basin_tolerance_db),
     )
     for flag, destination, default in specifications:
         group.add_argument(
@@ -581,9 +582,10 @@ def _search(args: argparse.Namespace) -> int:
             notch_depth_reject_db=args.gate_notch_depth,
             notch_max_width_octaves=args.gate_notch_width,
             gain_asymmetry_caution_db=args.gate_gain_asymmetry,
-            band_edge_spread_reject_db=args.gate_band_edge_spread,
+            band_edge_excess_spread_reject_db=args.gate_band_edge_excess_spread,
             localization_fraction_reject=args.gate_localization_fraction,
-            basin_range_fraction=args.gate_basin_range_fraction,
+            localization_min_mean_improvement_db=args.gate_localization_min_improvement,
+            basin_tolerance_db=args.gate_basin_tolerance,
         ),
     )
 

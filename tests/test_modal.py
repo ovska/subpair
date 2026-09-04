@@ -76,9 +76,10 @@ def _permissive_gates() -> GateThresholds:
         comb_index_caution=1.0,
         notch_depth_reject_db=300.0,
         gain_asymmetry_caution_db=100.0,
-        band_edge_spread_reject_db=300.0,
+        band_edge_excess_spread_reject_db=300.0,
         localization_fraction_reject=1.0,
-        basin_range_fraction=1.0,
+        localization_min_mean_improvement_db=0.0,
+        basin_tolerance_db=300.0,
     )
 
 
@@ -603,7 +604,7 @@ class EngineIntegrationTests(unittest.TestCase):
                     gate_thresholds=_permissive_gates(),
                 ),
             )
-            self.assertEqual(result["format_version"], 25)
+            self.assertEqual(result["format_version"], 26)
             signature = result["modal_signature"]
             self.assertIsNotNone(signature)
             self.assertTrue(signature["valid"])
