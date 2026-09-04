@@ -6,11 +6,12 @@ import itertools
 import math
 import os
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
+from scipy import ndimage
 
 from .api import RewClient
 from .cache import load_cache, write_json
@@ -40,6 +41,60 @@ from .modal import ModalOptions, RoomModalSignature
 
 
 @dataclass(frozen=True)
+class GateThresholds:
+    """All disqualifier thresholds, serialized verbatim with every search."""
+
+    redundancy_reject: float = 0.50
+    redundancy_caution: float = 0.60
+    ripple_correlation_reject: float = 0.30
+    ripple_complementary: float = -0.10
+    physical_percentile_reject: float = 75.0
+    cancellation_deficit_reject_db: float = -3.0
+    cancellation_deficit_caution_db: float = -1.0
+    comb_index_reject: float = 0.65
+    comb_index_caution: float = 0.40
+    notch_depth_reject_db: float = 8.0
+    notch_max_width_octaves: float = 1.0 / 6.0
+    gain_asymmetry_caution_db: float = 4.0
+    band_edge_spread_reject_db: float = 2.0
+    localization_fraction_reject: float = 0.50
+    basin_range_fraction: float = 0.05
+
+    def __post_init__(self) -> None:
+        values = asdict(self)
+        if not all(math.isfinite(float(value)) for value in values.values()):
+            raise ValueError("Gate thresholds must be finite")
+        if not 0.0 <= self.redundancy_reject <= self.redundancy_caution <= 1.0:
+            raise ValueError(
+                "Redundancy thresholds must satisfy 0 <= reject <= caution <= 1"
+            )
+        if not -1.0 <= self.ripple_correlation_reject <= 1.0:
+            raise ValueError("Ripple-correlation reject threshold must be between -1 and 1")
+        if not -1.0 <= self.ripple_complementary <= self.ripple_correlation_reject:
+            raise ValueError(
+                "Ripple complementary threshold must not exceed the reject threshold"
+            )
+        if not 0.0 <= self.physical_percentile_reject <= 100.0:
+            raise ValueError("Physical percentile threshold must be between 0 and 100")
+        if self.cancellation_deficit_reject_db > self.cancellation_deficit_caution_db:
+            raise ValueError("Cancellation reject threshold must not exceed caution")
+        if not 0.0 <= self.comb_index_caution <= self.comb_index_reject <= 1.0:
+            raise ValueError(
+                "Comb thresholds must satisfy 0 <= caution <= reject <= 1"
+            )
+        if self.notch_depth_reject_db <= 0.0 or self.notch_max_width_octaves <= 0.0:
+            raise ValueError("Notch depth and width thresholds must be positive")
+        if self.gain_asymmetry_caution_db < 0.0:
+            raise ValueError("Gain-asymmetry threshold must be non-negative")
+        if self.band_edge_spread_reject_db < 0.0:
+            raise ValueError("Band-edge spread threshold must be non-negative")
+        if not 0.0 <= self.localization_fraction_reject <= 1.0:
+            raise ValueError("Localization fraction threshold must be between 0 and 1")
+        if not 0.0 < self.basin_range_fraction <= 1.0:
+            raise ValueError("Basin range fraction must be in (0, 1]")
+
+
+@dataclass(frozen=True)
 class SearchOptions:
     band: tuple[float, float] = (25.0, 150.0)
     delay_range_ms: tuple[float, float, float] = (-10.0, 10.0, 0.05)
@@ -62,6 +117,7 @@ class SearchOptions:
     listener_movement_m: float = 0.25
     speed_of_sound_m_per_s: float = 343.0
     physical_delay_window_ms: float = 1.5
+    gate_thresholds: GateThresholds = field(default_factory=GateThresholds)
 
     def __post_init__(self) -> None:
         if self.modal_tiebreak and not self.modal:
@@ -198,6 +254,414 @@ def _local_minima_indices(values: np.ndarray) -> np.ndarray:
     return np.asarray(indices, dtype=int)
 
 
+def _score_wide_spectrum(
+    context: AnalysisContext,
+    spectrum: np.ndarray,
+    score_low_end_weight: float,
+    score_dip_weight: float,
+    band: tuple[float, float] | None = None,
+) -> np.ndarray | float:
+    """Apply the normal usable-output score to a margin-extended spectrum."""
+
+    low_hz, high_hz = band or context.band
+    indices = np.flatnonzero(
+        (context.trend_frequencies >= low_hz)
+        & (context.trend_frequencies <= high_hz)
+    )
+    if indices.size < 2:
+        raise ValueError(f"Evaluation band {low_hz:g}..{high_hz:g} Hz is empty")
+    score_slice = slice(int(indices[0]), int(indices[-1]) + 1)
+    frequencies = context.trend_frequencies[score_slice]
+    values = np.asarray(spectrum, dtype=np.complex128)
+    magnitude_wide_db = db20(values)
+    trend_db = broad_trend_db(magnitude_wide_db, context.ppo)[..., score_slice]
+    spl_db = 10.0 * np.log10(
+        np.maximum(np.mean(np.abs(values[..., score_slice]) ** 2, axis=-1), EPS)
+    )
+    low_end_db = low_end_power_db(trend_db, frequencies)
+    dip_db = smoothed_dip_db(
+        magnitude_wide_db,
+        context.ppo,
+        score_slice=score_slice,
+    )
+    return usable_output_score_db(
+        spl_db,
+        low_end_db,
+        dip_db,
+        score_low_end_weight,
+        score_dip_weight,
+    )
+
+
+def _baseline_objective_curve(
+    context: AnalysisContext,
+    first: int,
+    second: int,
+    delays_ms: np.ndarray,
+    score_low_end_weight: float,
+    score_dip_weight: float,
+) -> np.ndarray:
+    """Normal-polarity, equal-gain delay landscape used by physical Gate C."""
+
+    phase = np.exp(
+        -2j
+        * np.pi
+        * np.asarray(delays_ms, dtype=np.float64)[:, None]
+        * context.trend_frequencies[None, :]
+        / 1000.0
+    )
+    sums = context.trend_spectra[first][None, :] + context.trend_spectra[
+        second
+    ][None, :] * phase
+    return -np.asarray(
+        _score_wide_spectrum(
+            context,
+            sums,
+            score_low_end_weight,
+            score_dip_weight,
+        ),
+        dtype=np.float64,
+    )
+
+
+def _redundancy_residual(
+    context: AnalysisContext,
+    first: int,
+    second: int,
+    delays_ms: np.ndarray,
+) -> tuple[float, float, complex]:
+    """Best complex scaled/delayed-copy residual over the scoring band."""
+
+    reference = context.spectra[first]
+    target = context.spectra[second]
+    denominator = float(np.vdot(reference, reference).real)
+    target_norm = float(np.linalg.norm(target))
+    if denominator <= EPS or target_norm <= EPS:
+        return 1.0, 0.0, 0.0j
+    best = (math.inf, 0.0, 0.0j)
+    for delay_ms in np.asarray(delays_ms, dtype=np.float64):
+        shifted = reference * np.exp(
+            -2j * np.pi * context.frequencies * delay_ms / 1000.0
+        )
+        scale = np.vdot(shifted, target) / denominator
+        residual = float(np.linalg.norm(target - scale * shifted) / target_norm)
+        candidate = (residual, float(delay_ms), complex(scale))
+        if candidate[:2] < best[:2]:
+            best = candidate
+    return best
+
+
+def _ripple_deviation_correlation(
+    context: AnalysisContext,
+    first: int,
+    second: int,
+) -> float:
+    """Correlation of each solo response after one-octave detrending."""
+
+    magnitude_db = db20(context.trend_spectra[[first, second]])
+    residual = (
+        magnitude_db - broad_trend_db(magnitude_db, context.ppo)
+    )[:, context.trend_slice]
+    centred = residual - np.mean(residual, axis=1, keepdims=True)
+    norms = np.linalg.norm(centred, axis=1)
+    if np.any(norms <= EPS):
+        return 0.0
+    return float(np.dot(centred[0], centred[1]) / (norms[0] * norms[1]))
+
+
+def _cancellation_deficit_db(
+    context: AnalysisContext,
+    first: int,
+    second: int,
+    polarity: int,
+    delay_ms: float,
+    gain_db: float,
+) -> float:
+    """Mean coherent level minus the matching incoherent power sum."""
+
+    second_spectrum = (
+        10.0 ** (gain_db / 20.0)
+        * context.spectra[second]
+        * np.exp(-2j * np.pi * context.frequencies * delay_ms / 1000.0)
+    )
+    coherent = context.spectra[first] + polarity * second_spectrum
+    incoherent_db = 10.0 * np.log10(
+        np.maximum(
+            np.abs(context.spectra[first]) ** 2 + np.abs(second_spectrum) ** 2,
+            EPS,
+        )
+    )
+    return float(np.mean(db20(coherent) - incoherent_db))
+
+
+def _detrended_ripple(
+    context: AnalysisContext,
+    spectrum_wide: np.ndarray,
+) -> np.ndarray:
+    magnitude_db = db20(np.asarray(spectrum_wide, dtype=np.complex128))
+    return (
+        magnitude_db - broad_trend_db(magnitude_db, context.ppo)
+    )[context.trend_slice]
+
+
+def _comb_signature(
+    context: AnalysisContext,
+    spectrum_wide: np.ndarray,
+    delay_ms: float,
+) -> dict[str, float | None]:
+    """Autocorrelation at the linear-frequency comb spacing and harmonics."""
+
+    absolute_delay_ms = abs(float(delay_ms))
+    band_span_hz = float(context.frequencies[-1] - context.frequencies[0])
+    if absolute_delay_ms <= 1e-9 or band_span_hz <= 0.0:
+        return {"index": 0.0, "lag_hz": None, "fundamental_hz": None}
+    fundamental_hz = 1000.0 / absolute_delay_ms
+    if fundamental_hz > band_span_hz:
+        return {
+            "index": 0.0,
+            "lag_hz": None,
+            "fundamental_hz": fundamental_hz,
+        }
+    count = max(256, context.frequencies.size * 2)
+    linear_frequencies = np.linspace(
+        context.frequencies[0], context.frequencies[-1], count
+    )
+    ripple = np.interp(
+        linear_frequencies,
+        context.frequencies,
+        _detrended_ripple(context, spectrum_wide),
+    )
+    ripple -= float(np.mean(ripple))
+    step_hz = float(linear_frequencies[1] - linear_frequencies[0])
+    best_index = 0.0
+    best_lag_hz: float | None = None
+    harmonic = 1
+    while harmonic * fundamental_hz <= band_span_hz:
+        target = harmonic * fundamental_hz
+        centre = int(round(target / step_hz))
+        for lag in range(max(1, centre - 1), min(count - 2, centre + 1) + 1):
+            left = ripple[:-lag]
+            right = ripple[lag:]
+            denominator = float(np.linalg.norm(left) * np.linalg.norm(right))
+            correlation = float(np.dot(left, right) / denominator) if denominator > EPS else 0.0
+            if correlation > best_index:
+                best_index = correlation
+                best_lag_hz = lag * step_hz
+        harmonic += 1
+    return {
+        "index": float(np.clip(best_index, 0.0, 1.0)),
+        "lag_hz": best_lag_hz,
+        "fundamental_hz": fundamental_hz,
+    }
+
+
+def _residual_notches(
+    context: AnalysisContext,
+    spectrum_wide: np.ndarray,
+    depth_threshold_db: float,
+    max_width_octaves: float,
+) -> dict[str, Any]:
+    """Find deep nulls whose -3 dB width is narrower than the configured limit."""
+
+    ripple = _detrended_ripple(context, spectrum_wide)
+    frequencies = context.frequencies
+    offenders: list[dict[str, float]] = []
+    for index in _local_minima_indices(ripple):
+        depth_db = -float(ripple[index])
+        if depth_db < depth_threshold_db:
+            continue
+        left = int(index)
+        while left > 0 and ripple[left] <= -3.0:
+            left -= 1
+        right = int(index)
+        while right + 1 < ripple.size and ripple[right] <= -3.0:
+            right += 1
+        # A band-edge crossing has unknown width outside the evaluated band,
+        # so it cannot safely be called a narrow in-band notch.
+        if left == 0 or right == ripple.size - 1:
+            continue
+        width_octaves = float(np.log2(frequencies[right] / frequencies[left]))
+        if width_octaves <= max_width_octaves + 1e-12:
+            offenders.append(
+                {
+                    "depth_db": depth_db,
+                    "frequency_hz": float(frequencies[index]),
+                    "width_octaves": width_octaves,
+                }
+            )
+    offenders.sort(key=lambda item: (-item["depth_db"], item["frequency_hz"]))
+    return {
+        "count": len(offenders),
+        "worst": offenders[0] if offenders else None,
+        "offenders": offenders,
+    }
+
+
+def _band_edge_stability(
+    context: AnalysisContext,
+    spectrum_wide: np.ndarray,
+    score_low_end_weight: float,
+    score_dip_weight: float,
+) -> dict[str, Any]:
+    """Re-score after shifting the complete evaluation window by +/-1/6 octave."""
+
+    factor = 2.0 ** (1.0 / 6.0)
+    bands = {
+        "down": (context.band[0] / factor, context.band[1] / factor),
+        "nominal": context.band,
+        "up": (context.band[0] * factor, context.band[1] * factor),
+    }
+    scores = {
+        label: float(
+            _score_wide_spectrum(
+                context,
+                spectrum_wide,
+                score_low_end_weight,
+                score_dip_weight,
+                band,
+            )
+        )
+        for label, band in bands.items()
+    }
+    return {
+        "shift_octaves": 1.0 / 6.0,
+        "scores_db": scores,
+        "spread_db": float(max(scores.values()) - min(scores.values())),
+    }
+
+
+def _improvement_localization(
+    context: AnalysisContext,
+    selected_spectrum_wide: np.ndarray,
+    physical_spectrum_wide: np.ndarray,
+    score_low_end_weight: float,
+    score_dip_weight: float,
+) -> dict[str, float | None]:
+    """Share of positive detrended-ripple improvement in one 1/6-octave region."""
+
+    selected_db = db20(selected_spectrum_wide)
+    physical_db = db20(physical_spectrum_wide)
+    selected_score = float(
+        _score_wide_spectrum(
+            context,
+            selected_spectrum_wide,
+            score_low_end_weight,
+            score_dip_weight,
+        )
+    )
+    physical_score = float(
+        _score_wide_spectrum(
+            context,
+            physical_spectrum_wide,
+            score_low_end_weight,
+            score_dip_weight,
+        )
+    )
+    improvement_db = selected_score - physical_score
+    selected_ripple = (
+        selected_db - broad_trend_db(selected_db, context.ppo)
+    )[context.trend_slice]
+    physical_ripple = (
+        physical_db - broad_trend_db(physical_db, context.ppo)
+    )[context.trend_slice]
+    positive_improvement = np.maximum(
+        np.abs(physical_ripple) - np.abs(selected_ripple),
+        0.0,
+    )
+    positive_total = float(np.sum(positive_improvement))
+    if positive_total <= 1e-9:
+        return {
+            "fraction": 0.0,
+            "frequency_hz": None,
+            "contribution_db_sum": 0.0,
+            "positive_ripple_improvement_db_sum": positive_total,
+            "score_improvement_db": improvement_db,
+        }
+    width_bins = max(1, int(round(context.ppo / 6.0)))
+    window_sums = np.convolve(
+        positive_improvement,
+        np.ones(width_bins, dtype=np.float64),
+        mode="valid",
+    )
+    best_start = int(np.argmax(window_sums))
+    best_contribution = float(window_sums[best_start])
+    band_frequencies = context.frequencies
+    best_end = min(best_start + width_bins - 1, band_frequencies.size - 1)
+    best_frequency = float(
+        np.sqrt(band_frequencies[best_start] * band_frequencies[best_end])
+    )
+    return {
+        "fraction": best_contribution / positive_total,
+        "frequency_hz": best_frequency,
+        "contribution_db_sum": best_contribution,
+        "positive_ripple_improvement_db_sum": positive_total,
+        "score_improvement_db": improvement_db,
+    }
+
+
+def _detrended_symmetry(
+    objective: np.ndarray,
+    tau_grid_ms: np.ndarray,
+    preferred_axis_ms: float | None = None,
+) -> dict[str, float | None]:
+    """Fit a mirror axis after removing the broad delay-envelope shape."""
+
+    values = np.asarray(objective, dtype=np.float64)
+    tau = np.asarray(tau_grid_ms, dtype=np.float64)
+    if values.size < 9 or values.shape != tau.shape:
+        return {"correlation": None, "axis_ms": None, "axis_offset_ms": None}
+    broad = ndimage.gaussian_filter1d(
+        values,
+        sigma=max(2.0, values.size / 10.0),
+        mode="nearest",
+        truncate=3.0,
+    )
+    residual = values - broad
+    step = float(np.median(np.diff(tau)))
+    minimum_samples = max(7, values.size // 10)
+    candidates: list[tuple[float, float]] = []
+    for axis in tau:
+        half_span = min(float(axis - tau[0]), float(tau[-1] - axis))
+        sample_count = int(math.floor(half_span / step)) + 1
+        if sample_count < minimum_samples:
+            continue
+        offsets = np.arange(sample_count, dtype=np.float64) * step
+        left = np.interp(axis - offsets, tau, residual)
+        right = np.interp(axis + offsets, tau, residual)
+        left -= float(np.mean(left))
+        right -= float(np.mean(right))
+        denominator = float(np.linalg.norm(left) * np.linalg.norm(right))
+        correlation = float(np.dot(left, right) / denominator) if denominator > EPS else 0.0
+        candidates.append((correlation, float(axis)))
+    if not candidates:
+        return {"correlation": None, "axis_ms": None, "axis_offset_ms": None}
+    best_correlation = max(correlation for correlation, _axis in candidates)
+    if preferred_axis_ms is None:
+        best_correlation, best_axis = max(
+            candidates,
+            key=lambda item: (item[0], -abs(item[1])),
+        )
+    else:
+        # Periodic responses can have several almost indistinguishable mirror
+        # axes.  Treat correlations within one percentage point as equivalent
+        # and use the independently measured arrival difference to resolve that
+        # visual ambiguity.  This does not affect any score or verdict.
+        near_best = [
+            item for item in candidates if item[0] >= best_correlation - 0.01
+        ]
+        best_correlation, best_axis = min(
+            near_best,
+            key=lambda item: (abs(item[1] - preferred_axis_ms), -item[0]),
+        )
+    return {
+        "correlation": best_correlation,
+        "axis_ms": best_axis,
+        "axis_offset_ms": (
+            best_axis - preferred_axis_ms if preferred_axis_ms is not None else None
+        ),
+    }
+
+
 def _metadata_arrival_delay_ms(metadata: dict[str, Any]) -> float | None:
     """Read the normalized cached arrival delay, including older test caches."""
 
@@ -309,6 +773,7 @@ def _best_configurations(
     sigma_tau_ms: float,
     physical_tau_ms: float | None,
     physical_window_ms: float,
+    basin_range_fraction: float,
 ) -> list[tuple[int, float, float, float, float, float, dict[str, Any]]]:
     polarities = np.asarray([1.0, -1.0])
     gain_linear = 10.0 ** (gains / 20.0)
@@ -399,6 +864,19 @@ def _best_configurations(
         }
         basin_w03 = _basin_width(raw_curve, delays, tau_star_index, 0.3)
         basin_w05 = _basin_width(raw_curve, delays, tau_star_index, 0.5)
+        basin_scope = (
+            raw_curve[eligible_delays]
+            if physical_tau_ms is not None and physical_window_in_scan
+            else raw_curve
+        )
+        basin_range_db = float(np.max(basin_scope) - np.min(basin_scope))
+        basin_threshold_db = max(1e-9, basin_range_fraction * basin_range_db)
+        basin_scaled_ms = _basin_width(
+            raw_curve,
+            delays,
+            tau_star_index,
+            basin_threshold_db,
+        )
         non_physical = (
             physical_tau_ms is not None
             and abs(tau_star_ms - physical_tau_ms) > physical_window_ms + 1e-12
@@ -414,12 +892,21 @@ def _best_configurations(
             "fragility_db": float(robust_curve[tau_star_index] - raw_curve[tau_star_index]),
             "basin_w03_ms": basin_w03,
             "basin_w05_ms": basin_w05,
+            "basin_scaled_ms": basin_scaled_ms,
+            "basin_threshold_db": basin_threshold_db,
+            "basin_range_db": basin_range_db,
+            "basin_range_fraction": basin_range_fraction,
             "worst_case_db": worst_case,
             "n_competing": competing,
             "physical_tau_ms": physical_tau_ms,
             "physical_window_ms": physical_window_ms,
             "physical_window_in_scan": physical_window_in_scan,
             "non_physical_solution": non_physical,
+            "detrended_symmetry": _detrended_symmetry(
+                raw_curve,
+                delays,
+                physical_tau_ms,
+            ),
         }
         result.append(
             (
@@ -433,6 +920,406 @@ def _best_configurations(
             )
         )
     return result
+
+
+_GATE_ORDER = (
+    "gate_a_redundancy",
+    "gate_b_ripple_correlation",
+    "gate_c_physical_percentile",
+    "basin_geometry",
+    "gate_d_cancellation_deficit",
+    "gate_e_comb_signature",
+    "gate_f_residual_notches",
+    "gate_g_gain_asymmetry",
+    "gate_h_band_edge_stability",
+    "gate_i_improvement_localization",
+)
+
+
+def _not_run_gate(stage: str) -> dict[str, Any]:
+    return {"status": "not_run", "stage": stage}
+
+
+def _preoptimization_gates(
+    context: AnalysisContext,
+    first: int,
+    second: int,
+    delays: np.ndarray,
+    first_arrival_ms: float | None,
+    second_arrival_ms: float | None,
+    arrival_outliers: set[int],
+    options: SearchOptions,
+) -> dict[str, dict[str, Any]]:
+    """Run A/B and, when they pass, the delay-only physical Gate C."""
+
+    thresholds = options.gate_thresholds
+    residual, fitted_delay_ms, fitted_scale = _redundancy_residual(
+        context, first, second, delays
+    )
+    if residual < thresholds.redundancy_reject:
+        redundancy_status = "reject"
+    elif residual < thresholds.redundancy_caution:
+        redundancy_status = "caution"
+    else:
+        redundancy_status = "pass"
+    correlation = _ripple_deviation_correlation(context, first, second)
+    correlation_status = (
+        "reject"
+        if correlation > thresholds.ripple_correlation_reject
+        else "pass"
+    )
+    correlation_signal = (
+        "reinforcing"
+        if correlation > thresholds.ripple_correlation_reject
+        else (
+            "complementary"
+            if correlation < thresholds.ripple_complementary
+            else "neutral"
+        )
+    )
+    gates: dict[str, dict[str, Any]] = {
+        "gate_a_redundancy": {
+            "status": redundancy_status,
+            "residual": residual,
+            "best_fit_delay_ms": fitted_delay_ms,
+            "best_fit_scale_real": fitted_scale.real,
+            "best_fit_scale_imag": fitted_scale.imag,
+            "reject_below": thresholds.redundancy_reject,
+            "caution_below": thresholds.redundancy_caution,
+        },
+        "gate_b_ripple_correlation": {
+            "status": correlation_status,
+            "correlation": correlation,
+            "signal": correlation_signal,
+            "reject_above": thresholds.ripple_correlation_reject,
+            "complementary_below": thresholds.ripple_complementary,
+        },
+    }
+    stage_one_reject = any(
+        gate["status"] == "reject" for gate in gates.values()
+    )
+    physical_tau_ms = (
+        float(first_arrival_ms - second_arrival_ms)
+        if first_arrival_ms is not None and second_arrival_ms is not None
+        else None
+    )
+    physical_deficit_db = (
+        _cancellation_deficit_db(
+            context,
+            first,
+            second,
+            1,
+            physical_tau_ms,
+            0.0,
+        )
+        if physical_tau_ms is not None
+        else None
+    )
+    gates["gate_d_cancellation_deficit"] = {
+        **_not_run_gate("post_optimisation"),
+        "physical_deficit_db": physical_deficit_db,
+        "chosen_deficit_db": None,
+        "reject_below_db": thresholds.cancellation_deficit_reject_db,
+        "caution_below_db": thresholds.cancellation_deficit_caution_db,
+    }
+    if stage_one_reject:
+        gates["gate_c_physical_percentile"] = _not_run_gate(
+            "skipped_after_stage_1_reject"
+        )
+    elif physical_tau_ms is None:
+        gates["gate_c_physical_percentile"] = {
+            "status": "caution",
+            "percentile": None,
+            "physical_tau_ms": None,
+            "objective_gap_db": None,
+            "reject_above_percentile": thresholds.physical_percentile_reject,
+            "detail": "arrival metadata unavailable",
+        }
+    elif first in arrival_outliers or second in arrival_outliers:
+        gates["gate_c_physical_percentile"] = {
+            "status": "reject",
+            "percentile": None,
+            "physical_tau_ms": physical_tau_ms,
+            "objective_gap_db": None,
+            "reject_above_percentile": thresholds.physical_percentile_reject,
+            "detail": "arrival-delay outlier",
+        }
+    elif physical_tau_ms < delays[0] or physical_tau_ms > delays[-1]:
+        gates["gate_c_physical_percentile"] = {
+            "status": "reject",
+            "percentile": None,
+            "physical_tau_ms": physical_tau_ms,
+            "objective_gap_db": None,
+            "reject_above_percentile": thresholds.physical_percentile_reject,
+            "detail": "physical delay lies outside the scan",
+        }
+    else:
+        objective = _baseline_objective_curve(
+            context,
+            first,
+            second,
+            delays,
+            options.score_low_end_weight,
+            options.score_dip_weight,
+        )
+        physical_objective = float(np.interp(physical_tau_ms, delays, objective))
+        percentile = float(
+            100.0 * np.mean(objective <= physical_objective + 1e-12)
+        )
+        gates["gate_c_physical_percentile"] = {
+            "status": (
+                "reject"
+                if percentile > thresholds.physical_percentile_reject
+                else "pass"
+            ),
+            "percentile": percentile,
+            "physical_tau_ms": physical_tau_ms,
+            "objective_at_physical_db": physical_objective,
+            "objective_gap_db": physical_objective - float(np.min(objective)),
+            "reject_above_percentile": thresholds.physical_percentile_reject,
+            "baseline": "normal polarity, equal gain",
+        }
+    for name in _GATE_ORDER:
+        gates.setdefault(name, _not_run_gate("post_optimisation"))
+    return {name: gates[name] for name in _GATE_ORDER}
+
+
+def _postoptimization_gates(
+    context: AnalysisContext,
+    first: int,
+    second: int,
+    pair: dict[str, Any],
+    gates: dict[str, dict[str, Any]],
+    options: SearchOptions,
+) -> dict[str, dict[str, Any]]:
+    """Complete the basin and D-I checks for one chosen configuration."""
+
+    thresholds = options.gate_thresholds
+    polarity = int(pair["polarity"])
+    delay_ms = float(pair["delay_ms"])
+    gain_db = float(pair["gain_db"])
+    chosen_wide = context.sum_on_trend_grid(
+        first, second, polarity, delay_ms, gain_db
+    )
+    physical_tau_ms = pair.get("physical_tau")
+    physical_wide = (
+        context.sum_on_trend_grid(first, second, 1, float(physical_tau_ms), 0.0)
+        if physical_tau_ms is not None
+        else None
+    )
+
+    # The percentile remains defined against the cheap normal-polarity,
+    # equal-gain delay scan from Stage 2.  Once the optimiser has run, replace
+    # the provisional gap-to-baseline-minimum with the requested absolute gap
+    # to this pair's reported unconstrained optimum.
+    physical_objective = gates["gate_c_physical_percentile"].get(
+        "objective_at_physical_db"
+    )
+    if physical_objective is not None and pair.get("f_tau_star") is not None:
+        gates["gate_c_physical_percentile"]["objective_gap_db"] = (
+            float(physical_objective) - float(pair["f_tau_star"])
+        )
+        gates["gate_c_physical_percentile"]["gap_reference"] = "f(tau_star)"
+
+    if pair.get("non_physical_solution"):
+        gates["gate_c_physical_percentile"]["status"] = "reject"
+        gates["gate_c_physical_percentile"]["detail"] = (
+            "raw optimum lies outside the physical-delay window"
+        )
+
+    gates["basin_geometry"] = {
+        "status": "pass" if pair["geometric_pass"] else "reject",
+        "basin_width_ms": pair["basin_scaled"],
+        "basin_threshold_db": pair["basin_threshold_db"],
+        "required_excursion_ms": pair["delta_tau_max"],
+        "range_fraction": thresholds.basin_range_fraction,
+    }
+
+    chosen_deficit = _cancellation_deficit_db(
+        context,
+        first,
+        second,
+        polarity,
+        delay_ms,
+        gain_db,
+    )
+    physical_deficit = gates["gate_d_cancellation_deficit"].get(
+        "physical_deficit_db"
+    )
+    evaluated_deficits = [chosen_deficit]
+    if physical_deficit is not None:
+        evaluated_deficits.append(float(physical_deficit))
+    worst_deficit = min(evaluated_deficits)
+    cancellation_status = (
+        "reject"
+        if worst_deficit < thresholds.cancellation_deficit_reject_db
+        else (
+            "caution"
+            if worst_deficit < thresholds.cancellation_deficit_caution_db
+            else "pass"
+        )
+    )
+    gates["gate_d_cancellation_deficit"] = {
+        "status": cancellation_status,
+        "physical_deficit_db": physical_deficit,
+        "chosen_deficit_db": chosen_deficit,
+        "worst_deficit_db": worst_deficit,
+        "reject_below_db": thresholds.cancellation_deficit_reject_db,
+        "caution_below_db": thresholds.cancellation_deficit_caution_db,
+    }
+
+    comb = _comb_signature(context, chosen_wide, delay_ms)
+    comb_index = float(comb["index"] or 0.0)
+    gates["gate_e_comb_signature"] = {
+        "status": (
+            "reject"
+            if comb_index >= thresholds.comb_index_reject
+            else (
+                "caution"
+                if comb_index >= thresholds.comb_index_caution
+                else "pass"
+            )
+        ),
+        "comb_index": comb_index,
+        "peak_lag_hz": comb["lag_hz"],
+        "fundamental_hz": comb["fundamental_hz"],
+        "reject_at_or_above": thresholds.comb_index_reject,
+        "caution_at_or_above": thresholds.comb_index_caution,
+    }
+
+    notches = _residual_notches(
+        context,
+        chosen_wide,
+        thresholds.notch_depth_reject_db,
+        thresholds.notch_max_width_octaves,
+    )
+    gates["gate_f_residual_notches"] = {
+        "status": "reject" if notches["count"] else "pass",
+        **notches,
+        "depth_threshold_db": thresholds.notch_depth_reject_db,
+        "max_width_octaves": thresholds.notch_max_width_octaves,
+    }
+
+    gain_offset_db = abs(gain_db)
+    gains = inclusive_range(*options.gain_range_db)
+    at_search_boundary = bool(
+        abs(gain_db - float(gains[0])) <= 1e-9
+        or abs(gain_db - float(gains[-1])) <= 1e-9
+    )
+    gates["gate_g_gain_asymmetry"] = {
+        "status": (
+            "caution"
+            if gain_offset_db > thresholds.gain_asymmetry_caution_db
+            else "pass"
+        ),
+        "gain_offset_db": gain_offset_db,
+        "caution_above_db": thresholds.gain_asymmetry_caution_db,
+        "headroom_adjustment_db": pair["headroom_db"],
+        "gain_at_search_boundary": at_search_boundary,
+        "achievable_by_global_attenuation": True,
+        "hardware_headroom_known": False,
+    }
+
+    edge = _band_edge_stability(
+        context,
+        chosen_wide,
+        options.score_low_end_weight,
+        options.score_dip_weight,
+    )
+    gates["gate_h_band_edge_stability"] = {
+        "status": (
+            "reject"
+            if edge["spread_db"] > thresholds.band_edge_spread_reject_db
+            else "pass"
+        ),
+        **edge,
+        "reject_above_db": thresholds.band_edge_spread_reject_db,
+    }
+
+    if physical_wide is None:
+        gates["gate_i_improvement_localization"] = {
+            "status": "caution",
+            "fraction": None,
+            "frequency_hz": None,
+            "detail": "arrival metadata unavailable",
+            "reject_above_fraction": thresholds.localization_fraction_reject,
+        }
+    else:
+        localization = _improvement_localization(
+            context,
+            chosen_wide,
+            physical_wide,
+            options.score_low_end_weight,
+            options.score_dip_weight,
+        )
+        fraction = float(localization["fraction"] or 0.0)
+        gates["gate_i_improvement_localization"] = {
+            "status": (
+                "reject"
+                if fraction > thresholds.localization_fraction_reject
+                else "pass"
+            ),
+            **localization,
+            "reject_above_fraction": thresholds.localization_fraction_reject,
+        }
+    return {name: gates[name] for name in _GATE_ORDER}
+
+
+def _verdict_and_reasons(
+    gates: dict[str, dict[str, Any]],
+) -> tuple[str, list[dict[str, Any]]]:
+    reasons = []
+    for name in _GATE_ORDER:
+        gate = gates[name]
+        if gate.get("status") not in {"caution", "reject"}:
+            continue
+        measured = {
+            key: value
+            for key, value in gate.items()
+            if key not in {"status", "stage", "offenders"}
+        }
+        reasons.append(
+            {
+                "gate": name,
+                "status": gate["status"],
+                "measured": measured,
+            }
+        )
+    verdict = (
+        "reject"
+        if any(reason["status"] == "reject" for reason in reasons)
+        else ("caution" if reasons else "accept")
+    )
+    return verdict, reasons
+
+
+def _gate_summary_fields(gates: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Stable top-level columns for tabular JSON/report consumers."""
+
+    notch = gates["gate_f_residual_notches"].get("worst") or {}
+    cancellation = gates["gate_d_cancellation_deficit"]
+    return {
+        "redundancy_residual": gates["gate_a_redundancy"].get("residual"),
+        "ripple_correlation": gates["gate_b_ripple_correlation"].get("correlation"),
+        "physical_percentile": gates["gate_c_physical_percentile"].get("percentile"),
+        "physical_objective_gap_db": gates["gate_c_physical_percentile"].get(
+            "objective_gap_db"
+        ),
+        "physical_cancellation_deficit_db": cancellation.get("physical_deficit_db"),
+        "cancellation_deficit_db": cancellation.get("chosen_deficit_db"),
+        "comb_index": gates["gate_e_comb_signature"].get("comb_index"),
+        "notch_count": gates["gate_f_residual_notches"].get("count"),
+        "worst_notch_depth_db": notch.get("depth_db"),
+        "worst_notch_frequency_hz": notch.get("frequency_hz"),
+        "gain_asymmetry_db": gates["gate_g_gain_asymmetry"].get("gain_offset_db"),
+        "band_edge_spread_db": gates["gate_h_band_edge_stability"].get("spread_db"),
+        "improvement_localization_fraction": gates[
+            "gate_i_improvement_localization"
+        ].get("fraction"),
+        "improvement_localization_frequency_hz": gates[
+            "gate_i_improvement_localization"
+        ].get("frequency_hz"),
+    }
 
 
 _worker_state: dict[str, Any] = {}
@@ -559,6 +1446,7 @@ def _compute_pair(
         sigma_tau_ms,
         physical_tau_ms,
         search_options.physical_delay_window_ms,
+        search_options.gate_thresholds.basin_range_fraction,
     )
     finalists = []
     for (
@@ -604,7 +1492,7 @@ def _compute_pair(
             "sigma_tau_ms": sigma_tau_ms,
             "geometry_conservative_bound": conservative_bound,
             "basin_covers_geometry": (
-                float(robustness["basin_w03_ms"]) + 1e-12 >= delta_tau_max_ms
+                float(robustness["basin_scaled_ms"]) + 1e-12 >= delta_tau_max_ms
             ),
             "arrival_delay_first_ms": first_arrival,
             "arrival_delay_second_ms": second_arrival,
@@ -625,6 +1513,8 @@ def _compute_pair(
             "fragility": robustness["fragility_db"],
             "basin_w03": robustness["basin_w03_ms"],
             "basin_w05": robustness["basin_w05_ms"],
+            "basin_scaled": robustness["basin_scaled_ms"],
+            "basin_threshold_db": robustness["basin_threshold_db"],
             "worst_case": robustness["worst_case_db"],
             "n_competing": robustness["n_competing"],
             "geometric_pass": robustness["basin_covers_geometry"],
@@ -746,6 +1636,31 @@ def run_search(
         max_filters=options.eq_bands,
         low_shelf=options.low_shelf,
     )
+    combinations = list(itertools.combinations(range(len(measurements)), 2))
+    pre_gates: dict[tuple[int, int], dict[str, dict[str, Any]]] = {}
+    survivors: list[tuple[int, int]] = []
+    for first, second in combinations:
+        gates = _preoptimization_gates(
+            context,
+            first,
+            second,
+            delays,
+            arrival_delays_ms[first],
+            arrival_delays_ms[second],
+            arrival_outliers,
+            options,
+        )
+        pre_gates[(first, second)] = gates
+        if not any(
+            gates[name]["status"] == "reject"
+            for name in (
+                "gate_a_redundancy",
+                "gate_b_ripple_correlation",
+                "gate_c_physical_percentile",
+            )
+        ):
+            survivors.append((first, second))
+
     modal_options: ModalOptions | None = None
     modal_signature: RoomModalSignature | None = None
     if options.modal:
@@ -755,42 +1670,84 @@ def run_search(
             context.sample_rate,
             modal_options,
         )
-    combinations = list(itertools.combinations(range(len(measurements)), 2))
-    worker_count = max(1, min((os.cpu_count() or 1) // 4, 8, len(combinations)))
+    worker_count = max(1, min((os.cpu_count() or 1) // 4, 8, len(survivors)))
+    optimized: dict[tuple[int, int], tuple[int, float, float, dict[str, Any]]] = {}
+    if survivors:
+        with ProcessPoolExecutor(
+            max_workers=worker_count,
+            initializer=_init_pair_worker,
+            initargs=(
+                context,
+                delays,
+                gains,
+                eq_options,
+                options.score_low_end_weight,
+                options.score_dip_weight,
+                modal_signature,
+                modal_options,
+                arrival_delays_ms,
+                arrival_outliers,
+                options,
+            ),
+        ) as executor:
+            for first, second, polarity, delay_ms, gain_db, diagnostics in executor.map(
+                _compute_pair, survivors
+            ):
+                optimized[(first, second)] = (
+                    polarity,
+                    delay_ms,
+                    gain_db,
+                    diagnostics,
+                )
+
     pairs: list[dict] = []
-    with ProcessPoolExecutor(
-        max_workers=worker_count,
-        initializer=_init_pair_worker,
-        initargs=(
-            context,
-            delays,
-            gains,
-            eq_options,
-            options.score_low_end_weight,
-            options.score_dip_weight,
-            modal_signature,
-            modal_options,
-            arrival_delays_ms,
-            arrival_outliers,
-            options,
-        ),
-    ) as executor:
-        for ordinal, (first, second, polarity, delay_ms, gain_db, diagnostics) in enumerate(
-            executor.map(_compute_pair, combinations), start=1
-        ):
+    for ordinal, (first, second) in enumerate(combinations, start=1):
+        gates = pre_gates[(first, second)]
+        result = optimized.get((first, second))
+        if result is not None:
+            polarity, delay_ms, gain_db, diagnostics = result
             pair = {
                 "first": first + 1,
                 "second": second + 1,
                 "first_name": measurements[first].title,
                 "second_name": measurements[second].title,
+                "optimized": True,
                 "polarity": polarity,
                 "delay_ms": delay_ms,
                 "gain_db": gain_db,
                 **diagnostics,
             }
-            pairs.append(pair)
-            if progress:
-                progress(ordinal, len(combinations), f"{first + 1}+{second + 1}")
+            gates = _postoptimization_gates(
+                context,
+                first,
+                second,
+                pair,
+                gates,
+                options,
+            )
+        else:
+            pair = {
+                "first": first + 1,
+                "second": second + 1,
+                "first_name": measurements[first].title,
+                "second_name": measurements[second].title,
+                "optimized": False,
+                "polarity": None,
+                "delay_ms": None,
+                "gain_db": None,
+            }
+        verdict, reasons = _verdict_and_reasons(gates)
+        pair.update(
+            {
+                "verdict": verdict,
+                "reasons": reasons,
+                "gates": gates,
+                **_gate_summary_fields(gates),
+            }
+        )
+        pairs.append(pair)
+        if progress:
+            progress(ordinal, len(combinations), f"{first + 1}+{second + 1}")
 
     def _modal_tiebreak_key(pair: dict) -> tuple[float, float]:
         """``(n_highQ, sum_modal_energy_db)``, both lower-is-better.
@@ -812,55 +1769,91 @@ def run_search(
         )
 
     def _raw_sort_key(i: int) -> tuple:
-        # Invalid arrival metadata and a raw optimum outside the physical
-        # window are disqualifiers. Score remains the primary ordering among
-        # physically credible pairs and its formula is unchanged.
-        eligibility = (
-            0 if pairs[i].get("pair_valid", True) else 1,
-            1 if pairs[i].get("non_physical_solution", False) else 0,
+        pair = pairs[i]
+        verdict_order = {"accept": 0, "caution": 1, "reject": 2}
+        score = pair.get("score_db")
+        base = (
+            verdict_order[pair["verdict"]],
+            0 if pair["optimized"] else 1,
+            -float(score) if score is not None else math.inf,
         )
-        base = eligibility + (-pairs[i]["score_db"],)
-        tiebreak = _modal_tiebreak_key(pairs[i]) if options.modal_tiebreak else ()
-        return base + tiebreak + (pairs[i]["first"], pairs[i]["second"])
+        tiebreak = _modal_tiebreak_key(pair) if options.modal_tiebreak else ()
+        return base + tiebreak + (pair["first"], pair["second"])
 
     raw_order = sorted(range(len(pairs)), key=_raw_sort_key)
     pairs = [pairs[i] for i in raw_order]
-    raw_reference = max(pairs, key=lambda row: row["score_db"])
-    reference_spl = raw_reference["spl_db"]
-    reference_low_end_power = raw_reference["low_end_power_db"]
-    reference_score = raw_reference["score_db"]
+    optimized_pairs = [row for row in pairs if row["optimized"]]
+    raw_reference = (
+        max(optimized_pairs, key=lambda row: row["score_db"])
+        if optimized_pairs
+        else None
+    )
+    reference_spl = raw_reference["spl_db"] if raw_reference is not None else None
+    reference_low_end_power = (
+        raw_reference["low_end_power_db"] if raw_reference is not None else None
+    )
+    reference_score = raw_reference["score_db"] if raw_reference is not None else None
     for rank, row in enumerate(pairs, start=1):
         row["rank"] = rank
-        row["relative_score_db"] = float(row["score_db"] - reference_score)
-        row["relative_spl_db"] = float(row["spl_db"] - reference_spl)
-        row["relative_low_end_power_db"] = float(
-            row["low_end_power_db"] - reference_low_end_power
+        row["relative_score_db"] = (
+            float(row["score_db"] - reference_score) if row["optimized"] else None
         )
+        row["relative_spl_db"] = (
+            float(row["spl_db"] - reference_spl) if row["optimized"] else None
+        )
+        row["relative_low_end_power_db"] = (
+            float(row["low_end_power_db"] - reference_low_end_power)
+            if row["optimized"]
+            else None
+        )
+
     def _eq_sort_key(i: int) -> tuple:
-        eligibility = (
-            0 if pairs[i].get("pair_valid", True) else 1,
-            1 if pairs[i].get("non_physical_solution", False) else 0,
+        pair = pairs[i]
+        verdict_order = {"accept": 0, "caution": 1, "reject": 2}
+        score = pair.get("post_eq_score_db")
+        base = (
+            verdict_order[pair["verdict"]],
+            0 if pair["optimized"] else 1,
+            -float(score) if score is not None else math.inf,
         )
-        base = eligibility + (-pairs[i]["post_eq_score_db"],)
-        tiebreak = _modal_tiebreak_key(pairs[i]) if options.modal_tiebreak else ()
-        return base + tiebreak + (pairs[i]["first"], pairs[i]["second"])
+        tiebreak = _modal_tiebreak_key(pair) if options.modal_tiebreak else ()
+        return base + tiebreak + (pair["first"], pair["second"])
 
     eq_order = sorted(range(len(pairs)), key=_eq_sort_key)
     eq_pairs = [pairs[i] for i in eq_order]
-    eq_reference = max(eq_pairs, key=lambda row: row["post_eq_score_db"])
-    eq_reference_spl = eq_reference["post_eq_spl_db"]
-    eq_reference_low_end_power = eq_reference["post_eq_low_end_power_db"]
-    eq_reference_score = eq_reference["post_eq_score_db"]
+    eq_optimized_pairs = [row for row in eq_pairs if row["optimized"]]
+    eq_reference = (
+        max(eq_optimized_pairs, key=lambda row: row["post_eq_score_db"])
+        if eq_optimized_pairs
+        else None
+    )
+    eq_reference_spl = (
+        eq_reference["post_eq_spl_db"] if eq_reference is not None else None
+    )
+    eq_reference_low_end_power = (
+        eq_reference["post_eq_low_end_power_db"]
+        if eq_reference is not None
+        else None
+    )
+    eq_reference_score = (
+        eq_reference["post_eq_score_db"] if eq_reference is not None else None
+    )
     for eq_rank, row in enumerate(eq_pairs, start=1):
         row["eq_rank"] = eq_rank
-        row["post_eq_relative_score_db"] = float(
-            row["post_eq_score_db"] - eq_reference_score
+        row["post_eq_relative_score_db"] = (
+            float(row["post_eq_score_db"] - eq_reference_score)
+            if row["optimized"]
+            else None
         )
-        row["post_eq_relative_spl_db"] = float(
-            row["post_eq_spl_db"] - eq_reference_spl
+        row["post_eq_relative_spl_db"] = (
+            float(row["post_eq_spl_db"] - eq_reference_spl)
+            if row["optimized"]
+            else None
         )
-        row["post_eq_relative_low_end_power_db"] = float(
-            row["post_eq_low_end_power_db"] - eq_reference_low_end_power
+        row["post_eq_relative_low_end_power_db"] = (
+            float(row["post_eq_low_end_power_db"] - eq_reference_low_end_power)
+            if row["optimized"]
+            else None
         )
 
     modal_signature_json = None
@@ -898,8 +1891,9 @@ def run_search(
     ]
 
     result = {
-        "format_version": 24,
+        "format_version": 25,
         "measurement_count": len(measurements),
+        "optimized_pair_count": len(optimized_pairs),
         "sample_rate": measurements[0].sample_rate,
         "response_length": measurements[0].impulse.size,
         "settings": {
@@ -908,6 +1902,18 @@ def run_search(
             "delay_range_ms": list(options.delay_range_ms),
             "delay_grid_step_ms": effective_delay_step_ms,
             "gain_range_db": list(options.gain_range_db),
+            "gates": {
+                "thresholds": asdict(options.gate_thresholds),
+                "order": list(_GATE_ORDER),
+                "verdict_order": ["accept", "caution", "reject"],
+                "note": (
+                    "Every gate is a disqualifier, not a certificate. Stage 1 "
+                    "redundancy/ripple rejects and Stage 2 physical-percentile "
+                    "rejects skip the expensive optimiser. Passing all gates only "
+                    "means no configured single-position failure mode was detected; "
+                    "only multi-position measurements validate a listening area."
+                ),
+            },
             "robustness": {
                 "objective": "f = -raw usable-output score (lower is better)",
                 "listener_movement_m": options.listener_movement_m,
@@ -926,7 +1932,11 @@ def run_search(
                     "arrival-time excursion for the configured listener movement. "
                     "Without complete coordinates, 2d/c is used and each pair is "
                     "marked geometry_conservative_bound. Basin width is only a "
-                    "disqualifier: a narrow basin proves timing fragility, but a "
+                    "disqualifier. geometric_pass uses basin_scaled_ms, whose "
+                    "degradation threshold is the configured fraction of this "
+                    "pair's f range inside the physical window; basin_w03/w05 are "
+                    "retained as fixed-threshold diagnostics. A narrow basin proves "
+                    "timing fragility, but a "
                     "wide basin does not model the magnitude-response change caused "
                     "by moving through the room's modal pressure field. Only "
                     "multi-position measurements can validate a listening area."
@@ -1042,10 +2052,12 @@ def run_search(
                 ),
             },
             "ranking": {
-                "raw": ["score_db"],
-                "eq": ["post_eq_score_db"],
+                "raw": ["verdict", "score_db"],
+                "eq": ["verdict", "post_eq_score_db"],
                 "excess_gd_range_hz": list(eq_range),
-                "direction": "higher is better",
+                "direction": (
+                    "accept before caution before reject; higher score within verdict"
+                ),
                 "score": {
                     "fields": {
                         "raw": "score_db / relative_score_db",

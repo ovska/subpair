@@ -409,7 +409,8 @@ def _robustness_figure(pair: dict[str, Any]) -> go.Figure:
     robust = np.asarray(robustness["robust_objective_db"], dtype=np.float64)
     star_index = int(np.argmin(np.abs(tau - float(robustness["tau_star_ms"]))))
     robust_index = int(np.argmin(np.abs(tau - float(robustness["tau_robust_ms"]))))
-    threshold = objective[star_index] + 0.3
+    basin_delta_db = float(robustness.get("basin_threshold_db", 0.3))
+    threshold = objective[star_index] + basin_delta_db
     left = star_index
     while left > 0 and objective[left - 1] <= threshold:
         left -= 1
@@ -424,7 +425,7 @@ def _robustness_figure(pair: dict[str, Any]) -> go.Figure:
         fillcolor="#22c55e",
         opacity=0.15,
         line_width=0,
-        annotation_text="+0.3 dB contiguous basin",
+        annotation_text=f"+{basin_delta_db:.2f} dB adaptive contiguous basin",
         annotation_position="top left",
     )
     figure.add_trace(
@@ -472,6 +473,22 @@ def _robustness_figure(pair: dict[str, Any]) -> go.Figure:
             line={"color": "#fb7185", "width": 1.5, "dash": "dash"},
             annotation_text="physical tau",
             annotation_position="bottom right",
+        )
+    symmetry = robustness.get("detrended_symmetry") or {}
+    symmetry_axis = symmetry.get("axis_ms")
+    symmetry_correlation = symmetry.get("correlation")
+    symmetry_offset = symmetry.get("axis_offset_ms")
+    if symmetry_axis is not None:
+        symmetry_label = "detrended mirror axis"
+        if symmetry_correlation is not None:
+            symmetry_label += f" (r={float(symmetry_correlation):.2f})"
+        if symmetry_offset is not None:
+            symmetry_label += f"; offset {float(symmetry_offset):+.2f} ms"
+        figure.add_vline(
+            x=float(symmetry_axis),
+            line={"color": "#94a3b8", "width": 1.2, "dash": "dot"},
+            annotation_text=symmetry_label,
+            annotation_position="top right",
         )
     figure.update_layout(
         title="Delay robustness (lower f is better)",
@@ -800,7 +817,19 @@ def _ranking_table(
     columns = [
         (score_key, "Score (dB)", "number"),
         ("pair", "Pair", "text"),
+        ("verdict_status", "Verdict", "number"),
+        ("gate_reasons", "Gate reasons", "text"),
+        ("redundancy_residual", "A residual", "number"),
+        ("ripple_correlation", "B ripple r", "number"),
+        ("physical_percentile", "C physical (%)", "number"),
+        ("gate_d_deficit", "D deficit (dB)", "number"),
+        ("comb_index", "E comb", "number"),
+        ("notch_count", "F notches", "number"),
+        ("gain_asymmetry_db", "G gain (dB)", "number"),
+        ("band_edge_spread_db", "H edge (dB)", "number"),
+        ("localization_pct", "I local (%)", "number"),
         ("fragility", "Fragility (dB)", "number"),
+        ("basin_scaled", "Basin adaptive (ms)", "number"),
         ("basin_w03", "Basin +0.3 (ms)", "number"),
         ("worst_case_1", "Worst f +/-1 ms (dB)", "number"),
         ("geometric_pass", "Basin vs geometry", "number"),
@@ -825,7 +854,18 @@ def _ranking_table(
     )
     metric_directions = {
         score_key: "high",
+        "verdict_status": "low",
+        "redundancy_residual": "high",
+        "ripple_correlation": "low",
+        "physical_percentile": "low",
+        "gate_d_deficit": "high",
+        "comb_index": "low",
+        "notch_count": "low",
+        "gain_asymmetry_db": "low",
+        "band_edge_spread_db": "low",
+        "localization_pct": "low",
         "fragility": "low",
+        "basin_scaled": "high",
         "basin_w03": "high",
         "worst_case_1": "low",
         "geometric_pass": "high",
@@ -837,9 +877,28 @@ def _ranking_table(
         spl_key: "high",
     }
 
+    verdict_rank = {"accept": 0.0, "caution": 1.0, "reject": 2.0}
+    gate_labels = {
+        "gate_a_redundancy": "A",
+        "gate_b_ripple_correlation": "B",
+        "gate_c_physical_percentile": "C",
+        "basin_geometry": "Basin",
+        "gate_d_cancellation_deficit": "D",
+        "gate_e_comb_signature": "E",
+        "gate_f_residual_notches": "F",
+        "gate_g_gain_asymmetry": "G",
+        "gate_h_band_edge_stability": "H",
+        "gate_i_improvement_localization": "I",
+    }
+
     def physical_status(pair: dict[str, Any]) -> tuple[str, str, float | None]:
         """Display text, best-first sort rank, and colour rank for physical status."""
 
+        if not pair.get("optimized", True):
+            gate_c = pair.get("gates", {}).get("gate_c_physical_percentile", {})
+            if gate_c.get("status") == "reject" and gate_c.get("physical_tau_ms") is not None:
+                return "INVALID", "3", 3.0
+            return "N/A", "1", None
         if not pair.get("pair_valid", True):
             return "INVALID", "3", 3.0
         if pair.get("physical_tau") is None:
@@ -853,10 +912,21 @@ def _ranking_table(
     def metric_value(pair: dict[str, Any], key: str) -> float | None:
         if key == tail_key:
             return tail_display[id(pair)][0]
+        if key == "verdict_status":
+            return verdict_rank.get(str(pair.get("verdict", "reject")))
         if key == "worst_case_1":
             value = pair.get("worst_case", {}).get("1.0")
+        elif key == "gate_d_deficit":
+            value = pair.get("cancellation_deficit_db")
+            if value is None:
+                value = pair.get("physical_cancellation_deficit_db")
+        elif key == "localization_pct":
+            fraction = pair.get("improvement_localization_fraction")
+            value = 100.0 * float(fraction) if fraction is not None else None
         elif key == "geometric_pass":
-            value = 1.0 if pair.get("geometric_pass") else 0.0
+            value = (
+                1.0 if pair.get("geometric_pass") else 0.0
+            ) if pair.get("optimized", True) else None
         elif key == "physical_status":
             return physical_status(pair)[2]
         else:
@@ -868,6 +938,7 @@ def _ranking_table(
     # Status columns use fixed ranges so an all-FAIL table cannot make FAIL
     # look green merely because it is the best value currently visible.
     fixed_metric_ranges = {
+        "verdict_status": (0.0, 2.0),
         "geometric_pass": (0.0, 1.0),
         "physical_status": (0.0, 3.0),
     }
@@ -903,52 +974,79 @@ def _ranking_table(
         key_value = f"{int(pair['first'])}-{int(pair['second'])}"
         tail_value, tail_unit = tail_display[id(pair)]
         physical_text, physical_sort_value, _ = physical_status(pair)
+        verdict = str(pair.get("verdict", "reject"))
+        reason_text = ", ".join(
+            f"{gate_labels.get(str(reason.get('gate')), str(reason.get('gate')))} "
+            f"{str(reason.get('status', '')).upper()}"
+            for reason in pair.get("reasons", [])
+        ) or "none"
         tail_display_text = (
             (f"{tail_value:+.1f} dB" if tail_unit == "dB" else f"{tail_value:.1f} ms")
             if tail_value is not None
             else "—"
         )
 
+        def number_value(
+            key: str,
+            format_spec: str,
+            *,
+            suffix: str = "",
+        ) -> tuple[str, str]:
+            value = metric_value(pair, key)
+            if value is None:
+                return "—", ""
+            return f"{value:{format_spec}}{suffix}", str(value)
+
         values: dict[str, tuple[str, str]] = {
-            score_key: (f"{pair[score_key]:+.2f}", str(pair[score_key])),
+            score_key: number_value(score_key, "+.2f"),
             "pair": (
                 f"{pair['first']} + {pair['second']}",
                 f"{pair['first']:04d}-{pair['second']:04d}",
             ),
-            "fragility": (
-                f"{float(pair['fragility']):.2f}" if pair.get("fragility") is not None else "—",
-                str(pair.get("fragility", "")),
-            ),
-            "basin_w03": (
-                f"{float(pair['basin_w03']):.2f}" if pair.get("basin_w03") is not None else "—",
-                str(pair.get("basin_w03", "")),
-            ),
-            "worst_case_1": (
-                f"{float(pair['worst_case']['1.0']):.2f}"
-                if pair.get("worst_case", {}).get("1.0") is not None
-                else "—",
-                str(pair.get("worst_case", {}).get("1.0", "")),
-            ),
+            "verdict_status": (verdict.upper(), str(verdict_rank.get(verdict, 2.0))),
+            "gate_reasons": (reason_text, reason_text),
+            "redundancy_residual": number_value("redundancy_residual", ".3f"),
+            "ripple_correlation": number_value("ripple_correlation", "+.3f"),
+            "physical_percentile": number_value("physical_percentile", ".1f", suffix="%"),
+            "gate_d_deficit": number_value("gate_d_deficit", "+.2f"),
+            "comb_index": number_value("comb_index", ".3f"),
+            "notch_count": number_value("notch_count", ".0f"),
+            "gain_asymmetry_db": number_value("gain_asymmetry_db", ".2f"),
+            "band_edge_spread_db": number_value("band_edge_spread_db", ".2f"),
+            "localization_pct": number_value("localization_pct", ".1f", suffix="%"),
+            "fragility": number_value("fragility", ".2f"),
+            "basin_scaled": number_value("basin_scaled", ".2f"),
+            "basin_w03": number_value("basin_w03", ".2f"),
+            "worst_case_1": number_value("worst_case_1", ".2f"),
             "geometric_pass": (
-                "PASS" if pair.get("geometric_pass") else "FAIL",
-                "1" if pair.get("geometric_pass") else "0",
+                ("PASS" if pair.get("geometric_pass") else "FAIL")
+                if pair.get("optimized", True)
+                else "—",
+                ("1" if pair.get("geometric_pass") else "0")
+                if pair.get("optimized", True)
+                else "",
             ),
             "physical_status": (physical_text, physical_sort_value),
-            "polarity": ("+" if pair["polarity"] > 0 else "−", str(pair["polarity"])),
-            "delay_ms": (f"{pair['delay_ms']:+.3f}", str(pair["delay_ms"])),
-            "gain_db": (f"{pair['gain_db']:+.2f}", str(pair["gain_db"])),
-            headroom_key: (
-                f"{pair[headroom_key]:+.2f}",
-                str(pair[headroom_key]),
+            "polarity": (
+                ("+" if pair["polarity"] > 0 else "−")
+                if pair.get("polarity") is not None
+                else "—",
+                str(pair["polarity"]) if pair.get("polarity") is not None else "",
             ),
-            dip_key: (f"{pair[dip_key]:.3f}", str(pair[dip_key])),
-            excess_key: (f"{pair[excess_key]:.3f}", str(pair[excess_key])),
+            "delay_ms": (
+                f"{pair['delay_ms']:+.3f}" if pair.get("delay_ms") is not None else "—",
+                str(pair["delay_ms"]) if pair.get("delay_ms") is not None else "",
+            ),
+            "gain_db": (
+                f"{pair['gain_db']:+.2f}" if pair.get("gain_db") is not None else "—",
+                str(pair["gain_db"]) if pair.get("gain_db") is not None else "",
+            ),
+            headroom_key: number_value(headroom_key, "+.2f"),
+            dip_key: number_value(dip_key, ".3f"),
+            excess_key: number_value(excess_key, ".3f"),
             tail_key: (tail_display_text, "" if tail_value is None else str(tail_value)),
-            low_end_power_key: (
-                f"{pair[low_end_power_key]:+.2f}",
-                str(pair[low_end_power_key]),
-            ),
-            spl_key: (f"{pair[spl_key]:+.2f}", str(pair[spl_key])),
+            low_end_power_key: number_value(low_end_power_key, "+.2f"),
+            spl_key: number_value(spl_key, "+.2f"),
         }
         cells = []
         for key, _, _ in columns:
@@ -962,12 +1060,19 @@ def _ranking_table(
                 f'data-value="{html.escape(values[key][1])}"{style_attribute}>'
                 f'{html.escape(values[key][0])}</td>'
             )
-        checked = " checked" if key_value in selected_keys else ""
-        checkbox = (
-            '<td class="selection-cell"><input class="pair-select" type="checkbox" '
-            f'data-mode="{mode}" data-pair-key="{key_value}"{checked} '
-            f'aria-label="Show pair {pair["first"]}+{pair["second"]}"></td>'
-        )
+        if pair.get("optimized", True):
+            checked = " checked" if key_value in selected_keys else ""
+            checkbox = (
+                '<td class="selection-cell"><input class="pair-select" type="checkbox" '
+                f'data-mode="{mode}" data-pair-key="{key_value}"{checked} '
+                f'aria-label="Show pair {pair["first"]}+{pair["second"]}"></td>'
+            )
+        else:
+            checkbox = (
+                '<td class="selection-cell"><input class="pair-select" type="checkbox" '
+                f'data-mode="{mode}" data-pair-key="{key_value}" disabled '
+                f'aria-label="Pair {pair["first"]}+{pair["second"]} was not optimized"></td>'
+            )
         rows.append(
             f'<tr data-pair-key="{key_value}">{checkbox}{"".join(cells)}</tr>'
         )
@@ -1172,6 +1277,8 @@ def build_report(
         "post_eq_relative_low_end_power_db",
         "robustness",
         "fragility",
+        "basin_scaled",
+        "basin_threshold_db",
         "basin_w03",
         "worst_case",
         "geometric_pass",
@@ -1230,12 +1337,28 @@ def build_report(
         raise ReportError(
             "Search results predate basin robustness scoring; run 'subpair search' again"
         )
+    if int(results.get("format_version", 0)) < 25:
+        raise ReportError(
+            "Search results predate disqualifier gates; run 'subpair search' again"
+        )
+    required_pair_fields = {
+        "rank",
+        "eq_rank",
+        "optimized",
+        "verdict",
+        "reasons",
+        "gates",
+    }
     if any(
-        not required_ranking_fields.issubset(pair)
+        not required_pair_fields.issubset(pair)
+        or (
+            pair["optimized"]
+            and not required_ranking_fields.issubset(pair)
+        )
         for pair in results["pairs"]
     ):
         raise ReportError(
-            "Search results predate dual raw/EQ ranking; run 'subpair search' again"
+            "Search results contain incomplete gate/ranking data; run 'subpair search' again"
         )
     context = AnalysisContext(measurements, band, int(settings["ppo"]))
     mode = "raw" if raw else "eq"
@@ -1250,11 +1373,14 @@ def build_report(
     def pair_key(pair: dict[str, Any]) -> str:
         return f"{int(pair['first'])}-{int(pair['second'])}"
 
-    default_count = max(0, min(top, len(pairs)))
-    default_keys = {pair_key(pair) for pair in pairs[:default_count]}
-    initial_active_key = pair_key(pairs[0]) if default_count else None
+    optimized_pairs = [pair for pair in pairs if pair["optimized"]]
+    default_count = max(0, min(top, len(optimized_pairs)))
+    default_keys = {pair_key(pair) for pair in optimized_pairs[:default_count]}
+    initial_active_key = (
+        pair_key(optimized_pairs[0]) if default_count else None
+    )
     diagnostic_by_key: dict[str, dict[str, Any]] = {}
-    for pair in pairs:
+    for pair in optimized_pairs:
         diagnostic_by_key[pair_key(pair)] = pair_diagnostics(
             context,
             int(pair["first"]) - 1,
@@ -1268,7 +1394,9 @@ def build_report(
             score_dip_weight=score_dip_weight,
         )
 
-    overview = [(pair, diagnostic_by_key[pair_key(pair)]) for pair in pairs]
+    overview = [
+        (pair, diagnostic_by_key[pair_key(pair)]) for pair in optimized_pairs
+    ]
     magnitude_range, excess_range = _selected_axis_ranges(
         overview,
         raw=raw,
@@ -1305,7 +1433,7 @@ def build_report(
     )
     any_modal_tail = any(
         pair.get("effective_tail_is_modal") or pair.get("post_eq_effective_tail_is_modal")
-        for pair in pairs
+        for pair in optimized_pairs
     )
     tail_note = (
         "Tail is this pair's loudest detected room mode's level relative to "
@@ -1334,6 +1462,7 @@ def build_report(
     physical_delay_window_ms = float(
         robustness_settings.get("physical_delay_window_ms", 1.5)
     )
+    gate_thresholds = settings.get("gates", {}).get("thresholds", {})
     robustness_foundations_note = (
         "<strong>Delay-robustness basis.</strong> These are raw, pre-EQ diagnostics "
         "for the polarity and gain shown in the row. <strong>f(τ)</strong> is the "
@@ -1352,7 +1481,11 @@ def build_report(
         "optimum; lower is better. <strong>Basin +0.3</strong> is the width of the "
         "single contiguous delay interval containing τ* whose raw f stays within "
         "+0.3 dB of its minimum; disconnected good regions do not count, and wider "
-        "is better. <strong>Worst f ±1 ms</strong> is the largest raw f encountered "
+        "is better. <strong>Basin adaptive</strong> uses a degradation equal to "
+        f"{100.0 * float(gate_thresholds.get('basin_range_fraction', 0.05)):g}% "
+        "of that pair’s raw-f range inside its physical-delay window; this scaled "
+        "width drives the geometry gate while the fixed +0.3/+0.5 dB fields remain "
+        "unchanged for comparison. <strong>Worst f ±1 ms</strong> is the largest raw f encountered "
         "from τ* − 1 ms through τ* + 1 ms, including interpolated interval edges; "
         "lower is better. Competing minima, shown in each pair summary, counts "
         "distinct local minima within +0.3 dB of the best raw minimum."
@@ -1362,7 +1495,7 @@ def build_report(
         f"bound models up to {listener_movement_cm:g} cm of listener movement from "
         "configured source/listener coordinates; without complete coordinates it "
         "uses the conservative 2d/c bound. <strong>Basin vs geometry</strong> is "
-        "PASS when the +0.3 dB basin is at least as wide as that bound. "
+        "PASS when the adaptive basin is at least as wide as that bound. "
         "<strong>Physical</strong> compares τ* with the loopback-referenced arrival "
         "difference (first arrival − second arrival, because delay is applied to "
         f"sub 2): OK is within ±{physical_delay_window_ms:g} ms, OUT is outside, "
@@ -1373,8 +1506,10 @@ def build_report(
         "<strong>Robustness graph.</strong> The blue curve is raw f(τ), the purple "
         "curve is jitter-averaged f_robust(τ), the yellow diamond is τ*, and the "
         "green circle is the reported robust delay. The green band is the contiguous "
-        "+0.3 dB basin; the dashed red line is the arrival-derived physical delay "
-        "when available. Lower curves and a broad, shallow basin are preferable. "
+        "adaptive basin; the dashed red line is the arrival-derived physical delay, "
+        "and the dotted grey line is the best-fit mirror axis after removing the "
+        "broad f(τ) envelope. Mirror correlation and axis offset are visual timing/"
+        "redundancy diagnostics only, never a gate. Lower curves and a broad, shallow basin are preferable. "
         "Several similarly deep valleys indicate competing alignment solutions. "
         "Hover the curves and markers for exact delay/objective values."
     )
@@ -1383,12 +1518,74 @@ def build_report(
         "in this report: green with an inset outline is best and red is worst. "
         "Fragility, Worst f, residual dip, excess GD, and Tail prefer lower values; "
         "Score, Basin width, low-end power, and Relative SPL prefer higher values. "
+        "For the gate columns, A residual and D deficit prefer higher values, while "
+        "B correlation, C percentile, E comb, F notch count, G gain offset, H edge "
+        "spread, and I localisation prefer lower values. "
         "PASS/OK use fixed categorical scales so a table full of failures cannot "
         "appear green; unavailable values remain grey. Click any heading to sort "
         "ascending, then click it again for descending order."
     )
+    gate_pipeline_note = (
+        "<strong>Verdict pipeline.</strong> ACCEPT means every evaluated gate passed; "
+        "CAUTION means no hard rejection but at least one caution; REJECT means one "
+        "or more hard failures. A/B run before the delay optimiser, followed by the "
+        "cheap physical-delay C screen. A hard failure there stops optimisation, "
+        "but the row and its measured reasons remain visible. Basin and D–I run on "
+        "the chosen configuration. Verdict sorts before score."
+    )
+    gate_ab_note = (
+        "<strong>A — redundancy residual.</strong> Fits measurement B as a complex "
+        "scale and delay of A over the scoring band. Lower means the placements carry "
+        "less independent spatial information; reject below "
+        f"{float(gate_thresholds.get('redundancy_reject', 0.50)):g}, caution below "
+        f"{float(gate_thresholds.get('redundancy_caution', 0.60)):g}. "
+        "<strong>B — ripple correlation.</strong> Correlates each solo magnitude "
+        "after subtracting its one-octave trend. Positive correlation means their "
+        "errors reinforce; reject above "
+        f"{float(gate_thresholds.get('ripple_correlation_reject', 0.30)):g}. "
+        f"Values below {float(gate_thresholds.get('ripple_complementary', -0.10)):g} "
+        "are labelled complementary but do not improve rank."
+    )
+    gate_cd_note = (
+        "<strong>C — physical-delay percentile.</strong> Scores the normal-polarity, "
+        "equal-gain sum at the header-derived arrival alignment and locates it in that "
+        "pair’s delay landscape; reject above the "
+        f"{float(gate_thresholds.get('physical_percentile_reject', 75.0)):g}th "
+        "percentile. The absolute f(physical τ) − f(τ*) gap is also reported. "
+        "<strong>D — cancellation deficit.</strong> Coherent mean level minus the "
+        "matching incoherent power sum is evaluated at physical and chosen delay; "
+        "negative values mean flatness was bought by cancellation. Reject below "
+        f"{float(gate_thresholds.get('cancellation_deficit_reject_db', -3.0)):g} dB "
+        "and caution below "
+        f"{float(gate_thresholds.get('cancellation_deficit_caution_db', -1.0)):g} dB."
+    )
+    gate_ef_note = (
+        "<strong>E — comb signature.</strong> Detrends the chosen sum on a uniform "
+        "linear-frequency grid and measures normalized autocorrelation at 1/|τ| and "
+        "its harmonics; larger values are more comb-like. Caution/reject thresholds "
+        f"are {float(gate_thresholds.get('comb_index_caution', 0.40)):g}/"
+        f"{float(gate_thresholds.get('comb_index_reject', 0.65)):g}. "
+        "<strong>F — residual notches.</strong> Rejects a local null deeper than "
+        f"{float(gate_thresholds.get('notch_depth_reject_db', 8.0)):g} dB below its "
+        "one-octave trend when its −3 dB width is no more than "
+        f"{float(gate_thresholds.get('notch_max_width_octaves', 1.0 / 6.0)):g} octave."
+    )
+    gate_ghi_note = (
+        "<strong>G — gain asymmetry.</strong> Cautions when the chosen offset exceeds "
+        f"{float(gate_thresholds.get('gain_asymmetry_caution_db', 4.0)):g} dB; the "
+        "report records boundary/headroom information, while actual hardware limits "
+        "remain unknown without amplifier/driver data. <strong>H — band-edge "
+        "stability.</strong> Shifts the whole scoring window down and up by 1/6 octave "
+        "and rejects a score spread above "
+        f"{float(gate_thresholds.get('band_edge_spread_reject_db', 2.0)):g} dB. "
+        "<strong>I — improvement localisation.</strong> Compares detrended ripple "
+        "against the physical-alignment response and reports the largest share of "
+        "all positive improvement concentrated in a sliding 1/6-octave region, "
+        "alongside the total score change; reject above "
+        f"{100.0 * float(gate_thresholds.get('localization_fraction_reject', 0.5)):g}%."
+    )
     detail_sections = []
-    for pair in pairs:
+    for pair in optimized_pairs:
         key = pair_key(pair)
         data = diagnostic_by_key[key]
         pair_magnitude_range, pair_excess_range = _diagnostic_axis_ranges(data, raw=raw)
@@ -1453,11 +1650,48 @@ def build_report(
             f"f(tau*) {pair['f_tau_star']:.2f} dB · "
             f"f_robust(tau_robust) {pair['f_robust_tau_robust']:.2f} dB · "
             f"fragility {pair['fragility']:.2f} dB · +0.3 dB basin {pair['basin_w03']:.2f} ms · "
+            f"adaptive +{pair['basin_threshold_db']:.2f} dB basin "
+            f"{pair['basin_scaled']:.2f} ms · "
             f"worst f (+/-1 ms) {pair['worst_case']['1.0']:.2f} dB · "
             f"{pair['n_competing']} competing minima · "
             f"physical tau {physical_text} · geometric excursion "
             f"{robustness['delta_tau_max_ms']:.2f} ms ({geometry_text}) · "
             f"basin {'PASS' if pair['geometric_pass'] else 'FAIL'}{physical_warning}"
+        )
+        gate_rows = []
+        gate_names = {
+            "gate_a_redundancy": "A · redundancy residual",
+            "gate_b_ripple_correlation": "B · ripple correlation",
+            "gate_c_physical_percentile": "C · physical-delay percentile",
+            "basin_geometry": "Basin vs geometry",
+            "gate_d_cancellation_deficit": "D · cancellation deficit",
+            "gate_e_comb_signature": "E · comb signature",
+            "gate_f_residual_notches": "F · residual notches",
+            "gate_g_gain_asymmetry": "G · gain asymmetry",
+            "gate_h_band_edge_stability": "H · band-edge stability",
+            "gate_i_improvement_localization": "I · improvement localisation",
+        }
+        for gate_key, gate_name in gate_names.items():
+            gate = pair["gates"][gate_key]
+            measured = {
+                key: value
+                for key, value in gate.items()
+                if key not in {"status", "stage", "offenders"}
+            }
+            measured_text = html.escape(
+                json.dumps(measured, sort_keys=True, separators=(", ", ": "))
+            )
+            status = str(gate.get("status", "not_run"))
+            gate_rows.append(
+                f'<li class="gate-{html.escape(status)}"><strong>{html.escape(gate_name)}: '
+                f'{html.escape(status.upper())}</strong><br><span>{measured_text}</span></li>'
+            )
+        gate_sheet_html = (
+            f'<div class="gate-sheet"><h3>Verdict: {html.escape(pair["verdict"].upper())}</h3>'
+            '<p class="note">A clean sheet is not validation; these are single-position '
+            'disqualifiers only.</p><ul>'
+            + "".join(gate_rows)
+            + "</ul></div>"
         )
         peq_html = ""
         if not raw:
@@ -1501,12 +1735,13 @@ def build_report(
             <section class="{detail_class}" data-pair-key="{key}"
               data-pair-label="{pair['first']}+{pair['second']}"
               data-rank="{pair[rank_key]}"{axis_attributes}>
-              <h2>{mode_label} score {pair[score_key]:+.2f} dB:
+              <h2>{html.escape(pair['verdict'].upper())} · {mode_label} score {pair[score_key]:+.2f} dB:
                 {html.escape(pair['first_name'])} + {html.escape(pair['second_name'])}</h2>
               <p class="configuration">Sub 2: {'normal' if pair['polarity'] > 0 else 'inverted'},
                 robust delay {pair['delay_ms']:+.3f} ms, gain {pair['gain_db']:+.2f} dB,
                 headroom {pair['post_eq_headroom_db' if not raw else 'headroom_db']:+.2f} dB<br>
                 {metric_summary}<br>{robustness_summary}</p>
+              {gate_sheet_html}
               {_plot_html(_robustness_figure(pair), f'robustness-{key}')}
               {_plot_html(
                   _magnitude_figure(pair, data, raw=raw, y_range=magnitude_range, room_modes=room_modes),
@@ -1528,7 +1763,7 @@ def build_report(
         )
 
     default_json = json.dumps(
-        [pair_key(pair) for pair in pairs[:default_count]], separators=(",", ":")
+        [pair_key(pair) for pair in optimized_pairs[:default_count]], separators=(",", ":")
     )
     copy_peq_script = "" if raw else """
 function copyPeq(button) {
@@ -1542,7 +1777,7 @@ function copyPeq(button) {
     if modal_signature and modal_signature.get("valid"):
         modal_rows = [
             (pair, pair["modal"])
-            for pair in pairs
+            for pair in optimized_pairs
             if pair.get("modal", {}).get("valid") and pair["modal"].get("modes")
         ]
         pole_map_html = (
@@ -1605,7 +1840,7 @@ h1 {{ font-size:2.2rem; margin:0 0 4px; }} h2 {{ margin-top:0; }}
 .table-wrap {{ overflow:auto; border:1px solid var(--line); border-radius:12px; background:var(--card); }}
 table {{ width:100%; border-collapse:collapse; white-space:nowrap; }}
 th,td {{ padding:10px 13px; text-align:right; border-bottom:1px solid var(--line); }}
-th:nth-child(3),td:nth-child(3) {{ text-align:left; }}
+th:nth-child(3),td:nth-child(3),th:nth-child(5),td:nth-child(5) {{ text-align:left; }}
 th {{ position:sticky; top:0; cursor:pointer; background:#142238; color:#c9d8eb; }}
 th:hover {{ background:#1b2d48; }} tbody tr:hover {{ background:#132238; }}
 .selection-heading,.selection-cell {{ text-align:center; }}
@@ -1616,6 +1851,15 @@ th:hover {{ background:#1b2d48; }} tbody tr:hover {{ background:#132238; }}
 .peq {{ position:relative; padding:16px; background:#091322; border-radius:9px; }}
 .peq h3 {{ margin:0 0 10px; }} .peq pre {{ margin:0; white-space:pre-wrap; color:#a7f3d0; }}
 .peq button {{ position:absolute; right:14px; top:14px; border:1px solid #49607e; border-radius:6px; padding:6px 11px; color:var(--text); background:#1c2d47; cursor:pointer; }}
+.gate-sheet {{ margin:16px 0; padding:16px; background:#091322; border-radius:9px; }}
+.gate-sheet h3 {{ margin:0; }}
+.gate-sheet ul {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:8px; padding:0; list-style:none; }}
+.gate-sheet li {{ padding:10px; border:1px solid var(--line); border-left-width:4px; border-radius:7px; overflow-wrap:anywhere; }}
+.gate-sheet li span {{ color:var(--muted); font-size:.86rem; }}
+.gate-pass {{ border-left-color:#22c55e !important; }}
+.gate-caution {{ border-left-color:#f59e0b !important; }}
+.gate-reject {{ border-left-color:#ef4444 !important; }}
+.gate-not_run {{ border-left-color:#64748b !important; }}
 .modal-block {{ margin-top:18px; padding:16px; background:#091322; border-radius:9px; }}
 .modal-block h3 {{ margin:0 0 10px; }}
 .modal-section .table-wrap {{ margin-top:12px; }}
@@ -1650,7 +1894,7 @@ details {{ margin:22px 0; }} details pre {{ overflow:auto; color:var(--muted); }
     )}
   </div>
 </div>
-<p class="note">Score: higher is better, and 0 dB marks the highest numeric score. Arrival-delay outliers and non-physical raw optima are placed after eligible pairs without changing their displayed score. Click a heading to sort; colored metric cells run green (best) to red (worst), while unavailable values are grey.</p>
+<p class="note">Verdict is primary: ACCEPT rows sort before CAUTION, and REJECT rows always sort last regardless of score. Early A/B/C rejects stay visible but are intentionally not optimized. Score remains unchanged and 0 dB marks the highest numeric score among optimized pairs. Click a heading to sort; colored metric cells run green (best) to red (worst), while unavailable values are grey.</p>
 <div class="table-controls">
   <button type="button" onclick="selectTopN(0)">Clear</button>
   <button type="button" onclick="selectTopN(3)">Top 3</button>
@@ -1659,7 +1903,7 @@ details {{ margin:22px 0; }} details pre {{ overflow:auto; color:var(--muted); }
 <div class="table-wrap">{_ranking_table(pairs, mode, f'ranking-{mode}', default_keys, show_headroom=eq_possible)}</div>
 <div class="pair-tabs" data-pair-tabs role="tablist" aria-label="Selected {mode_label} pairs"></div>
 <div id="pair-details">{''.join(detail_sections)}</div>
-<details><summary>{'Score, metric &amp; EQ notes' if eq_possible else 'Score &amp; metric notes'}</summary><div class="glossary">
+<details><summary>Score &amp; metric notes</summary><div class="glossary">
 <p>{score_formula_note}</p>
 <p>{headroom_note}</p>
 <p>Low-end power weights the broad response through 100 Hz by the amplifier/excursion cost of producing pressure at each frequency (+12.04 dB per octave downward). Excess GD and tail remain diagnostics; they do not alter Score.</p>
@@ -1669,6 +1913,11 @@ details {{ margin:22px 0; }} details pre {{ overflow:auto; color:var(--muted); }
 <p>{robustness_status_note}</p>
 <p>{robustness_graph_note}</p>
 <p>{table_colour_note}</p>
+<p>{gate_pipeline_note}</p>
+<p>{gate_ab_note}</p>
+<p>{gate_cd_note}</p>
+<p>{gate_ef_note}</p>
+<p>{gate_ghi_note}</p>
 <p>Delay fragility is a disqualifier, not a certificate. A narrow basin proves the timing solution cannot survive the configured listener excursion. A wide basin only shows timing tolerance: it does not model how each sub’s magnitude response changes as the microphone moves through the modal pressure field. Validate a listening area with multi-position measurements.</p>
 {f'<p>{eq_notes}</p>' if eq_notes else ''}
 <p>CSD overlay (in each pair's excess-GD and decay charts): excess GD with common delay removed; a vertical line is frequency-independent delay.</p>
@@ -1688,6 +1937,8 @@ document.querySelectorAll('.ranking-table th[data-type]').forEach(th=>{{
     th.dataset.order=ascending?'asc':'desc';
     rows.sort((a,b)=>{{
       let av=a.children[index].dataset.value, bv=b.children[index].dataset.value;
+      const aMissing=av==='', bMissing=bv==='';
+      if(aMissing||bMissing) return aMissing===bMissing?0:(aMissing?1:-1);
       if(th.dataset.type==='number') {{ av=Number(av); bv=Number(bv); }}
       return (av<bv?-1:av>bv?1:0)*(ascending?1:-1);
     }});
@@ -1803,11 +2054,12 @@ function selectTopN(n) {{
   const table=document.getElementById('ranking-'+reportMode);
   const rows=Array.from(table.querySelectorAll('tbody tr'));
   selectedPairs.clear();
-  rows.forEach((row,index)=>{{
+  let selectedCount=0;
+  rows.forEach(row=>{{
     const checkbox=row.querySelector('.pair-select');
-    const select=index<n;
+    const select=!checkbox.disabled&&selectedCount<n;
     checkbox.checked=select;
-    if(select) selectedPairs.add(row.dataset.pairKey);
+    if(select) {{ selectedPairs.add(row.dataset.pairKey); selectedCount+=1; }}
   }});
   renderPairTabs();
   updateOverview();

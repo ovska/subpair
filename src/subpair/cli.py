@@ -11,7 +11,7 @@ from typing import Sequence
 
 from .api import RewApiError, RewClient
 from .cache import CacheError, write_cache
-from .engine import SearchOptions, run_search
+from .engine import GateThresholds, SearchOptions, run_search
 from .html_report import ReportError, build_report
 from .verification import VerificationError, run_verification
 
@@ -191,6 +191,7 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="MS",
         help="search window around measured relative arrival delay (default: 1.5 ms)",
     )
+    _add_gate_arguments(search)
     search.add_argument(
         "--gain-range",
         nargs=3,
@@ -356,6 +357,39 @@ def _add_shelf_arguments(subparser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_gate_arguments(subparser: argparse.ArgumentParser) -> None:
+    """Expose every verdict threshold while keeping defaults in GateThresholds."""
+
+    defaults = GateThresholds()
+    group = subparser.add_argument_group("disqualifier gates")
+    specifications = (
+        ("--gate-redundancy-reject", "gate_redundancy_reject", defaults.redundancy_reject),
+        ("--gate-redundancy-caution", "gate_redundancy_caution", defaults.redundancy_caution),
+        ("--gate-ripple-reject", "gate_ripple_reject", defaults.ripple_correlation_reject),
+        ("--gate-ripple-complementary", "gate_ripple_complementary", defaults.ripple_complementary),
+        ("--gate-physical-percentile", "gate_physical_percentile", defaults.physical_percentile_reject),
+        ("--gate-cancellation-reject", "gate_cancellation_reject", defaults.cancellation_deficit_reject_db),
+        ("--gate-cancellation-caution", "gate_cancellation_caution", defaults.cancellation_deficit_caution_db),
+        ("--gate-comb-reject", "gate_comb_reject", defaults.comb_index_reject),
+        ("--gate-comb-caution", "gate_comb_caution", defaults.comb_index_caution),
+        ("--gate-notch-depth", "gate_notch_depth", defaults.notch_depth_reject_db),
+        ("--gate-notch-width", "gate_notch_width", defaults.notch_max_width_octaves),
+        ("--gate-gain-asymmetry", "gate_gain_asymmetry", defaults.gain_asymmetry_caution_db),
+        ("--gate-band-edge-spread", "gate_band_edge_spread", defaults.band_edge_spread_reject_db),
+        ("--gate-localization-fraction", "gate_localization_fraction", defaults.localization_fraction_reject),
+        ("--gate-basin-range-fraction", "gate_basin_range_fraction", defaults.basin_range_fraction),
+    )
+    for flag, destination, default in specifications:
+        group.add_argument(
+            flag,
+            dest=destination,
+            type=float,
+            default=default,
+            metavar="VALUE",
+            help=f"default: {default:g}",
+        )
+
+
 def _fetch(args: argparse.Namespace) -> int:
     client = RewClient(args.url, timeout=args.timeout)
     routes = client.discover()
@@ -449,12 +483,26 @@ def _print_ranking(result: dict, top: int) -> None:
         label = "EQ'd" if eq else "Raw"
         print(f"\n{label} ranking")
         print(
-            "Score dB  Pair     Pol  Robust ms    Raw* ms  Gain dB  Frag dB  Basin03  "
+            "Verdict  Score dB  Pair     Pol  Robust ms    Raw* ms  Gain dB  Frag dB  Basin03  "
             "Worst1 f  Geo  Phys  Headroom  Dip dB  Excess ms  Excess95 ms  Peak ms  "
-            "    Tail  LE power  Rel SPL"
+            "    Tail  LE power  Rel SPL  A-res  B-corr  C-pct  D-def"
         )
         for row in rows[:top]:
             pair = f"{row['first']}+{row['second']}"
+            verdict = str(row.get("verdict", "accept")).upper()
+            if not row.get("optimized", True):
+                def optional(value: object, digits: int = 2) -> str:
+                    return "—" if value is None else f"{float(value):.{digits}f}"
+
+                print(
+                    f"{verdict:<7}  {'—':>8}  {pair:<7}  "
+                    f"{'not optimized after gate rejection':<105}  "
+                    f"{optional(row.get('redundancy_residual'), 3):>5}  "
+                    f"{optional(row.get('ripple_correlation'), 3):>6}  "
+                    f"{optional(row.get('physical_percentile'), 1):>5}  "
+                    f"{optional(row.get('physical_cancellation_deficit_db')):>5}"
+                )
+                continue
             polarity = "+" if row["polarity"] > 0 else "-"
             physical_status = (
                 "N/A"
@@ -462,6 +510,7 @@ def _print_ranking(result: dict, top: int) -> None:
                 else ("OUT" if row["non_physical_solution"] else "OK")
             )
             print(
+                f"{verdict:<7}  "
                 f"{row['post_eq_relative_score_db' if eq else 'relative_score_db']:>+8.2f}  "
                 f"{pair:<7}  {polarity:>3}  "
                 f"{row['delay_ms']:>+9.3f}  {row['tau_star']:>+9.3f}  "
@@ -477,7 +526,11 @@ def _print_ranking(result: dict, top: int) -> None:
                 f"{row['post_eq_excess_gd_peak_ms' if eq else 'excess_gd_peak_ms']:>7.3f}  "
                 f"{_format_tail(row, eq):>8}  "
                 f"{row['post_eq_relative_low_end_power_db' if eq else 'relative_low_end_power_db']:>+8.2f}  "
-                f"{row['post_eq_relative_spl_db' if eq else 'relative_spl_db']:>+7.2f}"
+                f"{row['post_eq_relative_spl_db' if eq else 'relative_spl_db']:>+7.2f}  "
+                f"{row['redundancy_residual']:>5.3f}  "
+                f"{row['ripple_correlation']:>+6.3f}  "
+                f"{row['physical_percentile'] if row['physical_percentile'] is not None else math.nan:>5.1f}  "
+                f"{row['cancellation_deficit_db']:>+5.2f}"
             )
 
     print_mode(result["pairs"], eq=False)
@@ -515,10 +568,27 @@ def _search(args: argparse.Namespace) -> int:
         listener_movement_m=args.listener_movement,
         speed_of_sound_m_per_s=args.speed_of_sound,
         physical_delay_window_ms=args.physical_delay_window,
+        gate_thresholds=GateThresholds(
+            redundancy_reject=args.gate_redundancy_reject,
+            redundancy_caution=args.gate_redundancy_caution,
+            ripple_correlation_reject=args.gate_ripple_reject,
+            ripple_complementary=args.gate_ripple_complementary,
+            physical_percentile_reject=args.gate_physical_percentile,
+            cancellation_deficit_reject_db=args.gate_cancellation_reject,
+            cancellation_deficit_caution_db=args.gate_cancellation_caution,
+            comb_index_reject=args.gate_comb_reject,
+            comb_index_caution=args.gate_comb_caution,
+            notch_depth_reject_db=args.gate_notch_depth,
+            notch_max_width_octaves=args.gate_notch_width,
+            gain_asymmetry_caution_db=args.gate_gain_asymmetry,
+            band_edge_spread_reject_db=args.gate_band_edge_spread,
+            localization_fraction_reject=args.gate_localization_fraction,
+            basin_range_fraction=args.gate_basin_range_fraction,
+        ),
     )
 
     def progress(done: int, total: int, pair: str) -> None:
-        print(f"\rScored pair {done}/{total} ({pair})", end="", flush=True)
+        print(f"\rEvaluated pair {done}/{total} ({pair})", end="", flush=True)
 
     result = run_search(args.cache, output, options, progress=progress)
     print()

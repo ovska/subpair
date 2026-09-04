@@ -72,6 +72,10 @@ def run_verification(
     if len(matches) != 1:
         raise VerificationError(f"Rank {rank} is not present in {results_path}")
     pair = matches[0]
+    if not pair.get("optimized", True):
+        raise VerificationError(
+            f"Rank {rank} was rejected before optimization and has no configuration to verify"
+        )
     band = band_override or tuple(float(v) for v in results["settings"]["band_hz"])
     context = AnalysisContext(cached, band, int(results["settings"]["ppo"]))
 

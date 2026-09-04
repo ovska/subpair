@@ -123,10 +123,14 @@ the real logic. Data flows strictly one-way through `.subpair-cache/`:
      instead of an average.
 
 4. **`engine.py` (`run_search`)** — enumerates every measurement pair and,
-   for each, exhaustively grid-searches polarity × delay × gain (vectorised
-   NumPy) to form the bounded high-score/low-dip shortlist, then runs the
-   expensive per-finalist diagnostics (`dsp.pair_diagnostics`) and selects by
-   post-EQ usable-output score. Writes `search-results.json`
+   first runs the A/B redundancy and ripple screens plus the C physical-delay
+   percentile screen. Hard failures remain in output with structured reasons
+   but skip the expensive optimiser. Surviving pairs exhaustively grid-search
+   polarity × delay × gain (vectorised NumPy) to form the bounded
+   high-score/low-dip shortlist, run the expensive per-finalist diagnostics
+   (`dsp.pair_diagnostics`), then apply the scaled-basin and D–I post-search
+   disqualifiers. Verdict sorts before score and every configured threshold is
+   serialized under `settings.gates`. Writes `search-results.json`
    (`format_version` is bumped whenever the result schema changes — keep
    `verification.py`/`html_report.py` in sync with it). When
    `SearchOptions.modal` is set, also computes `modal.estimate_room_poles`
