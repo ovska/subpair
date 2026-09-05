@@ -142,7 +142,12 @@ The pair JSON and comparison table include:
 - `fragility`: `f_robust(tau_star) - f(tau_star)` in dB;
 - `basin_w03` and `basin_w05`: the contiguous basin containing `tau_star`,
   not the total duration of every disconnected near-optimal region;
-- `worst_case` at 0.5, 1.0, and 1.5 ms around `tau_star`;
+- `worst_case_penalty` at +/-0.5, 1.0, and 1.5 ms around the **recommended**
+  delay, as a degradation in dB above the objective there rather than an
+  absolute objective value: an absolute figure mostly restates how well the
+  pair scores, so comparing pairs measures their quality rather than their
+  robustness, and centring on `tau_star` describes a delay the pair does not
+  propose;
 - `n_competing`: local minima within 0.3 dB of the raw global minimum; and
 - `excursion_penalty_db`: the worst degradation of `f` anywhere within
   `+/-delta_tau_max/2` of the **recommended** delay, with

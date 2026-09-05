@@ -604,7 +604,7 @@ class EngineIntegrationTests(unittest.TestCase):
                     gate_thresholds=_permissive_gates(),
                 ),
             )
-            self.assertEqual(result["format_version"], 26)
+            self.assertEqual(result["format_version"], 27)
             signature = result["modal_signature"]
             self.assertIsNotNone(signature)
             self.assertTrue(signature["valid"])

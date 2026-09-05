@@ -870,9 +870,12 @@ COLUMN_HELP = {
         "regions do not count. A fixed-threshold diagnostic; the gate uses the "
         "excursion penalty instead. Wider is better."
     ),
-    "worst_case_1": (
-        "Largest raw objective encountered from tau* - 1 ms through tau* + 1 ms, "
-        "including interpolated interval edges. Lower is better."
+    "worst_case_penalty_1": (
+        "Worst degradation of the objective anywhere within +/-1 ms of the "
+        "recommended delay, including interpolated interval edges. Same measure "
+        "as the excursion penalty but at a fixed +/-1 ms instead of the "
+        "geometry-derived window, so it is comparable across pairs whatever "
+        "listener movement is configured. Lower is better."
     ),
     "geometric_pass": (
         "PASS when the excursion penalty stays within the basin tolerance for the "
@@ -1125,7 +1128,7 @@ def _ranking_table(
         ("fragility", "Fragility (dB)", "number"),
         ("excursion_penalty_db", "Excursion penalty (dB)", "number"),
         ("basin_w03", "Basin +0.3 (ms)", "number"),
-        ("worst_case_1", "Worst f +/-1 ms (dB)", "number"),
+        ("worst_case_penalty_1", "Worst penalty +/-1 ms (dB)", "number"),
         ("geometric_pass", "Basin vs geometry", "number"),
         ("physical_status", "Physical", "number"),
         ("polarity", "Pol 2", "number"),
@@ -1181,7 +1184,7 @@ def _ranking_table(
         "fragility": "low",
         "excursion_penalty_db": "low",
         "basin_w03": "high",
-        "worst_case_1": "low",
+        "worst_case_penalty_1": "low",
         "geometric_pass": "high",
         "physical_status": "low",
         dip_key: "low",
@@ -1221,8 +1224,8 @@ def _ranking_table(
             return tail_display[id(pair)][0]
         if key == "verdict_status":
             return verdict_rank.get(str(pair.get("verdict", "reject")))
-        if key == "worst_case_1":
-            value = pair.get("worst_case", {}).get("1.0")
+        if key == "worst_case_penalty_1":
+            value = pair.get("worst_case_penalty", {}).get("1.0")
         elif key == "gate_d_deficit":
             value = pair.get("cancellation_deficit_db")
             if value is None:
@@ -1337,7 +1340,7 @@ def _ranking_table(
             "fragility": number_value("fragility", ".2f"),
             "excursion_penalty_db": number_value("excursion_penalty_db", ".2f"),
             "basin_w03": number_value("basin_w03", ".2f"),
-            "worst_case_1": number_value("worst_case_1", ".2f"),
+            "worst_case_penalty_1": number_value("worst_case_penalty_1", ".2f"),
             "geometric_pass": (
                 ("PASS" if pair.get("geometric_pass") else "FAIL")
                 if pair.get("optimized", True)
@@ -1609,7 +1612,7 @@ def build_report(
         "excursion_half_width_ms",
         "excursion_penalty_db",
         "basin_w03",
-        "worst_case",
+        "worst_case_penalty",
         "geometric_pass",
     }
     if int(results.get("format_version", 0)) < 6:
@@ -1817,9 +1820,10 @@ def build_report(
         "absolute dB figure on purpose — a tolerance scaled to each pair’s own "
         "objective range normalises away the delay-insensitivity the gate is "
         "testing for, and can fail a pair whose score barely moves with delay at "
-        "all. <strong>Worst f ±1 ms</strong> is the largest raw f encountered "
-        "from τ* − 1 ms through τ* + 1 ms, including interpolated interval edges; "
-        "lower is better. Competing minima, shown in each pair summary, counts "
+        "all. <strong>Worst penalty ±1 ms</strong> is the same degradation "
+        "measured over a fixed ±1 ms around the recommended delay rather than "
+        "the geometry-derived window, so it stays comparable across pairs "
+        "whatever listener movement is configured; lower is better. Competing minima, shown in each pair summary, counts "
         "distinct local minima within +0.3 dB of the best raw minimum."
     )
     robustness_status_note = (
@@ -1848,7 +1852,7 @@ def build_report(
     table_colour_note = (
         "<strong>Table colors.</strong> Colored metric cells compare the rows shown "
         "in this report: green with an inset outline is best and red is worst. "
-        "Fragility, Worst f, residual dip, excess GD, and Tail prefer lower values; "
+        "Fragility, worst penalty, residual dip, excess GD, and Tail prefer lower values; "
         "Score, Basin width, low-end power, and Relative SPL prefer higher values. "
         "For the gate columns, A residual and D deficit prefer higher values, while "
         "B correlation, C percentile, E comb, F notch count, G gain offset, H edge "
@@ -2000,7 +2004,7 @@ def build_report(
             f"{pair['basin_tolerance_ms']:.2f} ms · "
             f"excursion penalty (+/-{pair['excursion_half_width_ms']:.2f} ms) "
             f"{pair['excursion_penalty_db']:.2f} dB · "
-            f"worst f (+/-1 ms) {pair['worst_case']['1.0']:.2f} dB · "
+            f"worst penalty (+/-1 ms) {pair['worst_case_penalty']['1.0']:.2f} dB · "
             f"{pair['n_competing']} competing minima · "
             f"physical tau {physical_text} · geometric excursion "
             f"{robustness['delta_tau_max_ms']:.2f} ms ({geometry_text}) · "

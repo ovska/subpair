@@ -1008,8 +1008,17 @@ def _best_configurations(
         competing = int(
             np.count_nonzero(raw_curve[minima] <= raw_curve[tau_star_index] + 0.3 + 1e-12)
         )
-        worst_case = {
-            f"{dt:.1f}": _worst_case(raw_curve, delays, tau_star_ms, dt)
+        # A penalty above the objective at the *recommended* delay, not the raw
+        # objective around tau_star. As an absolute f it mostly restated how
+        # well the pair scores, so comparing pairs measured their quality
+        # rather than their robustness; and centred on tau_star it described a
+        # delay the pair does not propose, which on a lopsided landscape can
+        # disagree sharply with the configuration actually being recommended.
+        worst_case_penalty = {
+            f"{dt:.1f}": float(
+                _worst_case(raw_curve, delays, tau_robust_ms, dt)
+                - raw_curve[delay_index]
+            )
             for dt in (0.5, 1.0, 1.5)
         }
         basin_w03 = _basin_width(raw_curve, delays, tau_star_index, 0.3)
@@ -1049,7 +1058,7 @@ def _best_configurations(
             "basin_tolerance_ms": basin_tolerance_ms,
             "excursion_half_width_ms": excursion_half_width_ms,
             "excursion_penalty_db": excursion_penalty_db,
-            "worst_case_db": worst_case,
+            "worst_case_penalty_db": worst_case_penalty,
             "n_competing": competing,
             "physical_tau_ms": physical_tau_ms,
             "physical_window_ms": physical_window_ms,
@@ -1850,7 +1859,7 @@ def _compute_pair(
             "basin_tolerance_ms": robustness["basin_tolerance_ms"],
             "excursion_half_width_ms": robustness["excursion_half_width_ms"],
             "excursion_penalty_db": robustness["excursion_penalty_db"],
-            "worst_case": robustness["worst_case_db"],
+            "worst_case_penalty": robustness["worst_case_penalty_db"],
             "n_competing": robustness["n_competing"],
             "geometric_pass": robustness["excursion_penalty_ok"],
             "delta_tau_max": robustness["delta_tau_max_ms"],
@@ -2246,7 +2255,7 @@ def run_search(
     ]
 
     result = {
-        "format_version": 26,
+        "format_version": 27,
         "measurement_count": len(measurements),
         "optimized_pair_count": len(optimized_pairs),
         "sample_rate": measurements[0].sample_rate,

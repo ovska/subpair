@@ -1448,7 +1448,16 @@ class PipelineTests(unittest.TestCase):
                 self.assertGreaterEqual(row["fragility"], -1e-12)
                 self.assertGreaterEqual(row["basin_w03"], 0.0)
                 self.assertGreaterEqual(row["basin_w05"], row["basin_w03"])
-                self.assertEqual(set(row["worst_case"]), {"0.5", "1.0", "1.5"})
+                self.assertEqual(
+                    set(row["worst_case_penalty"]), {"0.5", "1.0", "1.5"}
+                )
+                # A penalty above the recommended delay, so never negative and
+                # monotone in the half-width it is measured over.
+                penalties = [
+                    row["worst_case_penalty"][key] for key in ("0.5", "1.0", "1.5")
+                ]
+                self.assertGreaterEqual(min(penalties), 0.0)
+                self.assertEqual(penalties, sorted(penalties))
                 self.assertIn("objective_db", row["robustness"])
                 self.assertTrue(row["robustness"]["geometry_conservative_bound"])
                 self.assertAlmostEqual(

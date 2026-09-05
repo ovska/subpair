@@ -485,7 +485,7 @@ def _print_ranking(result: dict, top: int) -> None:
         print(f"\n{label} ranking")
         print(
             "Verdict  Score dB  Pair     Pol  Robust ms    Raw* ms  Gain dB  Frag dB  Basin03  "
-            "Worst1 f  Geo  Phys  Headroom  Dip dB  Excess ms  Excess95 ms  Peak ms  "
+            "WorstPen  Geo  Phys  Headroom  Dip dB  Excess ms  Excess95 ms  Peak ms  "
             "    Tail  LE power  Rel SPL  A-res  B-corr  C-pct  D-def"
         )
         for row in rows[:top]:
@@ -517,7 +517,7 @@ def _print_ranking(result: dict, top: int) -> None:
                 f"{row['delay_ms']:>+9.3f}  {row['tau_star']:>+9.3f}  "
                 f"{row['gain_db']:>+7.2f}  "
                 f"{row['fragility']:>7.2f}  {row['basin_w03']:>7.2f}  "
-                f"{row['worst_case']['1.0']:>8.2f}  "
+                f"{row['worst_case_penalty']['1.0']:>8.2f}  "
                 f"{'PASS' if row['geometric_pass'] else 'FAIL':>4}  "
                 f"{physical_status:>4}  "
                 f"{row['post_eq_headroom_db' if eq else 'headroom_db']:>+8.2f}  "
