@@ -1611,6 +1611,21 @@ class PipelineTests(unittest.TestCase):
             self.assertIn("showing up to 3 pairs", page)
             self.assertEqual(page.count('class="pair-select"'), 3)
             self.assertEqual(page.count(" checked aria-label"), 2)
+            self.assertIn(
+                '<input id="show-rejected" type="checkbox" '
+                'onchange="setRejectedVisibility(this.checked)">Show rejected',
+                page,
+            )
+            self.assertNotIn('<input id="show-rejected" type="checkbox" checked', page)
+            visible_eq_pairs = sorted(
+                result["pairs"], key=lambda row: row["eq_rank"]
+            )[:3]
+            self.assertEqual(
+                page.count('data-verdict="reject" hidden'),
+                sum(pair["verdict"] == "reject" for pair in visible_eq_pairs),
+            )
+            self.assertIn("function setRejectedVisibility(show)", page)
+            self.assertIn("const select=!row.hidden&&!checkbox.disabled", page)
             table_pair_keys = set(
                 re.findall(
                     r'class="pair-select"[^>]*data-pair-key="([^"]+)"', page
@@ -1634,9 +1649,6 @@ class PipelineTests(unittest.TestCase):
             self.assertIn('"shape":"spline"', page)
             self.assertIn("EQ authority", page)
             self.assertIn("background:hsla(", page)
-            visible_eq_pairs = sorted(
-                result["pairs"], key=lambda row: row["eq_rank"]
-            )[:3]
             # Every sortable score, gate, and robustness metric is coloured.
             # Gate C, Gate I, and physical status are N/A in this fixture (no
             # arrival metadata), so those three cells per row stay grey.

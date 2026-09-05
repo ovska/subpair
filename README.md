@@ -626,8 +626,10 @@ diagnostics. The overview switches between magnitude and excess group delay.
 Number keys 1–9 open the corresponding selected pair tab. Metric cells use a
 best-to-worst colour scale. `report --top N` changes the initial selection
 count. `report --limit N` limits the table and its selectable diagnostics to
-the top N results (default 15). No network connection or CDN is used when the
-report is viewed.
+the top N results (default 15). Rejected rows are hidden initially; the
+unchecked **Show rejected** control reveals them, while early-screen rejects
+remain disabled because they have no optimized diagnostics. No network
+connection or CDN is used when the report is viewed.
 
 The selected overview and pair diagnostics share one magnitude Y-axis range
 and one excess-group-delay Y-axis range, recalculated whenever the selection

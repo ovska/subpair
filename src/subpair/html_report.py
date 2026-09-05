@@ -1437,8 +1437,10 @@ def _ranking_table(
                 f'data-mode="{mode}" data-pair-key="{key_value}" disabled '
                 f'aria-label="Pair {pair["first"]}+{pair["second"]} was not optimized"></td>'
             )
+        rejected_attributes = ' data-verdict="reject" hidden' if verdict == "reject" else ""
         rows.append(
-            f'<tr data-pair-key="{key_value}">{checkbox}{"".join(cells)}</tr>'
+            f'<tr data-pair-key="{key_value}"{rejected_attributes}>'
+            f'{checkbox}{"".join(cells)}</tr>'
         )
     return (
         f'<table id="{table_id}" class="ranking-table"><thead><tr>{heading}</tr></thead>'
@@ -1744,10 +1746,15 @@ def build_report(
         return f"{int(pair['first'])}-{int(pair['second'])}"
 
     optimized_pairs = [pair for pair in pairs if pair["optimized"]]
-    default_count = max(0, min(top, len(optimized_pairs)))
-    default_keys = {pair_key(pair) for pair in optimized_pairs[:default_count]}
+    default_selectable_pairs = [
+        pair for pair in optimized_pairs if pair.get("verdict") != "reject"
+    ]
+    default_count = max(0, min(top, len(default_selectable_pairs)))
+    default_keys = {
+        pair_key(pair) for pair in default_selectable_pairs[:default_count]
+    }
     initial_active_key = (
-        pair_key(optimized_pairs[0]) if default_count else None
+        pair_key(default_selectable_pairs[0]) if default_count else None
     )
     diagnostic_by_key: dict[str, dict[str, Any]] = {}
     for pair in optimized_pairs:
@@ -2166,7 +2173,8 @@ def build_report(
         )
 
     default_json = json.dumps(
-        [pair_key(pair) for pair in optimized_pairs[:default_count]], separators=(",", ":")
+        [pair_key(pair) for pair in default_selectable_pairs[:default_count]],
+        separators=(",", ":"),
     )
     copy_peq_script = "" if raw else """
 function copyPeq(button) {
@@ -2356,9 +2364,11 @@ h1 {{ font-size:2.2rem; line-height:1.1; margin:0; }} h2 {{ margin-top:0; }}
 .overview-panels,#pair-details {{ position:relative; }}
 .overview-panel,.pair-detail {{ width:100%; }}
 .overview-panel.is-inactive,.pair-detail.is-inactive {{ position:absolute; inset:0; visibility:hidden; pointer-events:none; }}
-.table-controls {{ display:flex; gap:8px; margin:14px 0; }}
+.table-controls {{ display:flex; align-items:center; flex-wrap:wrap; gap:8px; margin:14px 0; }}
 .table-controls button {{ border:1px solid #3b506d; border-radius:7px; padding:7px 13px; color:var(--muted); background:#101e31; cursor:pointer; font-weight:650; }}
 .table-controls button:hover {{ background:#1b2d48; color:var(--text); }}
+.reject-toggle {{ display:flex; align-items:center; gap:7px; margin-left:4px; padding:7px 2px; color:var(--muted); cursor:pointer; font-weight:650; }}
+.reject-toggle input {{ width:17px; height:17px; margin:0; accent-color:#7dd3fc; cursor:pointer; }}
 .table-wrap {{ overflow:auto; border:1px solid var(--line); border-radius:12px; background:var(--card); }}
 table {{ width:100%; border-collapse:collapse; white-space:nowrap; }}
 th,td {{ padding:10px 13px; text-align:right; border-bottom:1px solid var(--line); }}
@@ -2431,12 +2441,13 @@ details {{ margin:22px 0; }} details pre {{ overflow:auto; color:var(--muted); }
     )}
   </div>
 </div>
-<p class="note">Verdict is primary: ACCEPT rows sort before CAUTION, and REJECT rows always sort last regardless of score. Early A/B/C rejects stay visible but are intentionally not optimized. Score remains unchanged and 0 dB marks the highest numeric score among optimized pairs. Click a heading to sort; colored metric cells run green (best) to red (worst), while unavailable values are grey.</p>
+<p class="note">Verdict is primary: ACCEPT rows sort before CAUTION, and REJECT rows always sort last regardless of score. Rejected rows are hidden by default; use <strong>Show rejected</strong> to reveal them. Early A/B/C rejects are intentionally not optimized and cannot be selected. Score remains unchanged and 0 dB marks the highest numeric score among optimized pairs. Click a heading to sort; colored metric cells run green (best) to red (worst), while unavailable values are grey.</p>
 {resolution_note}
 <div class="table-controls">
   <button type="button" onclick="selectTopN(0)">Clear</button>
   <button type="button" onclick="selectTopN(3)">Top 3</button>
   <button type="button" onclick="selectTopN(5)">Top 5</button>
+  <label class="reject-toggle"><input id="show-rejected" type="checkbox" onchange="setRejectedVisibility(this.checked)">Show rejected</label>
 </div>
 <div class="table-wrap">{_ranking_table(pairs, mode, f'ranking-{mode}', default_keys, show_headroom=eq_possible)}</div>
 <div class="pair-tabs" data-pair-tabs role="tablist" aria-label="Selected {mode_label} pairs"></div>
@@ -2595,9 +2606,23 @@ function selectTopN(n) {{
   let selectedCount=0;
   rows.forEach(row=>{{
     const checkbox=row.querySelector('.pair-select');
-    const select=!checkbox.disabled&&selectedCount<n;
+    const select=!row.hidden&&!checkbox.disabled&&selectedCount<n;
     checkbox.checked=select;
     if(select) {{ selectedPairs.add(row.dataset.pairKey); selectedCount+=1; }}
+  }});
+  renderPairTabs();
+  updateOverview();
+  renderActiveDetail();
+}}
+function setRejectedVisibility(show) {{
+  const table=document.getElementById('ranking-'+reportMode);
+  table.querySelectorAll('tbody tr[data-verdict="reject"]').forEach(row=>{{
+    row.hidden=!show;
+    if(!show) {{
+      const checkbox=row.querySelector('.pair-select');
+      checkbox.checked=false;
+      selectedPairs.delete(row.dataset.pairKey);
+    }}
   }});
   renderPairTabs();
   updateOverview();
