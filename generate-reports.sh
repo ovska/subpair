@@ -38,7 +38,8 @@ SEARCH_ARGS=(
 
 generate_report() {
   local label="$1"
-  shift
+  local report_title="$2"
+  shift 2
   local results_path="${SUBPAIR_CACHE_DIR}/search-results-${label}.json"
   local report_path="${REPO_ROOT}/subpair-report-${label}.html"
 
@@ -54,13 +55,14 @@ generate_report() {
     --cache "${SUBPAIR_CACHE_DIR}" \
     --results "${results_path}" \
     --output "${report_path}" \
+    --report-title "${report_title}" \
     --top 5 \
     --limit 15 \
     --room 345x274x248
 }
 
-generate_report dsp
-generate_report no-eq --eq-bands 0
+generate_report dsp "Subpair DSP"
+generate_report no-eq "Subpair No EQ" --eq-bands 0
 
 printf '\nReports generated:\n'
 printf '  %s\n' "${REPO_ROOT}/subpair-report-dsp.html"

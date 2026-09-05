@@ -6,8 +6,10 @@ import html
 import json
 import math
 from collections import Counter
+from importlib.resources import files
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import numpy as np
 import plotly.graph_objects as go
@@ -31,6 +33,11 @@ _HOVER_MS_HZ_DB = "%{x:.1f} ms<br>%{y:.0f} Hz<br>%{z:.1f} dB<extra></extra>"
 _HOVER_HZ_MS_OVERLAY = "%{y:.0f} Hz · %{x:.1f} ms<extra></extra>"
 _EXCESS_GD_LOWER_LIMIT_MS = -20.0
 
+_GRAIN_SVG = """<svg xmlns="http://www.w3.org/2000/svg" width="180" height="180" viewBox="0 0 180 180">
+<filter id="grain"><feTurbulence type="fractalNoise" baseFrequency="0.8" numOctaves="4" stitchTiles="stitch"/></filter>
+<rect width="100%" height="100%" filter="url(#grain)" opacity="0.62"/>
+</svg>"""
+
 SPEED_OF_SOUND_M_PER_S = 343.0
 
 _ROOM_MODE_LINE_STYLE = {
@@ -52,6 +59,24 @@ _ROOM_MODE_MAX_ORDER = 3
 
 class ReportError(RuntimeError):
     pass
+
+
+def _svg_data_uri(svg: str) -> str:
+    """Encode an SVG for a self-contained HTML/CSS data URL."""
+
+    return "data:image/svg+xml," + quote(svg, safe="")
+
+
+def _brand_assets() -> tuple[str, str]:
+    """Return the inline logo and a favicon data URL derived from the same SVG."""
+
+    logo = files("subpair").joinpath("assets/subpair-logo.svg").read_text(encoding="utf-8")
+    inline_logo = logo.replace(
+        "<svg ",
+        '<svg class="brand-mark" aria-hidden="true" focusable="false" ',
+        1,
+    )
+    return inline_logo, _svg_data_uri(logo)
 
 
 def room_mode_frequencies(
@@ -1560,9 +1585,13 @@ def build_report(
     limit: int = 15,
     raw: bool = False,
     room_dimensions_cm: tuple[float, float, float] | None = None,
+    report_title: str = "subpair report",
 ) -> Path:
     if limit < 1:
         raise ReportError("Report result limit must be at least 1")
+    report_title = report_title.strip()
+    if not report_title:
+        raise ReportError("Report title must not be empty")
     results = load_results(results_path)
     measurements, _ = load_cache(cache_dir)
     if len(measurements) != int(results.get("measurement_count", -1)):
@@ -2280,6 +2309,9 @@ function copyPeq(button) {
         resolution_note = ""
 
     settings_json = html.escape(json.dumps(settings, sort_keys=True, indent=2))
+    escaped_report_title = html.escape(report_title)
+    inline_logo, favicon_href = _brand_assets()
+    grain_texture = _svg_data_uri(_GRAIN_SVG)
     # Arrival warnings are rendered inside the Arrival timing card next to the
     # table that explains them, so they are not repeated at the top of the page.
     timing_warnings = set(timing.get("warnings", []))
@@ -2293,13 +2325,21 @@ function copyPeq(button) {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>subpair ranking</title>
+<title>{escaped_report_title}</title>
+<link rel="icon" type="image/svg+xml" href="{favicon_href}">
 <style>
 :root {{ color-scheme: dark; --bg:#07111f; --card:#0f1b2d; --line:#26364d; --text:#e5edf8; --muted:#9fb0c7; }}
 * {{ box-sizing:border-box; }}
-body {{ margin:0; background:var(--bg); color:var(--text); font:15px/1.5 ui-sans-serif,system-ui,sans-serif; }}
-main {{ width:min(1500px,96vw); margin:0 auto; padding:36px 0 80px; }}
-h1 {{ font-size:2.2rem; margin:0 0 4px; }} h2 {{ margin-top:0; }}
+body {{ margin:0; min-height:100vh; isolation:isolate; color:var(--text); font:15px/1.5 ui-sans-serif,system-ui,sans-serif;
+  background:radial-gradient(circle at 8% -8%,rgba(56,189,248,.16),transparent 34rem),
+    radial-gradient(circle at 96% 16%,rgba(139,92,246,.1),transparent 38rem),
+    linear-gradient(145deg,#07111f 0%,#0a1628 48%,#050b14 100%); background-attachment:fixed; }}
+body::before {{ content:""; position:fixed; inset:0; z-index:0; pointer-events:none;
+  background-image:url("{grain_texture}"); background-size:180px 180px; opacity:.055; mix-blend-mode:soft-light; }}
+main {{ position:relative; z-index:1; width:min(1500px,96vw); margin:0 auto; padding:36px 0 80px; }}
+.brand {{ display:flex; align-items:center; gap:14px; margin:0 0 4px; }}
+.brand-mark {{ display:block; flex:0 0 auto; width:48px; height:48px; filter:drop-shadow(0 8px 18px rgba(56,189,248,.12)); }}
+h1 {{ font-size:2.2rem; line-height:1.1; margin:0; }} h2 {{ margin-top:0; }}
 .lede,.configuration,.note {{ color:var(--muted); }}
 .warning {{ color:#fecaca; border-left:3px solid #fb7185; padding-left:10px; }}
 .timing-card {{ background:var(--card); border:1px solid var(--line); border-radius:8px; padding:12px 16px; margin:14px 0; }}
@@ -2367,7 +2407,7 @@ details {{ margin:22px 0; }} details pre {{ overflow:auto; color:var(--muted); }
 <script>{get_plotlyjs()}</script>
 </head>
 <body><main>
-<h1>subpair ranking</h1>
+<header class="brand">{inline_logo}<h1>{escaped_report_title}</h1></header>
 <p class="lede">{results['measurement_count']} positions · {band[0]:g}–{band[1]:g} Hz · {settings['ppo']} points/octave · {mode_label} usable-output score · showing up to {limit} pairs</p>
 <p class="note">Check table rows to choose comparison pairs. The top {default_count} start selected; the pair tabs below the table open one full diagnostic at a time. Hotkeys 1–9 open the first nine selected tabs.</p>
 {warning_html}

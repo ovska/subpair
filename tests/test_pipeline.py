@@ -502,8 +502,13 @@ class PipelineTests(unittest.TestCase):
         defaults = parser.parse_args(["report"])
         self.assertEqual(defaults.limit, 15)
         self.assertFalse(defaults.raw)
+        self.assertEqual(defaults.report_title, "subpair report")
         self.assertEqual(parser.parse_args(["report", "--limit", "24"]).limit, 24)
         self.assertTrue(parser.parse_args(["report", "--raw"]).raw)
+        self.assertEqual(
+            parser.parse_args(["report", "--report-title", "Subpair DSP"]).report_title,
+            "Subpair DSP",
+        )
 
     def test_search_score_weight_arguments(self):
         parser = _build_parser()
@@ -1554,7 +1559,14 @@ class PipelineTests(unittest.TestCase):
             build_report(
                 cache, no_shelf_results_path, no_shelf_report, top=2, limit=3
             )
-            build_report(cache, results_path, shelf_report, top=2, limit=3)
+            build_report(
+                cache,
+                results_path,
+                shelf_report,
+                top=2,
+                limit=3,
+                report_title="Subpair DSP",
+            )
             no_shelf_page = no_shelf_report.read_text()
             shelf_page = shelf_report.read_text()
 
@@ -1566,6 +1578,8 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(len(ranking_tables(no_shelf_page)), 1)
             self.assertNotIn("LS Fc", no_shelf_page)
             self.assertIn("Automatic low shelf enabled", shelf_page)
+            self.assertIn("<title>Subpair DSP</title>", shelf_page)
+            self.assertIn("<h1>Subpair DSP</h1>", shelf_page)
 
             report = root / "report.html"
             build_report(cache, results_path, report, top=2, limit=3)
@@ -1574,6 +1588,10 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(first_render, report.read_bytes())
             page = first_render.decode()
             self.assertIn("plotly.js", page.lower())
+            self.assertIn("<title>subpair report</title>", page)
+            self.assertIn("<h1>subpair report</h1>", page)
+            self.assertIn('class="brand-mark"', page)
+            self.assertIn("feTurbulence", page)
             self.assertIn("id=\"ranking-eq\"", page)
             self.assertNotIn("id=\"ranking-raw\"", page)
             self.assertIn("id=\"selected-pairs-magnitude-eq\"", page)
@@ -1685,7 +1703,9 @@ class PipelineTests(unittest.TestCase):
             self.assertIn("pointerover", page)
             # self-contained: nothing is fetched at view time
             self.assertEqual(re.findall(r"<script[^>]+\bsrc=", page), [])
-            self.assertEqual(re.findall(r"<link[^>]+\bhref=", page), [])
+            linked_resources = re.findall(r'<link[^>]+\bhref="([^"]+)"', page)
+            self.assertEqual(len(linked_resources), 1)
+            self.assertTrue(linked_resources[0].startswith("data:image/svg+xml,"))
             self.assertIn(
                 'data-key="geometric_pass" data-type="number"', page
             )

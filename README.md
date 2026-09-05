@@ -616,6 +616,8 @@ electrical drive.
 
 Produces one HTML file containing Plotly itself, the sortable EQ'd ranking,
 top-pair response diagnostics, post-EQ CSD heatmaps, and copyable EQ text.
+The browser and page heading default to **subpair report**; use
+`--report-title "Subpair DSP"` to give a generated report a descriptive name.
 Pass `--raw` to show the raw ranking and raw diagnostics instead, omitting the
 EQ-specific plots and filter controls entirely. The table has selection checkboxes
 (its top five are checked by default); the selected pairs feed the combined

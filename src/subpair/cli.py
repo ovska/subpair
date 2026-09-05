@@ -27,6 +27,13 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
+def _nonempty_text(value: str) -> str:
+    parsed = value.strip()
+    if not parsed:
+        raise argparse.ArgumentTypeError("must not be empty")
+    return parsed
+
+
 def _at_least_two(value: str) -> int:
     parsed = int(value)
     if parsed < 2:
@@ -311,6 +318,13 @@ def _build_parser() -> argparse.ArgumentParser:
     report.add_argument("--cache", type=Path, default=DEFAULT_CACHE, help="cache directory")
     report.add_argument("--results", type=Path, help="search JSON input path")
     report.add_argument("--output", type=Path, default=Path("subpair-report.html"))
+    report.add_argument(
+        "--report-title",
+        type=_nonempty_text,
+        default="subpair report",
+        metavar="TITLE",
+        help="browser and page title (default: subpair report)",
+    )
     report.add_argument(
         "--top",
         type=_positive_int,
@@ -622,6 +636,7 @@ def _report(args: argparse.Namespace) -> int:
         limit=args.limit,
         raw=args.raw,
         room_dimensions_cm=args.room,
+        report_title=args.report_title,
     )
     print(f"Wrote self-contained report to {output.resolve()}")
     return 0

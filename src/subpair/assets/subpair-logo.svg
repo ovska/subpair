@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <title>subpair</title>
+  <defs>
+    <linearGradient id="subpair-mark-gradient" x1="12" y1="52" x2="52" y2="12" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#67e8f9"/>
+      <stop offset="1" stop-color="#a78bfa"/>
+    </linearGradient>
+  </defs>
+  <rect x="2.5" y="2.5" width="59" height="59" rx="18" fill="#0b1728" stroke="#2b3f5d"/>
+  <g fill="none" stroke="url(#subpair-mark-gradient)" stroke-width="3.5">
+    <circle cx="23" cy="32" r="12"/>
+    <circle cx="41" cy="32" r="12"/>
+  </g>
+  <circle cx="23" cy="32" r="3.5" fill="#e0f2fe"/>
+  <circle cx="41" cy="32" r="3.5" fill="#ede9fe"/>
+</svg>
