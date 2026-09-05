@@ -1,5 +1,29 @@
 # subpair
 
+## TL;DR
+
+`subpair` picks the best two-subwoofer pairing from solo, time-referenced Room
+EQ Wizard measurements. It searches polarity, delay, and gain offline, fits
+bounded EQ, rejects fragile solutions, and produces a self-contained
+interactive report with the evidence behind each recommendation.
+
+![Subpair report overview comparing the selected pair responses](resources/main.png)
+
+*Compare the highest-ranked pair responses and switch between magnitude and
+excess group delay.*
+
+![Delay robustness and post-EQ excess-group-delay diagnostics](resources/robustness_egd.png)
+
+*Inspect whether the recommended delay survives timing uncertainty, alongside
+the post-EQ excess-group-delay diagnostic.*
+
+![Solo and summed magnitude responses above a CSD-style decay plot](resources/spl_csd.png)
+
+*Audit the solo responses, fitted sum, room-mode references, and decay
+behaviour for an individual pair.*
+
+## How it works
+
 `subpair` is a deterministic, offline-first Python CLI for choosing two
 subwoofer positions from solo Room EQ Wizard (REW) measurements. REW is used
 read-only: `fetch` retrieves impulse responses, and every expensive operation
