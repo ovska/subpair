@@ -827,7 +827,9 @@ COLUMN_HELP = {
     "score": (
         "Usable-output score relative to the best pair, which sits at 0 dB. "
         "(1-w)x full-band SPL + w x low-end power - dip weight x worst smoothed "
-        "dip, with the search's configured weights. Higher is better."
+        "dip, with the search's configured weights. Higher is better. A leading "
+        "= marks a pair within its own score resolution of the 0 dB reference: "
+        "the table still orders it, but the data does not support that order."
     ),
     "verdict_status": (
         "ACCEPT: every evaluated gate passed. CAUTION: at least one gate "
@@ -1106,6 +1108,7 @@ def _ranking_table(
         else:
             raw_tail = pair.get(tail_key)
             tail_display[id(pair)] = (float(raw_tail) if raw_tail is not None else None, "ms")
+    tie_key = "post_eq_score_ties_reference" if eq else "score_ties_reference"
     headroom_key = "post_eq_headroom_db" if eq else "headroom_db"
     low_end_power_key = (
         "post_eq_relative_low_end_power_db" if eq else "relative_low_end_power_db"
@@ -1318,8 +1321,14 @@ def _ranking_table(
                 return "—", ""
             return f"{value:{format_spec}}{suffix}", str(value)
 
+        # A pair inside its own resolution of the reference is flagged rather
+        # than silently presented as ranked: the sort key is still the score, so
+        # the row has a position, but that position is not evidence.
+        score_text, score_sort = number_value(score_key, "+.2f")
+        if pair.get(tie_key) and score_text != "—":
+            score_text = f"= {score_text}"
         values: dict[str, tuple[str, str]] = {
-            score_key: number_value(score_key, "+.2f"),
+            score_key: (score_text, score_sort),
             "pair": (
                 f"{pair['first']} + {pair['second']}",
                 f"{pair['first']:04d}-{pair['second']:04d}",
@@ -2102,7 +2111,8 @@ def build_report(
               <details class="measured-card">
                 <summary><strong>Measured values</strong> — score components, delay
                   robustness and physical timing</summary>
-                <p class="configuration">{metric_summary}</p>
+                <p class="configuration">{metric_summary} · score resolution
+                  {pair['score_resolution_db']:.2f} dB</p>
                 <p class="configuration">{robustness_summary}</p>
               </details>
               {gate_sheet_html}
@@ -2232,6 +2242,43 @@ function copyPeq(button) {
     else:
         timing_section = ""
 
+    resolutions = [
+        float(pair["score_resolution_db"])
+        for pair in pairs
+        if pair.get("score_resolution_db") is not None
+    ]
+    tied = [
+        f"{pair['first']}+{pair['second']}"
+        for pair in pairs
+        if pair.get("score_ties_reference")
+    ]
+    margin = float(
+        (settings.get("ranking", {}).get("score_tie_margin_db") or 0.0)
+    )
+    if resolutions:
+        resolution_note = (
+            '<p class="note"><strong>Score resolution.</strong> The smallest score '
+            f"difference these pairs can be ordered by runs {min(resolutions):.2f}–"
+            f"{max(resolutions):.2f} dB: how far the score moves between adjacent "
+            "points of the delay/gain grid, plus each pair's excess over the "
+            "population median in the band-edge shift"
+            + (f", plus the {margin:g} dB tie margin" if margin else "")
+            + ". That is a floor — microphone repositioning, level drift and "
+            "measurement noise all add to it and none are visible in a single "
+            "cached sweep"
+            + (
+                "; <code>--score-tie-margin</code> adds a flat allowance for them"
+                if not margin
+                else ""
+            )
+            + ". Rows marked <code>=</code> are within their own resolution of the "
+            "0 dB reference"
+            + (f" ({', '.join(tied)})" if tied else "")
+            + " and are not meaningfully ordered against it.</p>"
+        )
+    else:
+        resolution_note = ""
+
     settings_json = html.escape(json.dumps(settings, sort_keys=True, indent=2))
     # Arrival warnings are rendered inside the Arrival timing card next to the
     # table that explains them, so they are not repeated at the top of the page.
@@ -2345,6 +2392,7 @@ details {{ margin:22px 0; }} details pre {{ overflow:auto; color:var(--muted); }
   </div>
 </div>
 <p class="note">Verdict is primary: ACCEPT rows sort before CAUTION, and REJECT rows always sort last regardless of score. Early A/B/C rejects stay visible but are intentionally not optimized. Score remains unchanged and 0 dB marks the highest numeric score among optimized pairs. Click a heading to sort; colored metric cells run green (best) to red (worst), while unavailable values are grey.</p>
+{resolution_note}
 <div class="table-controls">
   <button type="button" onclick="selectTopN(0)">Clear</button>
   <button type="button" onclick="selectTopN(3)">Top 3</button>

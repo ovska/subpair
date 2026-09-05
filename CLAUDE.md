@@ -142,7 +142,11 @@ the real logic. Data flows strictly one-way through `.subpair-cache/`:
    population median rather than an absolute value. Gates C, D and I reference
    the physical alignment at whichever polarity is better there, never a
    hardcoded normal polarity. Verdict sorts before score and every configured
-   threshold is serialized under `settings.gates`. Writes `search-results.json`
+   threshold is serialized under `settings.gates`. Each pair also reports
+   `score_resolution_db` — the delay/gain grid's score quantisation plus that
+   pair's excess band-edge sensitivity, plus `--score-tie-margin` — and
+   `score_ties_reference`, so the table can say where its own ordering is not
+   supported by the data rather than presenting spurious precision. Writes `search-results.json`
    (`format_version` is bumped whenever the result schema changes — keep
    `verification.py`/`html_report.py` in sync with it). When
    `SearchOptions.modal` is set, also computes `modal.estimate_room_poles`

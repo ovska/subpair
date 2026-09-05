@@ -122,6 +122,7 @@ class SearchOptions:
     listener_movement_m: float = 0.25
     speed_of_sound_m_per_s: float = 343.0
     physical_delay_window_ms: float = 1.5
+    score_tie_margin_db: float = 0.0
     gate_thresholds: GateThresholds = field(default_factory=GateThresholds)
 
     def __post_init__(self) -> None:
@@ -135,6 +136,8 @@ class SearchOptions:
             raise ValueError("speed of sound must be positive")
         if self.physical_delay_window_ms <= 0.0:
             raise ValueError("physical delay window must be positive")
+        if self.score_tie_margin_db < 0.0:
+            raise ValueError("score tie margin must be non-negative")
         coordinates = []
         if self.listener_position_m is not None:
             coordinates.append(("listener position", self.listener_position_m))
@@ -999,6 +1002,14 @@ def _best_configurations(
         gain_plateau_db = _plateau_width(
             scores[polarity_index, delay_index, :], gains, gain_index
         )
+        # How far the score moves between adjacent points of the tool's own
+        # delay/gain grid. Nothing finer than this is resolved by the search, so
+        # it is a hard floor on how precisely two pairs can be ordered -- and it
+        # is free here, since the whole grid is already in `scores`.
+        delay_slice = slice(max(0, delay_index - 1), delay_index + 2)
+        gain_slice = slice(max(0, gain_index - 1), gain_index + 2)
+        neighbourhood = scores[polarity_index, delay_slice, gain_slice]
+        score_quantisation_db = float(np.max(neighbourhood) - np.min(neighbourhood))
         raw_curve = objective[polarity_index, :, gain_index]
         robust_curve = robust_objective[polarity_index, :, gain_index]
         tau_star_index = int(np.argmin(raw_curve))
@@ -1059,6 +1070,7 @@ def _best_configurations(
             "excursion_half_width_ms": excursion_half_width_ms,
             "excursion_penalty_db": excursion_penalty_db,
             "worst_case_penalty_db": worst_case_penalty,
+            "score_quantisation_db": score_quantisation_db,
             "n_competing": competing,
             "physical_tau_ms": physical_tau_ms,
             "physical_window_ms": physical_window_ms,
@@ -1544,6 +1556,30 @@ def _postoptimization_gates(
     return {name: gates[name] for name in _GATE_ORDER}
 
 
+def _score_resolution_db(pair: dict[str, Any], margin_db: float = 0.0) -> float | None:
+    """Smallest score difference this pair can actually be ordered by.
+
+    Two components, both derived from the pair's own data. The delay/gain grid
+    quantises the search, so the score cannot be trusted finer than it moves
+    between adjacent grid points. And Gate H's band shift measures how much the
+    score depends on where the band edges are put: the part of that shared by
+    every pair cancels out of an ordering, but the excess over the population
+    is specific to this pair and is therefore an ordering uncertainty.
+
+    This is a floor, not a full error budget -- microphone placement, level
+    calibration and measurement noise all add to it and none of them are
+    visible in a single cached sweep.
+    """
+
+    quantisation = pair.get("score_quantisation_db")
+    if quantisation is None:
+        return None
+    gate = pair.get("gates", {}).get("gate_h_band_edge_stability", {})
+    excess = gate.get("excess_spread_db")
+    band_edge = max(0.0, float(excess)) if excess is not None else 0.0
+    return float(quantisation) + band_edge + float(margin_db)
+
+
 def _apply_band_edge_population_status(
     gate_sets: list[dict[str, dict[str, Any]]],
     thresholds: GateThresholds,
@@ -1860,6 +1896,7 @@ def _compute_pair(
             "excursion_half_width_ms": robustness["excursion_half_width_ms"],
             "excursion_penalty_db": robustness["excursion_penalty_db"],
             "worst_case_penalty": robustness["worst_case_penalty_db"],
+            "score_quantisation_db": robustness["score_quantisation_db"],
             "n_competing": robustness["n_competing"],
             "geometric_pass": robustness["excursion_penalty_ok"],
             "delta_tau_max": robustness["delta_tau_max_ms"],
@@ -2157,10 +2194,29 @@ def run_search(
         raw_reference["low_end_power_db"] if raw_reference is not None else None
     )
     reference_score = raw_reference["score_db"] if raw_reference is not None else None
+    reference_resolution = (
+        _score_resolution_db(raw_reference, options.score_tie_margin_db)
+        if raw_reference is not None
+        else None
+    )
     for rank, row in enumerate(pairs, start=1):
         row["rank"] = rank
+        row["score_resolution_db"] = _score_resolution_db(
+            row, options.score_tie_margin_db
+        )
         row["relative_score_db"] = (
             float(row["score_db"] - reference_score) if row["optimized"] else None
+        )
+        # Ordering two pairs is only meaningful beyond the coarser of their two
+        # resolutions; inside it the table is presenting an order the data does
+        # not support.
+        own = row["score_resolution_db"]
+        # The reference is trivially within its own resolution of itself, which
+        # says nothing; the flag is about pairs the table orders *against* it.
+        row["score_ties_reference"] = (
+            bool(abs(row["relative_score_db"]) <= max(own, reference_resolution or 0.0))
+            if row["optimized"] and own is not None and row is not raw_reference
+            else None
         )
         row["relative_spl_db"] = (
             float(row["spl_db"] - reference_spl) if row["optimized"] else None
@@ -2202,11 +2258,28 @@ def run_search(
     eq_reference_score = (
         eq_reference["post_eq_score_db"] if eq_reference is not None else None
     )
+    eq_reference_resolution = (
+        _score_resolution_db(eq_reference, options.score_tie_margin_db)
+        if eq_reference is not None
+        else None
+    )
     for eq_rank, row in enumerate(eq_pairs, start=1):
         row["eq_rank"] = eq_rank
         row["post_eq_relative_score_db"] = (
             float(row["post_eq_score_db"] - eq_reference_score)
             if row["optimized"]
+            else None
+        )
+        # The EQ'd score is fitted per configuration rather than read off the
+        # grid, so it has no quantisation figure of its own; the delay/gain grid
+        # underneath it is the same one, so the raw resolution is reused.
+        own = row["score_resolution_db"]
+        row["post_eq_score_ties_reference"] = (
+            bool(
+                abs(row["post_eq_relative_score_db"])
+                <= max(own, eq_reference_resolution or 0.0)
+            )
+            if row["optimized"] and own is not None and row is not eq_reference
             else None
         )
         row["post_eq_relative_spl_db"] = (
@@ -2255,7 +2328,7 @@ def run_search(
     ]
 
     result = {
-        "format_version": 27,
+        "format_version": 28,
         "measurement_count": len(measurements),
         "optimized_pair_count": len(optimized_pairs),
         "sample_rate": measurements[0].sample_rate,
@@ -2482,6 +2555,21 @@ def run_search(
                 "direction": (
                     "accept before caution before reject; higher score within verdict"
                 ),
+                "resolution": (
+                    "score_resolution_db is the smallest score difference a pair "
+                    "can be ordered by: how far the score moves between adjacent "
+                    "points of the delay/gain grid, plus that pair's excess over "
+                    "the population median in Gate H's band shift (the shared part "
+                    "cancels out of an ordering; the excess does not). "
+                    "score_ties_reference marks pairs within the coarser of their "
+                    "own and the reference pair's resolution, where the table is "
+                    "presenting an order the data does not support. It is a floor: "
+                    "microphone placement, level calibration and measurement noise "
+                    "all add to it and none are visible in a single cached sweep. "
+                    "--score-tie-margin adds a flat allowance for exactly those, "
+                    "and is included in every reported score_resolution_db."
+                ),
+                "score_tie_margin_db": options.score_tie_margin_db,
                 "score": {
                     "fields": {
                         "raw": "score_db / relative_score_db",

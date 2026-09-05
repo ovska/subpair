@@ -1762,6 +1762,114 @@ class PipelineTests(unittest.TestCase):
             self.assertIn("sub L", report_path.read_text())
 
 
+class ScoreResolutionTests(unittest.TestCase):
+    """The table must not present an order finer than the data supports."""
+
+    @staticmethod
+    def _cache(cache: Path) -> None:
+        sample_rate, length = 4000.0, 4096
+        definitions = [
+            (100, [(42, 0.20), (75, 0.10)]),
+            (106, [(48, 0.16), (92, 0.10)]),
+            (112, [(58, 0.18), (110, 0.08)]),
+            (118, [(68, 0.15), (125, 0.10)]),
+        ]
+        write_cache(
+            cache,
+            [
+                {
+                    "source_index": index,
+                    "title": f"Position {index}",
+                    "uuid": f"uuid-{index}",
+                    "sample_rate": sample_rate,
+                    "start_time_seconds": -0.025,
+                    "impulse": _synthetic_ir(sample_rate, length, delay, modes),
+                }
+                for index, (delay, modes) in enumerate(definitions, start=1)
+            ],
+            {"test": True},
+        )
+
+    def _search(self, cache: Path, margin: float) -> dict:
+        return run_search(
+            cache,
+            cache / f"results-{margin}.json",
+            SearchOptions(
+                band=(25.0, 150.0),
+                delay_range_ms=(-2.0, 2.0, 0.25),
+                gain_range_db=(-1.0, 1.0, 0.5),
+                ppo=24,
+                eq_bands=0,
+                score_tie_margin_db=margin,
+                gate_thresholds=_permissive_gates(),
+            ),
+        )
+
+    def test_resolution_is_reported_and_widens_with_the_tie_margin(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = Path(temporary) / "cache"
+            self._cache(cache)
+            tight = self._search(cache, 0.0)
+            loose = self._search(cache, 0.75)
+        by_pair = {(r["first"], r["second"]): r for r in tight["pairs"]}
+        for row in tight["pairs"]:
+            if not row["optimized"]:
+                continue
+            # Two non-negative components: grid quantisation plus this pair's
+            # excess band-edge sensitivity over the population.
+            self.assertIsNotNone(row["score_resolution_db"])
+            self.assertGreaterEqual(row["score_resolution_db"], 0.0)
+            self.assertGreaterEqual(row["score_quantisation_db"], 0.0)
+            self.assertGreaterEqual(
+                row["score_resolution_db"], row["score_quantisation_db"]
+            )
+        # The margin is a flat allowance added to every pair.
+        for row in loose["pairs"]:
+            if not row["optimized"]:
+                continue
+            key = (row["first"], row["second"])
+            self.assertAlmostEqual(
+                row["score_resolution_db"],
+                by_pair[key]["score_resolution_db"] + 0.75,
+            )
+        # Widening the margin can only ever add ties, never remove them.
+        def tied(result):
+            return {
+                (r["first"], r["second"])
+                for r in result["pairs"]
+                if r.get("score_ties_reference")
+            }
+
+        self.assertTrue(tied(tight) <= tied(loose))
+        # Every flagged pair really is inside the resolution it was judged by.
+        for row in loose["pairs"]:
+            if row.get("score_ties_reference"):
+                self.assertLessEqual(
+                    abs(row["relative_score_db"]), row["score_resolution_db"] + 1e-9
+                )
+
+    def test_the_reference_pair_is_not_flagged_as_tied_with_itself(self):
+        # It is trivially within its own resolution of itself, which says
+        # nothing about whether the ordering below it is supported.
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = Path(temporary) / "cache"
+            self._cache(cache)
+            result = self._search(cache, 5.0)
+        optimized = [r for r in result["pairs"] if r["optimized"]]
+        reference = max(optimized, key=lambda r: r["score_db"])
+        self.assertEqual(reference["relative_score_db"], 0.0)
+        self.assertIsNone(reference["score_ties_reference"])
+        # Pairs that genuinely fall inside the widened resolution are flagged;
+        # ones further away than 5 dB legitimately are not.
+        for row in optimized:
+            if row is reference:
+                continue
+            self.assertEqual(
+                bool(row["score_ties_reference"]),
+                abs(row["relative_score_db"]) <= row["score_resolution_db"] + 1e-9,
+            )
+
+
 class GateCorrectionTests(unittest.TestCase):
     """Each gate fires on the pair that is actually defective, not its opposite."""
 

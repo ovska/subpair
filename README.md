@@ -261,6 +261,29 @@ magnitude response as it samples a different point in the room's modal pressure
 field, and this delay-only test cannot capture that. Only multi-position
 measurements can validate a listening area.
 
+#### Score resolution
+
+`score_resolution_db` is the smallest score difference two pairs can actually
+be ordered by. It has two components, both derived from the pair's own data:
+how far the score moves between adjacent points of the delay/gain grid (nothing
+finer than that is resolved by the search), plus that pair's excess over the
+population median in Gate H's band-edge shift — the part of the band-edge
+sensitivity every pair shares cancels out of an ordering, but the excess does
+not.
+
+`score_ties_reference` (and `post_eq_score_ties_reference`) marks pairs within
+the coarser of their own and the reference pair's resolution. The table still
+sorts them, but that order is not evidence, and both the CLI and the report
+prefix such rows with `=`. The reference itself is never flagged: it is
+trivially within its own resolution of itself.
+
+This is a **floor**, not a full error budget. Microphone repositioning, level
+drift between sweeps and measurement noise all add to it, and none of them are
+visible in a single cached sweep. `--score-tie-margin` adds a flat allowance
+for exactly those and is included in every reported `score_resolution_db`;
+around 0.1 dB covers a centimetre of microphone placement in a typical small
+room, more if positions are re-established by eye.
+
 #### Pair disqualifier gates
 
 Each row has a reproducible `verdict` (`accept`, `caution`, or `reject`), a

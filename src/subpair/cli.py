@@ -191,6 +191,17 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="MS",
         help="search window around measured relative arrival delay (default: 1.5 ms)",
     )
+    search.add_argument(
+        "--score-tie-margin",
+        type=_bounded_float(0.0, 6.0),
+        default=0.0,
+        metavar="DB",
+        help=(
+            "allowance added to every pair's computed score resolution for "
+            "uncertainty a single cached sweep cannot show -- microphone "
+            "repositioning, level drift between sweeps (default: 0 dB)"
+        ),
+    )
     _add_gate_arguments(search)
     search.add_argument(
         "--gain-range",
@@ -512,7 +523,8 @@ def _print_ranking(result: dict, top: int) -> None:
             )
             print(
                 f"{verdict:<7}  "
-                f"{row['post_eq_relative_score_db' if eq else 'relative_score_db']:>+8.2f}  "
+                f"{('=' if row.get('post_eq_score_ties_reference' if eq else 'score_ties_reference') else ' '):>2}"
+                f"{row['post_eq_relative_score_db' if eq else 'relative_score_db']:>+6.2f}  "
                 f"{pair:<7}  {polarity:>3}  "
                 f"{row['delay_ms']:>+9.3f}  {row['tau_star']:>+9.3f}  "
                 f"{row['gain_db']:>+7.2f}  "
@@ -569,6 +581,7 @@ def _search(args: argparse.Namespace) -> int:
         listener_movement_m=args.listener_movement,
         speed_of_sound_m_per_s=args.speed_of_sound,
         physical_delay_window_ms=args.physical_delay_window,
+        score_tie_margin_db=args.score_tie_margin,
         gate_thresholds=GateThresholds(
             redundancy_reject=args.gate_redundancy_reject,
             redundancy_caution=args.gate_redundancy_caution,
