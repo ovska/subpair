@@ -820,6 +820,121 @@ GATE_MEANINGS = {
 }
 
 
+# Ranking-table column help. Keyed by the canonical concept; the raw and EQ'd
+# variants of a column share one entry. Obvious columns (Pair) are omitted so
+# the cursor only changes where there is something worth reading.
+COLUMN_HELP = {
+    "score": (
+        "Usable-output score relative to the best pair, which sits at 0 dB. "
+        "(1-w)x full-band SPL + w x low-end power - dip weight x worst smoothed "
+        "dip, with the search's configured weights. Higher is better."
+    ),
+    "verdict_status": (
+        "ACCEPT: every evaluated gate passed. CAUTION: at least one gate "
+        "cautioned. REJECT: at least one rejected. Verdict is the primary sort "
+        "key, so rejected pairs stay visible at the bottom whatever they score. "
+        "A clean sheet is not validation - these are single-position "
+        "disqualifiers only."
+    ),
+    "gate_reasons": (
+        "Which gates cautioned or rejected this pair. Hover a cell to see what "
+        "each one measured and the limit it was compared against."
+    ),
+    "redundancy_residual": GATE_MEANINGS["gate_a_redundancy"] + " Higher is better.",
+    "ripple_correlation": GATE_MEANINGS["gate_b_ripple_correlation"] + " Lower is better.",
+    "physical_percentile": GATE_MEANINGS["gate_c_physical_percentile"] + " Lower is better.",
+    "gate_d_deficit": GATE_MEANINGS["gate_d_cancellation_deficit"] + " Higher is better.",
+    "comb_index": GATE_MEANINGS["gate_e_comb_signature"] + " Lower is better.",
+    "notch_count": GATE_MEANINGS["gate_f_residual_notches"] + " Lower is better.",
+    "gain_asymmetry_db": GATE_MEANINGS["gate_g_gain_asymmetry"] + " Lower is better.",
+    "band_edge_excess_spread_db": (
+        GATE_MEANINGS["gate_h_band_edge_stability"] + " This column is the excess "
+        "over the population median, so 0 means exactly as stable as its peers "
+        "and negative means more stable. Lower is better."
+    ),
+    "localization_pct": GATE_MEANINGS["gate_i_improvement_localization"] + " Lower is better.",
+    "fragility": (
+        "f_robust(tau*) - f(tau*): how much worse the jitter-averaged objective "
+        "is at the raw optimum than the raw objective there. A large value means "
+        "the optimum only looks good if the timing is exact. Lower is better."
+    ),
+    "excursion_penalty_db": (
+        "Worst degradation of the objective anywhere within +/-delta_tau_max/2 of "
+        "the recommended delay - how many dB the pair loses when the listener "
+        "moves by the configured --listener-movement. This drives the basin gate. "
+        "Lower is better."
+    ),
+    "basin_w03": (
+        "Width of the single contiguous delay interval containing tau* over which "
+        "the raw objective stays within +0.3 dB of its minimum. Disconnected good "
+        "regions do not count. A fixed-threshold diagnostic; the gate uses the "
+        "excursion penalty instead. Wider is better."
+    ),
+    "worst_case_1": (
+        "Largest raw objective encountered from tau* - 1 ms through tau* + 1 ms, "
+        "including interpolated interval edges. Lower is better."
+    ),
+    "geometric_pass": (
+        "PASS when the excursion penalty stays within the basin tolerance for the "
+        "configured listener movement. A FAIL proves the tuning is fragile; a PASS "
+        "does not prove the pair is robust across seats, since this delay-only "
+        "test cannot see the magnitude change from moving through the room's "
+        "modal field."
+    ),
+    "physical_status": (
+        "Whether the pair's measured arrival alignment is usable. OK: the raw "
+        "optimum lies inside the physical-delay window. OUT: it lies outside, "
+        "though the recommended delay was still constrained inside. N/A: no "
+        "usable arrival timing for this pair. INVALID: the physical window does "
+        "not intersect the delay scan."
+    ),
+    "polarity": "Polarity applied to the second sub of the pair: + normal, - inverted.",
+    "delay_ms": (
+        "Delay applied to the second sub at the recommended configuration, "
+        "selected from the jitter-averaged objective inside the physical window."
+    ),
+    "gain_db": "Level applied to the second sub, relative to the first.",
+    "headroom": (
+        "Global attenuation applied to every compared response so the comparison "
+        "is equal-drive: it removes positive relative pair gain and, post-EQ, the "
+        "fitted bank's largest in-band boost. Already included in SPL, low-end "
+        "power and the plotted magnitudes."
+    ),
+    "dip": (
+        "Worst negative deviation from a one-third-octave Gaussian-smoothed "
+        "version of the same equal-drive response. This is the only score term "
+        "you cannot recover with the volume knob. Lower is better."
+    ),
+    "excess_gd": (
+        "Energy-weighted mean of the denoised excess group delay across the "
+        "scoring band, after the common delay is removed. A reported diagnostic "
+        "and EQ-authority input, not a score term. Lower is better."
+    ),
+    "tail": (
+        "Decay. Shows the loudest detected mode's level relative to direct sound "
+        "in dB when this pair's modal fit is valid, otherwise the CSD envelope "
+        "decay time in ms - ringing_ms saturates at 0 for every mode below the "
+        "audibility margin, so the dB figure is preferred when available. Lower "
+        "is better either way."
+    ),
+    "low_end_power": (
+        "One-octave broad-trend pressure power weighted by the f^-4 excursion and "
+        "amplifier cost of producing pressure low down, relative to the best pair. "
+        "A score component. Higher is better."
+    ),
+    "spl": (
+        "Mean in-band level relative to the best pair, at equal drive. A score "
+        "component. Higher is better."
+    ),
+}
+
+
+def _column_help(key: str, canonical: dict[str, str]) -> str:
+    """Help text for one column key, resolving raw/EQ'd variants to one entry."""
+
+    return COLUMN_HELP.get(canonical.get(key, key), "")
+
+
 def _gate_evidence(gate_key: str, gate: dict[str, Any]) -> str:
     """The measured figure and the limit it was compared against."""
 
@@ -1026,9 +1141,29 @@ def _ranking_table(
         (low_end_power_key, "Low-end power (dB)", "number"),
         (spl_key, "Relative SPL (dB)", "number"),
     ])
+    # Raw and EQ'd variants of a column share one help entry.
+    canonical = {
+        score_key: "score",
+        headroom_key: "headroom",
+        dip_key: "dip",
+        excess_key: "excess_gd",
+        tail_key: "tail",
+        low_end_power_key: "low_end_power",
+        spl_key: "spl",
+    }
+
+    def heading_cell(index: int, key: str, label: str, kind: str) -> str:
+        help_text = _column_help(key, canonical)
+        described = ' class="has-help"' if help_text else ""
+        help_attribute = f' data-help="{html.escape(help_text)}"' if help_text else ""
+        return (
+            f'<th data-key="{key}" data-type="{kind}" '
+            f'data-column-index="{index + 1}"{described}{help_attribute}>'
+            f"{html.escape(label)}</th>"
+        )
+
     heading = '<th class="selection-heading">Show</th>' + "".join(
-        f'<th data-key="{key}" data-type="{kind}" data-column-index="{index + 1}">'
-        f'{html.escape(label)}</th>'
+        heading_cell(index, key, label, kind)
         for index, (key, label, kind) in enumerate(columns)
     )
     metric_directions = {
@@ -1240,15 +1375,16 @@ def _ranking_table(
             style = score_style(key, numeric_value) if is_metric else ""
             empty_class = " is-empty" if is_metric and numeric_value is None else ""
             style_attribute = f' style="{style}"' if style else ""
-            title_attribute = (
-                f' title="{html.escape(reason_tooltip)}"'
+            help_attribute = (
+                f' data-help="{html.escape(reason_tooltip)}"'
                 if key == "gate_reasons"
                 else ""
             )
+            help_class = " has-help" if key == "gate_reasons" else ""
             cells.append(
-                f'<td class="metric-cell{empty_class}" '
+                f'<td class="metric-cell{empty_class}{help_class}" '
                 f'data-value="{html.escape(values[key][1])}"'
-                f'{style_attribute}{title_attribute}>'
+                f'{style_attribute}{help_attribute}>'
                 f'{html.escape(values[key][0])}</td>'
             )
         if pair.get("optimized", True):
@@ -1886,7 +2022,7 @@ def build_report(
             )
             tooltip = html.escape(_gate_tooltip(gate_key, gate, include_status=False))
             gate_rows.append(
-                f'<li class="gate-{html.escape(status)}" title="{tooltip}">'
+                f'<li class="gate-{html.escape(status)} has-help" data-help="{tooltip}">'
                 f'<strong>{html.escape(gate_name)}: '
                 f'{html.escape(status.upper())}</strong>'
                 f'<p class="gate-meaning">{html.escape(GATE_MEANINGS.get(gate_key, ""))}</p>'
@@ -2152,7 +2288,13 @@ th:hover {{ background:#1b2d48; }} tbody tr:hover {{ background:#132238; }}
 .measured-card > summary {{ cursor:pointer; }}
 .measured-card p {{ margin:10px 0 0; font-size:.9rem; }}
 .gate-meaning {{ margin:6px 0 0; color:var(--muted); font-size:.86rem; }}
-.metric-cell[title] {{ cursor:help; }}
+.has-help {{ cursor:help; }}
+.ranking-table th.has-help {{ text-decoration:underline dotted var(--muted); text-underline-offset:3px; }}
+.hover-help[hidden] {{ display:none; }}
+.hover-help {{ position:fixed; z-index:60; max-width:min(420px,86vw); padding:9px 11px;
+  background:#0b1728; color:var(--text); border:1px solid var(--line); border-radius:7px;
+  box-shadow:0 6px 20px rgba(0,0,0,.5); font-size:.82rem; line-height:1.45;
+  white-space:pre-line; pointer-events:none; }}
 .gate-sheet ul {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:8px; padding:0; list-style:none; }}
 .gate-sheet li {{ padding:10px; border:1px solid var(--line); border-left-width:4px; border-radius:7px; overflow-wrap:anywhere; }}
 .gate-sheet li span {{ color:var(--muted); font-size:.86rem; }}
@@ -2392,6 +2534,45 @@ document.addEventListener('keydown',event=>{{
   activatePair(key);
 }});
 {copy_peq_script}
+// Hover help. A single element parented to <body> rather than a CSS ::after on
+// each target: the ranking table scrolls inside its own overflow container, and
+// a pseudo-element tooltip would be clipped at that container's edge. Shown on
+// pointerover with no delay, and positioned to stay inside the viewport.
+(function(){{
+  const tip=document.createElement('div');
+  tip.className='hover-help';
+  tip.hidden=true;
+  document.body.appendChild(tip);
+  let current=null;
+  function place(target){{
+    const box=target.getBoundingClientRect();
+    tip.style.left='0px'; tip.style.top='0px';
+    const size=tip.getBoundingClientRect();
+    const margin=8;
+    let left=box.left+box.width/2-size.width/2;
+    left=Math.max(margin,Math.min(left,window.innerWidth-size.width-margin));
+    let top=box.bottom+6;
+    if(top+size.height>window.innerHeight-margin) top=box.top-size.height-6;
+    const lowest=Math.max(margin,window.innerHeight-size.height-margin);
+    top=Math.max(margin,Math.min(top,lowest));
+    tip.style.left=left+'px';
+    tip.style.top=top+'px';
+  }}
+  function hide(){{ current=null; tip.hidden=true; }}
+  document.addEventListener('pointerover',event=>{{
+    const node=event.target;
+    const target=node&&node.closest?node.closest('[data-help]'):null;
+    if(target===current) return;
+    if(!target){{ hide(); return; }}
+    current=target;
+    tip.textContent=target.dataset.help;
+    tip.hidden=false;
+    place(target);
+  }});
+  document.addEventListener('pointerdown',hide);
+  window.addEventListener('scroll',hide,true);
+  window.addEventListener('blur',hide);
+}})();
 renderPairTabs();
 setOverviewView('magnitude');
 renderActiveDetail();

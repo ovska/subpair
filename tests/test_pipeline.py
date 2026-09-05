@@ -1656,6 +1656,27 @@ class PipelineTests(unittest.TestCase):
             self.assertIn("Table colors.", page)
             self.assertIn("green with an inset outline is best and red is worst", page)
             self.assertIn("A residual and D deficit prefer higher values", page)
+            # Hover help: every non-obvious column carries its own description,
+            # rendered by a self-contained script rather than a title attribute
+            # (a title has a browser-imposed delay and cannot be styled) or a
+            # CSS pseudo-element (the table scrolls inside an overflow
+            # container, which would clip it).
+            headers = re.findall(r'<th data-key="([^"]+)"[^>]*>', page)
+            documented = set(
+                re.findall(r'<th data-key="([^"]+)"[^>]*data-help="[^"]+"', page)
+            )
+            self.assertTrue(headers)
+            self.assertEqual(set(headers) - documented, {"pair"})
+            for element in ("th", "td", "li"):
+                self.assertEqual(
+                    re.findall(rf"<{element}[^>]*\btitle=", page), []
+                )
+            self.assertIn(".hover-help {", page)          # styled inline
+            self.assertIn("tip.className='hover-help'", page)  # built by the inline script
+            self.assertIn("pointerover", page)
+            # self-contained: nothing is fetched at view time
+            self.assertEqual(re.findall(r"<script[^>]+\bsrc=", page), [])
+            self.assertEqual(re.findall(r"<link[^>]+\bhref=", page), [])
             self.assertIn(
                 'data-key="geometric_pass" data-type="number"', page
             )
